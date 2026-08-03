@@ -41,30 +41,26 @@ bijvangst.
 Deze moeten opgelost zijn vóórdat iemand zonder technische achtergrond dit
 zelfstandig gebruikt — los van de interface-vraag hierboven:
 
-- **Geen vangnet tegen per ongeluk een echte run i.p.v. dry-run.** Het enige verschil
-  is een vlag die de gebruiker moet onthouden. Eén verkeerd getypt commando en er
-  wordt echt gekopieerd. Nodig: een expliciete bevestigingsstap bij een eerste
-  (niet-dry-run) run, of dry-run als onveranderlijke standaard die je bewust moet
-  uitzetten.
-- **Stilzwijgend falende afhankelijkheid (ffmpeg).** Als ffprobe ontbreekt, wordt
-  élk bestand gewoon "Onbekend" — geen foutmelding, geen waarschuwing. Een
-  niet-technische gebruiker ziet dan alleen "het herkent niks" en heeft geen idee
-  waarom. Nodig: een duidelijke, vroege check ("ffmpeg ontbreekt, installeer via
-  ...") vóór een run begint, niet een stille kwaliteitsdegradatie.
-- **Geen bescherming tegen bestandsnaam-botsingen op de bestemming.** Als er al een
-  bestand met dezelfde naam op de doelplek staat (maar een andere checksum — dus
-  geen duplicaat), wordt dat vandaag stilzwijgend overschreven door `shutil.copy2`.
-  Dat is een echt dataverlies-risico, niet hypothetisch: twee cameraverkopen die
-  toevallig `C0001.MP4` heten, twee shoots op dezelfde dag.
-- **Geen voortgangsindicatie.** We hebben zelf bestanden van tot 19GB op de externe
-  SSD gezien. Een kopieeractie van zulke bestanden duurt merkbaar lang met nul
-  feedback — een niet-technische gebruiker weet niet of het "hangt" of gewoon
-  bezig is, en zal geneigd zijn het proces af te breken (wat op zichzelf weer een
-  onvolledige kopie kan achterlaten, zie punt 2).
-- **Geen duidelijk "klaar, veilig om de schijf te ontkoppelen"-signaal.** De huidige
-  samenvatting print in de terminal en verdwijnt; er is geen persistente,
-  makkelijk te vinden bevestiging dat een run echt voltooid is voordat iemand de
-  SSD losklikt.
+- ~~Geen bescherming tegen bestandsnaam-botsingen op de bestemming.~~ **Opgelost
+  (2026-08-03).** Een bestaand doelbestand wordt nooit meer overschreven: zelfde
+  checksum → behandeld als duplicaat, andere checksum → automatische `_001`/`_002`-
+  suffix. Zie `MANY_INGEST_BUILD_PLAN.md`, sectie 5, stap 8.
+- ~~Stilzwijgend falende afhankelijkheid (ffmpeg).~~ **Opgelost (2026-08-03).**
+  `IngestService.run()` stopt nu onmiddellijk met een duidelijke foutmelding
+  (`brew install ffmpeg`) als ffprobe ontbreekt — vóór er iets anders gebeurt.
+- ~~Geen voortgangsindicatie.~~ **Opgelost (2026-08-03).** Elke verwerkte bestand
+  toont voortgang (verwerkt/totaal, percentage, huidig bestand, cumulatieve
+  grootte) via een herbruikbare `progress_callback`.
+- ~~Geen duidelijk "klaar, veilig om te ontkoppelen"-signaal.~~ **Grotendeels
+  opgelost (2026-08-03).** Er verschijnt nu een leesbaar eindrapport met expliciet
+  "Veilig om bronmedia te verwijderen: JA/NEE" (nooit "JA" bij een dry-run of als
+  er fouten waren), ook weggeschreven als tekstbestand naast het logbestand. Nog
+  niet opgelost: dit staat in de terminal/een bestand, niet op een plek die een
+  niet-technische gebruiker vanzelf ziet vóórdat hij de schijf loskoppelt — dat
+  wacht nog op de interface uit sectie 0.
+- **Geen vangnet tegen per ongeluk een echte run i.p.v. dry-run.** Nog steeds
+  open — dit was expliciet niet in scope van de huidige verbeteringsronde. Het
+  enige verschil is nog altijd een vlag die de gebruiker moet onthouden.
 
 ---
 
@@ -93,17 +89,41 @@ en worden erger naarmate meer mensen dit gebruiken:
 
 ## 3. Vertrouwens-/nauwkeurigheidsgaten in de camera-herkenning
 
-Geen veiligheidsrisico (het systeem gokt niet, valt terecht terug op "Onbekend"),
-maar wel relevant voor "dagelijks gebruik": hoe vaker "Onbekend" verschijnt, hoe
-minder een editor het systeem vertrouwt.
+**~~Generieke MP4-bestanden classificeren als FX3~~ — OPGELOST (2026-08-03).**
+`container_contains: ["mp4"]` op het Sony FX3-profiel matchte vrijwel elk generiek
+MP4-bestand, niet alleen Sony XAVC-MP4 — bevestigd met een puur ffmpeg-gegenereerd
+testbestand zonder enige Sony-tag (`major_brand: isom`) dat desondanks als "Sony
+FX3" met **hoge** confidence classificeerde. Dit was geen "Onbekend"-geval zoals de
+rest van deze sectie, maar een **actieve misclassificatie met hoge confidence** —
+het risicovolste punt in deze sectie.
+
+**Fix:** MP4 mag nooit op zichzelf een HIGH-confidence signaal zijn — het is een
+vrijwel universeel containerformaat, geen Sony-specifiek kenmerk. Het nieuwe,
+generieke, opt-in profielveld `container_requires_brand: true` voorkomt dit:
+wanneer gezet, telt `container_contains` alleen mee als `brand_contains` ook
+matcht. `sony_fx3` wordt nu dus alleen herkend via de **combinatie** XAVC-brand +
+MP4-container, nooit via MP4 alleen. `sony_fx6` blijft ongewijzigd zelfstandig
+werken op `container_contains: ["mxf"]`, omdat MXF — in tegenstelling tot MP4 —
+binnen ManyFast's eigen apparatuur smal en specifiek genoeg is (bevestigd over 6
+crew-gelabelde mappen, geen enkele uitzondering) om geen aanvullend brand-signaal
+nodig te hebben. Geen nieuwe hardgecodeerde camera-uitzondering in code — het
+mechanisme is generiek, elk toekomstig profiel kan hetzelfde opt-in gebruiken. Zie
+`docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md` voor de volledige analyse en
+`CLAUDE.md` voor de vastgelegde beslissing.
+
+De rest van deze sectie is geen veiligheidsrisico (het systeem gokt niet, valt
+terecht terug op "Onbekend"), maar wel relevant voor "dagelijks gebruik": hoe vaker
+"Onbekend" verschijnt, hoe minder een editor het systeem vertrouwt.
 
 - **DJI en GoPro zijn nog steeds volledig ongevalideerd** — nul echte bestanden
   van die apparaten gezien tot nu toe. De patronen zijn illustratief giswerk.
-- **Sony A7IV is ongevalideerd**, en specifiek relevant: als de A7IV ook
-  XAVC-MP4 met een vergelijkbaar `C####`-patroon blijkt te gebruiken, kan het
-  nieuwe containerformaat-signaal voor FX3 dan verkeerd gaan — dat risico is
-  bewust geaccepteerd, niet weggenomen (zie `MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md`,
-  sectie 7).
+- **Openstaand: Sony A7IV gebruikt mogelijk dezelfde XAVC-MP4-workflow en kan
+  verdere validatie vereisen.** Als de A7IV ook XAVC-brand + MP4-container met een
+  vergelijkbaar `C####`-patroon blijkt te gebruiken, zou een A7IV-bestand nog
+  steeds als FX3 geclassificeerd kunnen worden — de zojuist doorgevoerde fix lost
+  specifiek "matcht willekeurig alles" op, niet deze kleinere, resterende
+  onzekerheid tussen twee specifieke Sony-modellen. Nog steeds bewust geaccepteerd,
+  niet weggenomen (zie `MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md`, sectie 7).
 - **Het FX3/FX6-containersignaal is een workflow-conventie, geen hardware-feit.**
   Betrouwbaar zolang de crew consistent blijft — een aannemelijke aanname, geen
   garantie. Als iemand ooit een camera-instelling wijzigt, misclassificeert dit
@@ -140,15 +160,14 @@ team, structureel":
 ## 5. Wat ik als eerste zou oppakken (v0.2-prioriteit)
 
 Getoetst aan VISION.md's Decision Filter — niet alles hierboven is nu de moeite
-waard, sommige dingen wel:
+waard, sommige dingen wel. **Bijgewerkt na de veiligheidsronde van 2026-08-03:**
 
-1. **Vangnet tegen per-ongeluk-echte-run + botsingsbescherming op de bestemming**
-   (sectie 1) — kleine wijziging, voorkomt het enige échte dataverlies-scenario
-   dat vandaag bestaat.
-2. **Duidelijke ffmpeg-afhankelijkheidscheck vooraf** (sectie 1) — klein, voorkomt
-   een verwarrende, stille kwaliteitsdegradatie.
-3. **Voortgangsindicatie bij kopiëren** (sectie 1) — nodig zodra dit niet meer
-   alleen door mij getest wordt.
+1. ~~Botsingsbescherming op de bestemming~~, ~~ffmpeg-afhankelijkheidscheck~~,
+   ~~voortgangsindicatie~~ — **alle drie opgelost**, zie sectie 1.
+2. ~~De `container_contains`-misclassificatiebug in sectie 3 fixen.~~ **Opgelost
+   (2026-08-03)** via `container_requires_brand`. Zie sectie 3.
+3. **Vangnet tegen per-ongeluk-echte-run** (sectie 1) — nog steeds open, nog
+   steeds klein.
 4. Dán pas, en apart getraceerd: **een simpele interface** (sectie 0) — dat is het
    grootste stuk werk en verdient een eigen implementatieplan, niet iets wat
    "erbij" gebeurt.
@@ -165,3 +184,7 @@ gebruikers zijn — dat is nu nog premature complexiteit.
 1. Akkoord op de prioritering in sectie 5, of een andere volgorde.
 2. Bevestigen: is "een editor zonder technische kennis" al voor v0.2 het doel, of
    pas later — dat bepaalt of sectie 0 nu al meegepland moet worden.
+3. ~~Akkoord om de `container_contains`-bug te fixen~~ — **opgelost (2026-08-03)**.
+4. **Sony A7IV blijft openstaand:** gebruikt mogelijk dezelfde XAVC-MP4-workflow als
+   FX3 en kan verdere validatie vereisen zodra er echte A7IV-bestanden beschikbaar
+   zijn (zie sectie 3 en 5 van `MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md`).

@@ -60,9 +60,11 @@ many_ingest/
 ├── cli.py                       # dunne CLI-laag: parse args → composition root → run()
 ├── config.py                    # laadt ingest_config.yaml + camera_profiles.yaml
 ├── core/
-│   └── ingest_service.py        # kernlogica: scan → classify → metadata → workspace-pad
-│                                 # → dedupe → (dry-run? preview : copy → verify → schema
-│                                 # bijwerken) → rapport
+│   ├── ingest_service.py        # kernlogica: scan → classify → metadata → workspace-pad
+│   │                             # → dedupe → collision-check → (dry-run? preview : copy
+│   │                             # → verify → schema bijwerken); progress_callback
+│   └── report.py                 # IngestSummary/summarize()/render_report() — herbruikbaar
+│                                 # voor een toekomstige GUI, niet CLI-specifiek
 ├── ports/
 │   ├── storage.py               # interface: list/read/copy/exists/checksum
 │   │                             # (géén move-methode in v0.1 — zie sectie 7)
@@ -166,6 +168,18 @@ generiek getierd naar betrouwbaarheid van het *signaal*, niet per camera:
   ManyFast-workflowconventie — zie de kanttekening hierover in
   `camera_profiles.yaml`: dit is een workflow-conventie, geen onveranderlijk
   hardware-feit).
+  **Niet elk containerformaat is even specifiek.** MP4 is een vrijwel universeel
+  containerformaat (bijna elk toestel produceert het) en mag daarom **nooit** op
+  zichzelf een HIGH-signaal zijn. MXF is binnen ManyFast's eigen apparatuur smal
+  en specifiek genoeg (bevestigd over 6 crew-gelabelde mappen, geen uitzondering)
+  om wél op zichzelf te mogen staan. Een profiel kan daarom
+  `metadata_match.container_requires_brand: true` zetten om te eisen dat
+  `brand_contains` óók matcht vóórdat `container_contains` meetelt — `sony_fx3`
+  zet dit (FX3 wordt zo alleen herkend via de combinatie XAVC-brand + MP4-
+  container, nooit via MP4 alleen), `sony_fx6` niet (MXF blijft zelfstandig
+  werken). Dit is een databeslissing per profiel, geen nieuwe hardgecodeerde
+  camera-uitzondering in code — zie `docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md`
+  voor de volledige analyse van de bug die dit oploste.
 - **MEDIUM** — een brand-match (major_brand/compatible_brands, bijv. Sony's
   "XAVC"), **of** een generieke, nog niet-bevestigde `filename_patterns`-match.
 - **LOW ("Onbekend")** — niets matcht, of meerdere profielen matchen op hetzelfde
@@ -184,6 +198,10 @@ entry in `camera_profiles.yaml`. Geen codewijziging, geen redeploy van logica.
 
 ## 5. Welke stappen de software uitvoert
 
+0. **ffprobe-preflight** — vóórdat er iets anders gebeurt: is ffprobe beschikbaar?
+   Zo niet, stop de hele run onmiddellijk met een duidelijke foutmelding
+   (`brew install ffmpeg`) — nooit stilzwijgend doorgaan zonder metadata (zie
+   `docs/MANY_INGEST_V0.1_READINESS_ASSESSMENT.md`).
 1. **Trigger** — gebruiker start handmatig:
    `many-ingest run --source /pad/naar/inputmap --client "Nike" --project "Zomer Campagne" [--dry-run]`
 2. **Scan** — doorzoek de inputmap naar bestanden, negeer systeembestanden.
@@ -197,24 +215,34 @@ entry in `camera_profiles.yaml`. Geen codewijziging, geen redeploy van logica.
    `category`, bijv.:
    `/Opslag/Klanten/Nike/ZomerCampagne/2026-08-03_Raw/Drone/DJI_0001.MP4`
 7. **Duplicaatcontrole** — checksum vergelijken met de ManyFast Asset Schema.
-8. **Dry-run-afsplitsing:**
+8. **Botsingscontrole (collision protection)** — staat er al een bestand op de
+   berekende bestemming? Zelfde checksum → ook een duplicaat (skip). Andere checksum
+   → automatisch een `_001`/`_002`/...-suffix toevoegen. **Een bestaand bestand wordt
+   nooit overschreven.** Deze stap draait ook tijdens dry-run (puur lezen: bestaat het,
+   en zo ja, welke checksum), zodat de preview de werkelijke bestemming toont.
+9. **Dry-run-afsplitsing:**
    - **Als `--dry-run` actief is:** stop hier per bestand. Voeg een preview-regel toe
      aan het rapport en het logbestand (voorgestelde bestemming, classificatie,
-     duplicaat ja/nee) — **geen kopie, geen schema-wijziging.** Ga naar het volgende
-     bestand.
-   - **Anders:** ga door met stap 9.
-9. **Kopiëren** — bestand wordt gekopieerd naar de Project Workspace. Bron blijft altijd
-   onaangeroerd (geen move in v0.1).
-10. **Verificatie** — checksum van de kopie vergelijken met het origineel. Bij een
+     duplicaat ja/nee, eventueel hernoemd) — **geen kopie, geen schema-wijziging.** Ga
+     naar het volgende bestand.
+   - **Anders:** ga door met stap 10.
+10. **Kopiëren** — bestand wordt gekopieerd naar de (evt. hernoemde) Project Workspace-
+    bestemming. Bron blijft altijd onaangeroerd (geen move in v0.1).
+11. **Verificatie** — checksum van de kopie vergelijken met het origineel. Bij een
     mismatch: fout loggen, bestand markeren als mislukt, doorgaan met de rest.
-11. **ManyFast Asset Schema bijwerken** — bestand, bestemming, checksum, metadata,
+12. **ManyFast Asset Schema bijwerken** — bestand, bestemming, checksum, metadata,
     `category`/`camera_profile`/`confidence`, tijdstip. (Alleen bij een echte run, niet
     bij dry-run.)
-12. **Logbestand schrijven** — elke actie hierboven als JSON-lines-regel, gemarkeerd als
+13. **Logbestand schrijven** — elke actie hierboven als JSON-lines-regel, gemarkeerd als
     `dry_run: true/false`.
-13. **Rapportage** — overzicht: aantal bestanden, per camera-profiel/categorie, totale
-    omvang, duplicaten, fouten. Bij dry-run: expliciet "dit is een preview, er is niets
-    gewijzigd" plus het exacte vervolgcommando zonder `--dry-run`.
+14. **Voortgang tonen** — na elk bestand: verwerkt/totaal, percentage, huidige
+    bestandsnaam, cumulatieve grootte — via een `progress_callback`, niet hardcoded
+    print-statements, zodat een toekomstige GUI dit kan hergebruiken.
+15. **Eindrapport** — een leesbare samenvatting (niet alleen JSON): aantal bestanden,
+    per bestandstype en camera-profiel, duplicaten, opgeloste naamconflicten, fouten,
+    totale grootte, duur, logbestand-locatie, en of het veilig is om de bronmedia te
+    verwijderen (nooit "JA" bij een dry-run of als er fouten waren). Wordt zowel
+    getoond als weggeschreven als leesbaar tekstbestand naast het logbestand.
 
 ---
 

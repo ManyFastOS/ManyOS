@@ -165,3 +165,34 @@ approach when implementing this module:
   `camera_profiles.yaml`), metadata takes priority over filename. v0.1 ships profiles
   for Sony FX6, Sony A7IV, Sony FX3, DJI, GoPro, and Audio. Unclear cases are labeled
   "Onbekend"/low confidence rather than guessed — never silently misclassified.
+  **Fixed bug (found and fixed 2026-08-03):** `container_contains: ["mp4"]` on the
+  Sony FX3 profile used to match almost any generic MP4 file, not just Sony
+  XAVC-MP4 — confirmed with a plain ffmpeg-generated MP4 (`major_brand: isom`, no
+  Sony tags at all) classifying as "Sony FX3" at HIGH confidence. **MP4 must never
+  be a standalone HIGH-confidence signal — it's a near-universal container, not a
+  Sony-specific one.** Fixed with a new, generic, opt-in profile field:
+  `metadata_match.container_requires_brand: true` — when set, `container_contains`
+  only counts if `brand_contains` also matches for that same profile. `sony_fx3`
+  now sets this (so FX3 is only recognized via the XAVC-brand + MP4-container
+  *combination*, never MP4 alone); `sony_fx6` does not (MXF is specific/rare enough
+  within ManyFast's own equipment to stand alone as a signal — confirmed over 6
+  crew-labeled folders with zero exceptions). This is a per-profile data decision,
+  not a hardcoded FX3 exception — any future profile can opt in the same way if its
+  container value turns out to be similarly generic. See
+  `docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md` for the full analysis.
+- **Never silently overwrite a destination file (collision protection).** Before
+  writing, check `Storage.exists()` on the destination; if a file is already there,
+  compare checksums — identical content is treated as a duplicate (skip, log
+  `duplicate_skipped`), different content gets an automatic `_001`, `_002`, ...
+  suffix. This check runs during dry-run too (it's read-only), so previews reflect
+  reality. Never invent a scenario where an existing file is replaced.
+- **Fail fast and loudly if ffprobe is missing**, at the very start of
+  `IngestService.run()` — never let every asset silently degrade to "Onbekend" for
+  lack of metadata. One clear, actionable error (`brew install ffmpeg`), not a
+  partial/confusing run.
+- **Progress and the final report are core data, not CLI text.** `IngestService.run()`
+  takes an optional `progress_callback` (plain `ProgressUpdate` objects — processed
+  count, total, current file, cumulative bytes); `core/report.py`'s `IngestSummary`/
+  `summarize()` are the structured summary, with `render_report()` as one particular
+  plain-text rendering of it. A future GUI reuses the callback and `IngestSummary`
+  directly; it does not need to parse CLI output.

@@ -362,6 +362,76 @@ dekken.
 
 ---
 
+## 9. Bug gevonden ná 8: `container_contains: ["mp4"]` te breed — opgelost
+
+**Bevinding (2026-08-03, tijdens handmatige verificatie van de veiligheidsronde):**
+sectie 8 introduceerde `container_contains: ["mp4"]` bij `sony_fx3` als een op
+zichzelf staand HIGH-signaal — precies zoals bij `sony_fx6`'s `container_contains:
+["mxf"]`. Dat bleek een fout gelijkstelling: **MXF en MP4 zijn niet even
+specifiek.** MXF komt in de praktijk alleen bij professionele/broadcast-
+apparatuur voor; MP4 wordt door vrijwel elk toestel geproduceerd (telefoons,
+GoPro's, DJI, willekeurige software-exports). Een puur ffmpeg-gegenereerd
+testbestand zonder enige Sony-metadata (`major_brand: isom`) classificeerde
+hierdoor toch als **"Sony FX3" met hoge confidence** — een actieve
+misclassificatie, geen "Onbekend"-geval.
+
+**Analyse:** het achterliggende bewijs voor de FX3-regel was nooit "dit is een
+MP4-bestand", maar "dit is een MP4-bestand mét de Sony XAVC-brand" (zie sectie 7).
+De implementatie in sectie 8 had alleen de helft van dat bewijs vastgelegd.
+
+**Oplossing:** een nieuw, generiek, opt-in profielveld
+`metadata_match.container_requires_brand` (standaard `False`, geen wijziging voor
+bestaande profielen). Als `True`, telt `container_contains` alleen mee wanneer
+`brand_contains` óók matcht voor datzelfde profiel:
+
+```python
+def _matches_container(probe_result, profile) -> bool:
+    if probe_result is None or not profile.metadata_container_contains:
+        return False
+    if profile.container_requires_brand and not _matches_brand(probe_result, profile):
+        return False  # container alleen is nooit genoeg — moet samengaan met een merksignaal
+    container = (probe_result.container_format or "").lower()
+    return any(needle.lower() in container for needle in profile.metadata_container_contains)
+```
+
+```yaml
+sony_fx3:
+  metadata_match:
+    container_contains: ["mp4"]
+    container_requires_brand: true   # MP4 alleen is te generiek; vereist ook XAVC-brand
+
+sony_fx6:
+  metadata_match:
+    container_contains: ["mxf"]
+    # geen container_requires_brand: MXF is smal/specifiek genoeg om op zichzelf te staan
+```
+
+**Resultaat:**
+- **FX3 wordt nu alleen herkend via de combinatie XAVC-brand + MP4-container** —
+  nooit meer via MP4 alleen.
+- **FX6/MXF blijft ongewijzigd zelfstandig werken**, omdat MXF binnen ManyFast's
+  eigen apparatuur aantoonbaar specifiek genoeg is (bevestigd over 6 crew-
+  gelabelde mappen, geen enkele uitzondering) — dit is bewust *niet* hetzelfde
+  behandeld als MP4.
+- **Geen nieuwe hardgecodeerde camera-uitzondering in code.** De code kent geen
+  cameranamen; elk profiel kan zelf via YAML kiezen of zijn containersignaal sterk
+  genoeg is om alleen te staan. Toekomstige profielen met een even generiek
+  containerformaat kunnen dezelfde opt-in gebruiken.
+
+**Getest:** 5 nieuwe/bijgewerkte tests (generiek MP4 zonder Sony-metadata → nooit
+FX3; FX3 met XAVC-brand + MP4 blijft HIGH; FX6/MXF ongewijzigd; config-loading van
+`container_requires_brand` in beide richtingen). 61/61 tests slagen. Herbevestigd
+met de exacte oorspronkelijke bug-reproductie: een puur ffmpeg-gegenereerd
+MP4-bestand classificeert niet langer als "Sony FX3".
+
+**Restrisico, niet weggenomen door deze fix:** de A7IV-onzekerheid uit sectie 7
+blijft bestaan — als de A7IV ook XAVC-brand + MP4-container met een vergelijkbaar
+`C####`-patroon blijkt te gebruiken, kan een A7IV-bestand nog steeds als FX3
+geclassificeerd worden. Deze fix lost specifiek "matcht willekeurig alles" op, niet
+die kleinere, resterende onzekerheid tussen twee specifieke Sony-modellen.
+
+---
+
 ## Openstaand
 
 1. ~~Akkoord op 3a (audio-extensies)~~ — **toegepast.**
@@ -372,9 +442,8 @@ dekken.
    classificeert. Dit staat los van de nu doorgevoerde confidence-tiers en vereist
    nog steeds een aparte, expliciete `classify()`-uitbreiding.
 4. ~~Akkoord op sectie 8 (containerformaat)~~ — **toegepast.**
-5. Antwoord op de drie vragen in sectie 4 en de checklist in sectie 5 (met name
-   A7IV nog volledig open), zodat verdere uitbreidingen op echte data in plaats van
-   aannames gebaseerd kunnen worden.
-5. **Nieuw: akkoord op sectie 8** (containerformaat als generiek HIGH-signaal,
-   lost het FX3-"Onbekend"-probleem op) — inclusief bewust akkoord op het
-   workflow-conventie-risico uit sectie 7, vóór implementatie.
+5. ~~Akkoord op sectie 9 (`container_requires_brand`-fix)~~ — **toegepast.**
+6. **Nog open:** Sony A7IV gebruikt mogelijk dezelfde XAVC-MP4-workflow en kan
+   verdere validatie vereisen — zie sectie 7 en 9. Antwoord op de overige vragen in
+   sectie 4 en de checklist in sectie 5 staat ook nog open, zodat verdere
+   uitbreidingen op echte data in plaats van aannames gebaseerd kunnen worden.
