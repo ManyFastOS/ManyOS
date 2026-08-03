@@ -29,6 +29,8 @@ class ProbeResult:
     make: str | None
     model: str | None
     creation_time: str | None
+    major_brand: str | None
+    compatible_brands: str | None
 
 
 def _ffprobe_path() -> str:
@@ -74,9 +76,11 @@ def probe(path: Path) -> ProbeResult:
         height=first_video.get("height") if first_video else None,
         frame_rate=first_video.get("r_frame_rate") if first_video else None,
         duration_seconds=float(duration) if duration is not None else None,
-        make=_first_tag(format_tags, ["make", "com.apple.quicktime.make"]),
-        model=_first_tag(format_tags, ["model", "com.apple.quicktime.model"]),
+        make=_first_tag(format_tags, ["make", "com.apple.quicktime.make", "company_name"]),
+        model=_first_tag(format_tags, ["model", "com.apple.quicktime.model", "product_name"]),
         creation_time=_first_tag(format_tags, ["creation_time"]),
+        major_brand=_first_tag(format_tags, ["major_brand"]),
+        compatible_brands=_first_tag(format_tags, ["compatible_brands"]),
     )
 
 

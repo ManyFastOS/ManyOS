@@ -1,9 +1,14 @@
 # ManyOS Many Ingest — camera-profielen (v0.1)
 #
-# Elk profiel matcht op bestandsnaam-patronen en/of ffprobe-metadata (make/model-tags).
+# Elk profiel matcht op bestandsnaam-patronen en/of ffprobe-metadata (make/model/brand-tags).
 # Metadata weegt zwaarder dan bestandsnaam (zie docs/MANY_INGEST_BUILD_PLAN.md, sectie 4)
 # — dat is met name relevant hier omdat Sony FX6 en FX3 dezelfde clip-naamgeving kunnen
-# gebruiken; alleen de metadata `model`-tag onderscheidt ze betrouwbaar.
+# gebruiken; alleen metadata onderscheidt ze betrouwbaar.
+#
+# Getoetst tegen echte footage (2026-08-03): Sony XAVC-bestanden (.MP4) schrijven geen
+# make/model in format.tags, maar wel een herkenbare major_brand "XAVC" — vandaar
+# brand_contains hieronder. Sony MXF-bestanden gebruiken company_name/product_name
+# i.p.v. make/model (afgehandeld in metadata_extractor.py, niet hier).
 #
 # Nieuw apparaat toevoegen = nieuwe entry hieronder. Geen codewijziging nodig.
 
@@ -17,6 +22,8 @@ profiles:
       model_contains:
         - "FX6"
         - "ILME-FX6"
+      brand_contains:
+        - "XAVC"
 
   - id: sony_a7iv
     label: "Sony A7 IV"
@@ -37,6 +44,8 @@ profiles:
       model_contains:
         - "FX3"
         - "ILME-FX3"
+      brand_contains:
+        - "XAVC"
 
   - id: dji
     label: "DJI"
@@ -63,4 +72,4 @@ profiles:
     category: Audio
     audio_only: true
     filename_patterns:
-      - ".*\\.(wav|mp3)$"
+      - ".*\\.(wav|mp3|m4a)$"

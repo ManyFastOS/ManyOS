@@ -31,6 +31,8 @@ def make_probe_result():
         make: str | None = None,
         model: str | None = None,
         creation_time: str | None = None,
+        major_brand: str | None = None,
+        compatible_brands: str | None = None,
     ) -> ProbeResult:
         return ProbeResult(
             has_video_stream=has_video_stream,
@@ -43,6 +45,8 @@ def make_probe_result():
             make=make,
             model=model,
             creation_time=creation_time,
+            major_brand=major_brand,
+            compatible_brands=compatible_brands,
         )
 
     return _make

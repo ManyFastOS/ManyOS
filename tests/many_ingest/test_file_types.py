@@ -13,6 +13,7 @@ def test_extension_only_classification():
     assert detect_file_type(Path("clip.mxf"), None) == FileType.VIDEO
     assert detect_file_type(Path("take.wav"), None) == FileType.AUDIO
     assert detect_file_type(Path("take.mp3"), None) == FileType.AUDIO
+    assert detect_file_type(Path("Jan Rotmans.m4a"), None) == FileType.AUDIO
     assert detect_file_type(Path("weird.xyz"), None) == FileType.UNKNOWN
 
 
