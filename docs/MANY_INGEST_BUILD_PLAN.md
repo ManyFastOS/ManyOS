@@ -7,8 +7,9 @@
 
 Dit is het eerste module binnen ManyOS die we daadwerkelijk gaan bouwen. De scope is
 bewust smal: georganiseerde, geverifieerde footage op de juiste plek — niets meer.
-Transcriptie/tagging (uit het eerdere v0.1-voorstel) bouwt hier bovenop in een
-vólgende stap, zodra Many Ingest bewezen betrouwbaar footage aanlevert om op te werken.
+Asset Intelligence (transcriptie/tagging, uit het eerdere v0.1-voorstel) bouwt hier
+bovenop in een vólgende stap, zodra Many Ingest bewezen betrouwbaar footage aanlevert
+om op te werken.
 
 ---
 
@@ -38,9 +39,9 @@ many_ingest/
 ├── config.py        # laadt en valideert ingest_config.yaml
 ├── scanner.py        # vindt videobestanden op de bron (SD-kaart/schijf), filtert op extensie
 ├── metadata.py         # ffprobe-wrapper: codec, resolutie, fps, duur, opnamedatum
-├── organizer.py         # bepaalt doelpad o.b.v. config + metadata + klant/project
+├── organizer.py         # bepaalt de Project Workspace o.b.v. config + metadata + klant/project
 ├── copier.py             # veilig kopiëren + checksum-verificatie + voortgang
-├── manifest.py             # schrijft/leest ingestgeschiedenis (SQLite): bestand, checksum, tijdstip, bestemming
+├── manifest.py             # schrijft/leest de ManyFast Asset Schema (SQLite): bestand, checksum, tijdstip, bestemming
 └── logger.py                # logging-configuratie (console + logbestand)
 
 config/
@@ -63,21 +64,21 @@ Elke module heeft één verantwoordelijkheid, zodat we later makkelijk kunnen aa
    `many-ingest run --source /Volumes/SD_CARD_1 --client "Nike" --project "Zomer Campagne"`
 2. **Scan** — doorzoek de bron naar videobestanden (mp4/mov/mxf e.d.), negeer
    systeembestanden.
-3. **Asset Intelligence Data extraheren** — per bestand via ffprobe: codec, resolutie,
-   framerate, duur, opnamedatum (uit bestandsmetadata, met bestandsdatum als terugval).
-4. **ManyOS Project Workspace bepalen** — o.b.v. config + klant/project + opnamedatum
-   wordt de doelmap (workspace) bepaald, bijv.:
+3. **Metadata-extractie** — per bestand via ffprobe: codec, resolutie, framerate, duur,
+   opnamedatum (uit bestandsmetadata, met bestandsdatum als terugval). Dit is pure
+   technische extractie, geen AI — dus geen Asset Intelligence.
+4. **Project Workspace bepalen** — o.b.v. config + klant/project + opnamedatum
+   wordt de Project Workspace bepaald, bijv.:
    `/Opslag/Klanten/Nike/ZomerCampagne/2026-08-03_Raw/Kaart1/`
 5. **Duplicaatcontrole** — checksum berekenen en vergelijken met de ManyFast Asset
    Schema, zodat dezelfde footage niet twee keer wordt geïmporteerd.
 6. **Kopiëren** — bestanden kopiëren (nooit direct verplaatsen of van de bron
-   verwijderen) naar de ManyOS Project Workspace, met voortgang gelogd.
+   verwijderen) naar de Project Workspace, met voortgang gelogd.
 7. **Verificatie** — checksum van de kopie vergelijken met het origineel; pas na een
    match wordt een bestand als "veilig binnengehaald" gemarkeerd.
 8. **ManyFast Asset Schema bijwerken** — ingest-run vastleggen in de lokale
-   SQLite-database: bestand, bestemming, checksum, Asset Intelligence Data, tijdstip.
-   Dit is de eerste, ruwe vorm van een "Asset"-record en later de brug naar de ManyOS
-   Core.
+   SQLite-database: bestand, bestemming, checksum, metadata, tijdstip. Dit is de eerste,
+   ruwe vorm van een "Asset"-record en later de brug naar de ManyOS Core.
 9. **Rapportage** — overzicht tonen: aantal bestanden, totale omvang, duur, eventuele
    fouten of overgeslagen duplicaten; logbestand wegschrijven.
 10. **Bron leegmaken (optioneel, expliciet)** — pas ná succesvolle verificatie vraagt de
@@ -90,9 +91,9 @@ Elke module heeft één verantwoordelijkheid, zodat we later makkelijk kunnen aa
 
 - **Geen achtergrond-daemon/continue file-watcher.** v0.1 is een bewust getriggerde
   actie na een shoot, geen altijd-actieve service die stil kan falen.
-- **Geen transcriptie of AI-tagging van de inhoud.** Many Ingest levert georganiseerde
-  bestanden + basale Asset Intelligence Data; inhoudelijke analyse is een volgende
-  module die hierop voortbouwt.
+- **Geen transcriptie of AI-tagging van de inhoud (geen Asset Intelligence).** Many
+  Ingest levert georganiseerde bestanden + basismetadata; de AI-analyselaag (Asset
+  Intelligence) is een volgende module die hierop voortbouwt.
 - **Geen cloud-opslag of sync.** v0.1 draait volledig lokaal (externe SSD/NAS via
   Finder-mount). Cloud is een latere stap.
 - **Geen multi-user of rechtensysteem.** Eén persoon draait dit lokaal; geen login,

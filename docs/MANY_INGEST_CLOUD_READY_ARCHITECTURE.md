@@ -96,9 +96,9 @@ ManyOS-architectuur) direct kan consumeren.
 - **Geen bedrijfslogica die rechtstreeks `os.path`/`shutil` aanroept.** Alles via de
   `Storage`-interface — anders zit lokale-bestandssysteemkennis straks overal
   verspreid in code die niet cloud-bewust hoeft te zijn.
-- **Geen SQLite-specifieke queries of aannames in de kernlogica.** Toegang tot het
-  manifest loopt via de `Manifest`-interface met gewone, portable SQL — geen
-  SQLite-only functies diep in de businesslogica.
+- **Geen SQLite-specifieke queries of aannames in de kernlogica.** Toegang tot de
+  ManyFast Asset Schema loopt via de `Manifest`-interface met gewone, portable SQL —
+  geen SQLite-only functies diep in de businesslogica.
 - **Geen autoincrement-ID's of pad-als-identiteit.** Zoals hierboven: dit werkt lokaal
   prima, maar botst zodra er meerdere bronnen tegelijk schrijven. Checksum-gebaseerde
   ID's nu voorkomt een pijnlijke identiteitsmigratie later.
@@ -175,15 +175,15 @@ nooit in één keer:
    aan — de CLI wordt dan één van meerdere "front-ends" in plaats van de enige.
 4. **Events**: de gestructureerde JSON-log-regels worden ook gepubliceerd op een echte
    event-bus (bijv. "AssetIngested"), waarmee Many Ingest de eerste echte
-   event-bron wordt voor de bredere ManyOS-architectuur (Core, latere
-   transcriptie-module, notificaties).
+   event-bron wordt voor de bredere ManyOS-architectuur (Core, latere Asset
+   Intelligence-module, notificaties).
 5. **Configuratie**: het lokale YAML-bestand wordt vervangen door environment
    variables/secrets-manager — dezelfde config-structuur, andere bron.
 6. **Hybride tussenstap (optioneel):** voordat alles volledig cloud is, kan een
    ingest-station lokaal blijven werken (snelheid op locatie, geen wifi-afhankelijkheid
-   tijdens een shoot) en enkel de manifest-deltas periodiek naar de centrale Postgres
-   synchroniseren. Dit werkt zonder aanpassing van de kernlogica, puur door een extra
-   sync-stap toe te voegen die de bestaande adapters gebruikt.
+   tijdens een shoot) en enkel de ManyFast Asset Schema-deltas periodiek naar de
+   centrale Postgres synchroniseren. Dit werkt zonder aanpassing van de kernlogica, puur
+   door een extra sync-stap toe te voegen die de bestaande adapters gebruikt.
 
 **Wat dit ontwerp oplevert:** de dag dat we van één Mac naar meerdere ingest-stations of
 een centrale cloudopslag gaan, is dat een kwestie van nieuwe adapters schrijven en een

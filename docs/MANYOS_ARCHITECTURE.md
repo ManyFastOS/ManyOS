@@ -45,7 +45,7 @@ Op basis hiervan onderscheid ik de onderdelen die ManyOS nodig heeft:
 | 1 | **Project & Taken Core** | Eén bron van waarheid: klanten, projecten, briefs, taken, status, deadlines |
 | 2 | **Intake / Briefing** | Gestructureerd opnemen van een klantbrief (vorm, doel, deadline, stijl) → automatisch project + taken aanmaken |
 | 3 | **Asset Management (DAM)** | Ontvangst, opslag en organisatie van ruwe footage en outputs |
-| 4 | **AI Logging & Transcriptie** | Automatisch transcriberen, taggen en doorzoekbaar maken van ruwe footage |
+| 4 | **Asset Intelligence** | Automatisch transcriberen, taggen en doorzoekbaar maken van ruwe footage |
 | 5 | **Editing / Productie Orkestratie** | Taakverdeling naar editors, versiebeheer, AI-ondersteunde rough cuts |
 | 6 | **Review & Approval Portal** | Klant bekijkt concept, laat tijdgestempelde feedback achter, revisieronde wordt getrackt |
 | 7 | **Delivery Automation** | Automatisch exporteren in juiste formaten/platformen en leveren aan klant |
@@ -111,7 +111,7 @@ klant notificeren zodra een revisie klaarstaat, enzovoort).
 - **Client** — klantgegevens, huisstijl/brand-guidelines, voorkeuren
 - **Project** — gekoppeld aan client, heeft deadline (24H-klok start hier), status
 - **Brief** — de intake: doel, vorm, lengte, stijl, referenties
-- **Asset** — ruwe footage/audio/beeldmateriaal, met Asset Intelligence Data en (later) transcript/tags
+- **Asset** — ruwe footage/audio/beeldmateriaal, met metadata en (later, via Asset Intelligence) transcript/tags
 - **Task** — werkeenheid binnen een project (bijv. "rough cut maken", "review verwerken")
 - **Deliverable** — output-bestand(en) + formaat/platform-eisen
 - **Review** — feedbackronde op een deliverable, met tijdgestempelde comments
@@ -143,7 +143,7 @@ concreet.
 |---|---|---|
 | **v0.1** | Core datamodel + statusbord | Eén plek met alle projecten/taken/deadlines i.p.v. verspreide tools. Nog geen AI. Fundament waarop alles verder bouwt. |
 | **v0.2** | Intake/briefing automatisering | Gestructureerd brief-formulier → AI-agent zet brief om in project + takenlijst. Eerste "AI parseert iets" moment. |
-| **v0.3** | Asset ingestion + AI transcriptie/logging | Footage upload triggert automatische transcriptie + tagging. Editors starten met doorzoekbaar materiaal i.p.v. zelf uitloggen. |
+| **v0.3** | Asset ingestion + Asset Intelligence | Footage upload triggert automatische transcriptie + tagging. Editors starten met doorzoekbaar materiaal i.p.v. zelf uitloggen. |
 | **v0.4** | Review & approval portaal | Klant bekijkt concept, laat tijdgestempelde feedback achter; revisierondes worden getrackt i.p.v. los in mail/WhatsApp. |
 | **v0.5** | AI rough-cut assistent | Agent stelt op basis van transcript + brief een eerste selectie/rough cut voor; editor verfijnt i.p.v. van nul begint. |
 | **v0.6** | Delivery automatisering | Automatische export per platform/formaat + automatische levering en notificatie aan klant. |
@@ -165,7 +165,7 @@ Let op: dit is een **volgorde van waarde**, geen vaste tijdlijn. Elke versie is 
 |---|---|---|---|
 | Core datamodel + statusbord (v0.1) | Middel (randvoorwaardelijk, geen directe tijdswinst) | Laag | Laag |
 | Intake/briefing-automatisering (v0.2) | Middel-hoog | Middel | Laag — puur intern |
-| **Asset ingestion + AI transcriptie/logging (v0.3)** | **Hoog** | **Laag-middel** | **Laag — puur intern, geen klant-facing risico** |
+| **Asset ingestion + Asset Intelligence (v0.3)** | **Hoog** | **Laag-middel** | **Laag — puur intern, geen klant-facing risico** |
 | Review & approval portaal (v0.4) | Hoog | Middel-hoog | Middel — klant-facing, UX moet goed zijn |
 | AI rough-cut assistent (v0.5) | Hoog, maar pas nuttig als v0.3 al staat | Hoog | Middel — kwaliteit van output is kritisch |
 | Delivery automatisering (v0.6) | Middel | Middel | Laag |
@@ -176,7 +176,7 @@ Let op: dit is een **volgorde van waarde**, geen vaste tijdlijn. Elke versie is 
 impact heeft op zichzelf, maar omdat geen enkele andere module zonder een source of truth
 kan bestaan. Dit is bewust klein en saai houden.
 
-**Als eerste écht impactvolle AI-module: Asset Ingestion + AI Transcriptie/Logging (v0.3).**
+**Als eerste écht impactvolle AI-module: Asset Ingestion + Asset Intelligence (v0.3).**
 Redenen:
 
 1. **Grootste directe tijdswinst binnen het 24H-venster.** Het uitloggen/doorzoeken van

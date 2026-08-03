@@ -21,34 +21,65 @@ connect production stages (intake → asset ingestion → editing → review →
 an event-driven core, with AI agents automating specific steps (transcription, tagging,
 rough cuts, notifications).
 
+## Vision & Principles
+
+**`docs/VISION.md` is the canonical source for ManyOS's mission and Core Principles —
+read it first, before anything else in this repo.** It is the highest source of truth,
+together with this file, for design and development decisions. Its principles are not
+duplicated here to avoid the two drifting apart; when evaluating a new module or
+feature, apply VISION.md's Decision Filter directly (does it solve a real ManyFast
+problem, does it save measurable time, can it be reused, is it the simplest solution,
+will it still make sense in three years).
+
+Quick-reference tie-ins to decisions already made in this repo:
+- *Local First* / *"migration to cloud infrastructure possible without rebuilding"* →
+  the Many Ingest ports & adapters design below.
+- *Time is the Primary Metric* / Decision Filter Q2 → `docs/MANYOS_V0.1_PROPOSAL.md`,
+  the worked example of applying this filter to ManyOS's full module list.
+- *"ManyOS is not generic project management software"* (VISION.md, "What ManyOS is
+  NOT") → the ROI proposal's explicit call to use Notion/spreadsheets instead of
+  building a custom project tracker in v0.1.
+- *Modular by Design* → each module (Many Ingest, and future ones) must stay
+  independently replaceable — the reason the ports & adapters approach matters even for
+  a single-user local tool.
+- *AI as an Assistant* — no module should let AI make final creative decisions
+  unsupervised; relevant once modules beyond Many Ingest (which has no AI yet) are
+  built.
+
 ## Terminology
 
-Use ManyFast-specific naming for **user-facing/conceptual** writing (docs, comments that
-explain intent, UI text). Generic technical terms are fine for code-level identifiers
-(interfaces, classes, file names) — the mapping below governs how concepts are described
-to humans, not internal implementation names.
+Use ManyFast-specific naming in documentation and code — avoid generic names when a
+ManyFast equivalent exists. This governs how concepts are described to a human reader;
+code-level identifiers (interfaces, classes, file names such as `Manifest`,
+`manifest.py`) may keep generic/technical names.
 
-| Generic term | Use instead |
+| Term | Definition |
 |---|---|
-| Manifest schema | ManyFast Asset Schema |
-| File organizer | ManyOS Ingest Engine |
-| Project folder | ManyOS Project Workspace |
-| Metadata | Asset Intelligence Data |
+| **ManyOS** | The operating system as a whole |
+| **Many Ingest** | The asset ingestion engine — the module covered by the Many Ingest docs |
+| **ManyFast Asset Schema** | The canonical asset description (what earlier docs called "the manifest schema") |
+| **Project Workspace** | The per-project destination folder (what earlier docs called "the project folder") |
+| **Asset Intelligence** | The AI analysis layer (transcription, tagging, content understanding) |
 
-Example: the `Manifest` interface and `manifest.py` module can keep those technical
-names in code, but when explaining to a reader what that data represents, call it the
-**ManyFast Asset Schema**.
+**Important distinction:** *Asset Intelligence* is the AI analysis layer — it is **not**
+a rename for the plain ffprobe metadata (codec, resolution, duration, timestamp) that
+Many Ingest v0.1 extracts. That extraction has no AI involved and is explicitly out of
+scope for what "Asset Intelligence" means; it stays plain "metadata" until an AI-driven
+analysis module actually exists. An earlier terminology pass conflated the two — this
+has been corrected in the Many Ingest docs.
 
 Read these in order before working on anything in this repo:
-1. `docs/MANYOS_ARCHITECTURE.md` — full target architecture, all planned modules, and
+1. `docs/VISION.md` — mission, Core Principles, success metrics, and the Decision
+   Filter every feature must pass.
+2. `docs/MANYOS_ARCHITECTURE.md` — full target architecture, all planned modules, and
    the v0.1→v1.0 roadmap.
-2. `docs/MANYOS_V0.1_PROPOSAL.md` — ROI-driven reprioritization: explicitly narrows
+3. `docs/MANYOS_V0.1_PROPOSAL.md` — ROI-driven reprioritization: explicitly narrows
    scope down to what actually saves time in the first 30 days, and defers most of the
    architecture doc's scope.
-3. `docs/MANY_INGEST_BUILD_PLAN.md` — the concrete build plan for the first module
+4. `docs/MANY_INGEST_BUILD_PLAN.md` — the concrete build plan for the first module
    actually being built: **Many Ingest** (automatically organizing raw video files
    after a shoot).
-4. `docs/MANY_INGEST_CLOUD_READY_ARCHITECTURE.md` — binding architectural constraints
+5. `docs/MANY_INGEST_CLOUD_READY_ARCHITECTURE.md` — binding architectural constraints
    for how Many Ingest must be structured so it can migrate from local-only to a
    server/cloud setup without a rewrite. Read this before writing any Many Ingest code.
 

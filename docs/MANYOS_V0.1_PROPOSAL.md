@@ -20,18 +20,18 @@ rendement.
 
 | Onderdeel | Bespaart tijd binnen 30 dagen? | Waarom |
 |---|---|---|
-| **AI transcriptie & logging van ruwe footage** | **Ja, direct en meetbaar** | Editors wachten nu op handmatig uitloggen/doorzoeken van footage voor ze kunnen beginnen. Automatische transcriptie is technisch simpel te bouwen (dagen, geen weken) en scheelt direct wachttijd in het kritieke 24H-pad. |
+| **Asset Intelligence (transcriptie & logging van ruwe footage)** | **Ja, direct en meetbaar** | Editors wachten nu op handmatig uitloggen/doorzoeken van footage voor ze kunnen beginnen. Automatische transcriptie is technisch simpel te bouwen (dagen, geen weken) en scheelt direct wachttijd in het kritieke 24H-pad. |
 | **Gestructureerd intake-formulier (zonder AI)** | Ja, bescheiden | Een vast format voor een brief voorkomt heen-en-weer mailen over ontbrekende info. Dit hoeft geen AI te zijn — een goed formulier is al winst. |
 | Core datamodel + custom statusbord | **Nee, niet op zichzelf** | Een spreadsheet of Slack-kanaal doet dit vandaag al "goed genoeg". Dit zelf bouwen kost meer tijd dan het de eerste maand oplevert — dit is infrastructuur, geen tijdsbesparing. |
 | Review & approval portaal | Nee, te groot voor 30 dagen | Waardevol, maar client-facing UX kost weken, niet dagen, om goed te doen. Fout hierin kost ons klantvertrouwen. |
-| AI rough-cut assistent | Nee | Kwaliteit is onzeker, risico op ruis die editor-tijd juist kóst in plaats van bespaart. Pas zinvol als transcriptie/tagging al staat. |
+| AI rough-cut assistent | Nee | Kwaliteit is onzeker, risico op ruis die editor-tijd juist kóst in plaats van bespaart. Pas zinvol als Asset Intelligence al staat. |
 | Delivery-automatisering | Nee, niet urgent | Export/levering is vandaag geen aantoonbare bottleneck vergeleken met footage-prep en klant-feedback. |
 | Scheduling & capaciteit | Nee | Heeft historische data nodig om nuttig te zijn — die hebben we na 30 dagen nog niet. |
 | Analytics/SLA-dashboard | Nee | Kip-en-ei: eerst moet er iets zijn om te meten. Nu bouwen is gokken op aannames. |
 | AI-orchestratielaag (generieke infra) | Nee | Premature abstractie. Bouw dit pas als er twee of meer agents zijn die het daadwerkelijk nodig hebben. |
 
 **Conclusie:** er is precies één onderdeel met een directe, meetbare terugverdientijd
-binnen 30 dagen: **AI transcriptie & logging.** Het intake-formulier is een goedkope
+binnen 30 dagen: **Asset Intelligence.** Het intake-formulier is een goedkope
 bijkomstige winst, geen los project.
 
 ---
@@ -40,7 +40,7 @@ bijkomstige winst, geen los project.
 
 - **Review & approval portaal** — wachten tot na v0.1. Blijf voorlopig werken met wat we
   nu gebruiken (Frame.io/mail/WhatsApp) voor klantfeedback.
-- **AI rough-cut assistent** — wachten tot de transcriptie-pijplijn bewezen heeft dat
+- **AI rough-cut assistent** — wachten tot Asset Intelligence bewezen heeft dat
   hij betrouwbaar en snel is. Zonder goede transcripten heeft een rough-cut-agent niets
   om op te bouwen.
 - **Scheduling & capaciteitsintelligentie** — wachten tot we data hebben. Nu bouwen is
@@ -62,8 +62,8 @@ ons oplost.
 
 ## 3. Met 2 weken: wat zou ik bouwen?
 
-**Eén ding: een automatische pijplijn van ruwe footage naar doorzoekbaar, getagd
-transcript, geleverd op de plek waar het team al werkt.**
+**Eén ding: Asset Intelligence — een automatische pijplijn van ruwe footage naar
+doorzoekbaar, getagd transcript, geleverd op de plek waar het team al werkt.**
 
 Niet meer dan dat. Concreet:
 
@@ -91,12 +91,13 @@ hebben gebouwd.
 
 ## 4. De kleinste versie van ManyOS die al waarde levert (voorstel v0.1)
 
-**ManyOS v0.1 = de transcriptie/logging-automatisering, los toegevoegd aan het bestaande
-proces. Geen platform, geen "OS" in de volledige zin — één bewezen automatisering.**
+**ManyOS v0.1 = Asset Intelligence, de transcriptie/logging-automatisering, los
+toegevoegd aan het bestaande proces. Geen platform, geen "OS" in de volledige zin — één
+bewezen automatisering.**
 
 | Wat wél | Wat niet (nog) |
 |---|---|
-| Automatische transcriptie + tagging van binnenkomende footage | Eigen Project/Klant/Taken-datamodel |
+| Automatische transcriptie + tagging van binnenkomende footage (Asset Intelligence) | Eigen Project/Klant/Taken-datamodel |
 | Output op de plek waar editors nu al werken (Slack/bestand) | Nieuw dashboard of klantportaal |
 | Simpele log van welke bestanden verwerkt zijn (voor controle, geen UI) | Analytics, scheduling, AI-rough-cut |
 | Meting: tijd tot editor start, vóór/na | Client-facing functionaliteit |
