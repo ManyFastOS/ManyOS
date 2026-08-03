@@ -81,10 +81,26 @@ def test_xavc_brand_with_model_still_disambiguates(camera_profiles, make_probe_r
     assert result.confidence == Confidence.HIGH
 
 
-def test_sony_mxf_company_name_matches_via_make_alias(camera_profiles, make_probe_result):
+def test_sony_mxf_company_name_alone_is_not_enough_for_a_specific_model_match(
+    camera_profiles, make_probe_result
+):
     """Sony MXF files expose company_name/product_name rather than make/model
-    (metadata_extractor.py maps company_name -> make); here that alone isn't enough
-    to pick a specific Sony profile since none of ours match on make="Sony" alone."""
+    (metadata_extractor.py maps company_name -> make); make="Sony" alone doesn't hit
+    the make/model tier for any profile. With a filename that doesn't match any
+    pattern either, this correctly stays Onbekend."""
     probe_result = make_probe_result(make="Sony", model="Mem")
-    result = classify(Path("611_3894.MXF"), probe_result, camera_profiles)
-    assert result.category == "Onbekend"  # geen van onze profielen matcht op make="Sony" alleen
+    result = classify(Path("randomly_named_export.mxf"), probe_result, camera_profiles)
+    assert result.category == "Onbekend"
+
+
+def test_611_pattern_matches_fx6_via_filename_at_medium_confidence(camera_profiles):
+    """611_####.MXF is evidence-backed, not illustrative (see
+    docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md section 2b: confirmed Sony FX6
+    across three independent ManyFast projects with crew-labeled "FX6" folders).
+    Without a model tag this still only matches at the filename tier, so confidence
+    stays MEDIUM -- classify() doesn't yet distinguish confirmed patterns from
+    illustrative ones (see proposal section 3c)."""
+    result = classify(Path("611_3894.MXF"), None, camera_profiles)
+    assert result.camera_profile == "Sony FX6"
+    assert result.category == "Camera"
+    assert result.confidence == Confidence.MEDIUM

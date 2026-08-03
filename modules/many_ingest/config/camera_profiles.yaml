@@ -18,6 +18,15 @@ profiles:
     category: Camera
     filename_patterns:
       - "^C\\d{4}\\..*"
+      - "^611_\\d{4}\\.MXF$"   # bewijs-onderbouwd (niet illustratief): bevestigd over
+                                # drie onafhankelijke ManyFast-projecten met crew-
+                                # gelabelde "FX6"-mappen, zie
+                                # docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md sectie 2b.
+                                # Let op: dit matcht via bestandsnaam, dus confidence
+                                # blijft "middel" zolang er geen model-tag aanwezig is
+                                # (classify() kent geen hogere confidence toe aan dit
+                                # specifieke, bevestigde patroon t.o.v. de andere,
+                                # nog illustratieve bestandsnaam-patronen).
     metadata_match:
       model_contains:
         - "FX6"
