@@ -31,6 +31,7 @@ class CameraProfile:
     metadata_make_contains: list[str]
     metadata_model_contains: list[str]
     metadata_brand_contains: list[str]
+    metadata_container_contains: list[str]
     audio_only: bool = False
 
 
@@ -76,6 +77,7 @@ def load_camera_profiles(path: Path) -> list[CameraProfile]:
                 metadata_make_contains=metadata_match.get("make_contains", []),
                 metadata_model_contains=metadata_match.get("model_contains", []),
                 metadata_brand_contains=metadata_match.get("brand_contains", []),
+                metadata_container_contains=metadata_match.get("container_contains", []),
                 audio_only=entry.get("audio_only", False),
             )
         )

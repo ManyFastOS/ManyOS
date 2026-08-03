@@ -1,9 +1,12 @@
 # ManyOS Many Ingest — camera-profielen (v0.1)
 #
-# Elk profiel matcht op bestandsnaam-patronen en/of ffprobe-metadata (make/model/brand-tags).
-# Twee soorten bestandsnaam-patronen, met verschillend gewicht in classify():
+# Elk profiel matcht op bestandsnaam-patronen en/of ffprobe-metadata (make/model/brand/
+# container-tags). Twee soorten bestandsnaam-patronen, met verschillend gewicht in
+# classify():
 #   - confirmed_filename_patterns: getoetst tegen echte ManyFast-footage -> HIGH confidence
 #   - filename_patterns: illustratief/generiek, nog niet bevestigd -> MEDIUM confidence
+# container_contains (containerformaat, bijv. "mxf" vs "mp4") is ook een HIGH-signaal
+# als het bevestigd is tegen echte footage — zie sony_fx6/sony_fx3 hieronder.
 # Metadata weegt binnen elk niveau zwaarder dan bestandsnaam (zie
 # docs/MANY_INGEST_BUILD_PLAN.md, sectie 4) — dat is met name relevant hier omdat
 # Sony FX6 en FX3 dezelfde generieke clip-naamgeving kunnen gebruiken; alleen
@@ -13,6 +16,15 @@
 # make/model in format.tags, maar wel een herkenbare major_brand "XAVC" — vandaar
 # brand_contains hieronder. Sony MXF-bestanden gebruiken company_name/product_name
 # i.p.v. make/model (afgehandeld in metadata_extractor.py, niet hier).
+#
+# Getoetst tegen echte footage (2026-08-03, vervolgonderzoek): over 9 crew-gelabelde
+# "FX6"/"FX3"-mappen in 3 onafhankelijke projecten, zonder uitzondering: FX6-mappen
+# bevatten uitsluitend .MXF, FX3-mappen uitsluitend .MP4 (XAVC). Dit is een bevestigde
+# workflow-conventie bij ManyFast, GEEN onveranderlijke hardware-eigenschap van de
+# camera's zelf (beide camera's kunnen technisch in beide formaten opnemen) — vandaar
+# HIGH-confidence, niet omdat het een hardware-feit is zoals make/model, maar omdat het
+# empirisch 100% consistent is gebleken. Zie
+# docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md secties 7-8.
 #
 # Nieuw apparaat toevoegen = nieuwe entry hieronder. Geen codewijziging nodig.
 
@@ -33,6 +45,8 @@ profiles:
         - "ILME-FX6"
       brand_contains:
         - "XAVC"
+      container_contains:
+        - "mxf"   # tweede, onafhankelijke bevestiging naast confirmed_filename_patterns
 
   - id: sony_a7iv
     label: "Sony A7 IV"
@@ -55,6 +69,9 @@ profiles:
         - "ILME-FX3"
       brand_contains:
         - "XAVC"
+      container_contains:
+        - "mp4"   # bevestigd over 3 onafhankelijke crew-gelabelde "FX3"-mappen:
+                   # deze camera staat bij ManyFast altijd op XAVC-MP4, nooit MXF.
 
   - id: dji
     label: "DJI"

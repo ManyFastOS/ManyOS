@@ -152,7 +152,8 @@ ManyFast geverifieerd worden vóór implementatie):
   zijn getoetst (optioneel; bepaalt HIGH-confidence, zie hieronder)
 - `filename_patterns` — nog illustratieve/niet-bevestigde regex-patronen (optioneel;
   bepaalt MEDIUM-confidence)
-- `metadata_match` — te zoeken waarden in ffprobe `make`/`model`/brand-tags (optioneel)
+- `metadata_match` — te zoeken waarden in ffprobe `make`/`model`/brand/
+  containerformaat-tags (optioneel)
 - Voor **Audio**: `audio_only` (alleen-audiostream-check) i.p.v. bestandsnaam/metadata,
   want dat is feitelijk vast te stellen, niet te gokken.
 
@@ -160,7 +161,11 @@ ManyFast geverifieerd worden vóór implementatie):
 `docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md` voor de volledige aanleiding):
 generiek getierd naar betrouwbaarheid van het *signaal*, niet per camera:
 - **HIGH** — exacte make/model-metadata-match (of, voor Audio, echte
-  streamanalyse), **of** een `confirmed_filename_patterns`-match.
+  streamanalyse), een `confirmed_filename_patterns`-match, **of** een bevestigde
+  `container_contains`-match (bijv. MXF vs. XAVC-MP4 als bevestigde
+  ManyFast-workflowconventie — zie de kanttekening hierover in
+  `camera_profiles.yaml`: dit is een workflow-conventie, geen onveranderlijk
+  hardware-feit).
 - **MEDIUM** — een brand-match (major_brand/compatible_brands, bijv. Sony's
   "XAVC"), **of** een generieke, nog niet-bevestigde `filename_patterns`-match.
 - **LOW ("Onbekend")** — niets matcht, of meerdere profielen matchen op hetzelfde

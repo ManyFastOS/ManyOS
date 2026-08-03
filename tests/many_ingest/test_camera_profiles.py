@@ -54,16 +54,48 @@ def test_audio_via_extension_without_metadata(camera_profiles):
     assert result.confidence == Confidence.MEDIUM
 
 
-def test_xavc_brand_without_model_stays_ambiguous_between_fx6_and_fx3(
+def test_xavc_brand_without_model_or_container_stays_ambiguous(
     camera_profiles, make_probe_result
 ):
-    """Mirrors a real file from the Jan Rotmans footage (C9666.MP4): Sony XAVC MP4
-    carries no make/model tags, only major_brand=XAVC — which both FX6 and FX3
-    profiles match, so this must stay Onbekend rather than guess."""
+    """Edge case: brand=XAVC known but container_format somehow unavailable (e.g. a
+    future container ffprobe can't identify) — both FX6 and FX3 share brand_contains,
+    so without the container tie-breaker this must stay Onbekend rather than guess.
+    A real C9666.MP4-style file always has a container_format; see
+    test_container_format_resolves_fx3_without_model_tag for that realistic case."""
     probe_result = make_probe_result(major_brand="XAVC", compatible_brands="XAVCmp42iso6")
     result = classify(Path("C9666.MP4"), probe_result, camera_profiles)
     assert result.category == "Onbekend"
     assert result.confidence == Confidence.LOW
+
+
+def test_container_format_resolves_fx3_without_model_tag(camera_profiles, make_probe_result):
+    """The real-world fix: C9666.MP4-style Sony XAVC MP4 files carry no make/model
+    tag, but container_contains=["mp4"] is confirmed FX3-specific within ManyFast's
+    workflow (see docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md sections 7-8) — no
+    longer Onbekend."""
+    probe_result = make_probe_result(
+        major_brand="XAVC",
+        compatible_brands="XAVCmp42iso6",
+        container_format="mov,mp4,m4a,3gp,3g2,mj2",
+    )
+    result = classify(Path("C9666.MP4"), probe_result, camera_profiles)
+    assert result.category == "Camera"
+    assert result.camera_profile == "Sony FX3"
+    assert result.confidence == Confidence.HIGH
+
+
+def test_container_format_resolves_fx6_independent_of_confirmed_filename(
+    camera_profiles, make_probe_result
+):
+    """An MXF file that doesn't match the 611_####.MXF confirmed filename pattern
+    (e.g. a different numbering scheme) still resolves to Sony FX6 via the
+    container-format signal alone — the container match doesn't depend on the
+    filename pattern also matching."""
+    probe_result = make_probe_result(container_format="mxf")
+    result = classify(Path("some_other_name.MXF"), probe_result, camera_profiles)
+    assert result.category == "Camera"
+    assert result.camera_profile == "Sony FX6"
+    assert result.confidence == Confidence.HIGH
 
 
 def test_xavc_brand_with_model_still_disambiguates(camera_profiles, make_probe_result):

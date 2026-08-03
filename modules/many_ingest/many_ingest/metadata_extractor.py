@@ -31,6 +31,7 @@ class ProbeResult:
     creation_time: str | None
     major_brand: str | None
     compatible_brands: str | None
+    container_format: str | None
 
 
 def _ffprobe_path() -> str:
@@ -64,8 +65,9 @@ def probe(path: Path) -> ProbeResult:
     streams = data.get("streams", [])
     video_streams = [s for s in streams if s.get("codec_type") == "video"]
     audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
-    format_tags = data.get("format", {}).get("tags", {}) or {}
-    duration = data.get("format", {}).get("duration")
+    format_info = data.get("format", {})
+    format_tags = format_info.get("tags", {}) or {}
+    duration = format_info.get("duration")
     first_video = video_streams[0] if video_streams else None
 
     return ProbeResult(
@@ -81,6 +83,7 @@ def probe(path: Path) -> ProbeResult:
         creation_time=_first_tag(format_tags, ["creation_time"]),
         major_brand=_first_tag(format_tags, ["major_brand"]),
         compatible_brands=_first_tag(format_tags, ["compatible_brands"]),
+        container_format=format_info.get("format_name"),
     )
 
 

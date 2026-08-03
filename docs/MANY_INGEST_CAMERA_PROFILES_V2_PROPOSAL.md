@@ -244,17 +244,121 @@ voorkeur van een ongewijzigd, origineel bestand (geen export/hernoemde kopie).
 - [ ] Bestandsnaam-patroon van het toestel zelf
 
 ### Sony FX3
-- [ ] Eén originele clip (ongewijzigde bestandsnaam)
-- [ ] Volledige `ffprobe`-output
-- [ ] Opnameformat in de praktijk
-- [ ] Aantal audiokanalen dat déze crew doorgaans gebruikt op de FX3 — als dit
-      structureel lager is dan bij de FX6-opstelling, is kanaalaantal mogelijk zelf
-      een bruikbaar onderscheidend signaal tussen de twee
-- [ ] Bestandsnaam-patroon (huidige aanname deelt `C####` met de FX6 — bevestigen of
-      dat ook in de praktijk zo is)
+- [x] Eén originele clip (ongewijzigde bestandsnaam) — bevestigd via 3 crew-gelabelde
+      "FX3"-mappen (sectie 7)
+- [x] Volledige `ffprobe`-output — zie sectie 7
+- [x] Opnameformat in de praktijk — **XAVC-MP4, consistent, geen MXF gezien**
+- [ ] Aantal audiokanalen dat déze crew doorgaans gebruikt op de FX3 — nog niet apart
+      onderzocht (niet nodig geweest: containerformaat bleek al voldoende)
+- [x] Bestandsnaam-patroon — bevestigd: deelt inderdaad `C####` met de FX6, zoals
+      aangenomen; daarom lost bestandsnaam dit niet op, containerformaat wel
+      (sectie 7-8)
 
 Zodra dit binnen is per toestel, kan sectie 3b (of een verdere verfijning daarvan)
 op bewijs in plaats van aannames gebouwd worden.
+
+---
+
+## 6. Analyse: category vs. camera_profile na de eerste echte ingest
+
+**Bevinding uit de praktijk:** Sony FX6 wordt correct herkend, maar `category`
+blijft "Camera"; Sony FX3 komt nog steeds uit op "Onbekend".
+
+**Analyse van de huidige classificatielogica:** dit eerste deel is **geen bug** —
+het is precies hoe het schema is ontworpen, en dat ontwerp is nog steeds juist:
+
+- `category` (Camera/Drone/Audio) bepaalt uitsluitend de Project Workspace-submap.
+  Dit is bewust **generiek** gehouden (zie `MANY_INGEST_BUILD_PLAN.md`, sectie 6) —
+  er komt geen aparte submap per cameramodel, dat zou de mapstructuur onnodig
+  versnipperen voor iets dat de bestandsnaam/schema al vastlegt.
+- `camera_profile` (bijv. "Sony FX6") bevat het specifieke apparaat, apart
+  vastgelegd in de ManyFast Asset Schema, ook al bepaalt het geen eigen map.
+
+Met andere woorden: **doel 1 en 2 uit deze vraag zijn al vervuld door het bestaande
+ontwerp** — `category` is en blijft generiek, `camera_profile` draagt al het
+specifieke apparaat. Dat FX6 "goed" voelt en FX3 "fout" is geen verschil in hóe het
+systeem werkt, maar puur een verschil in **welk signaal beschikbaar is**: FX6 heeft
+sinds 3c/3d een bevestigd signaal (`611_####.MXF`), FX3 nog niet. Sectie 7
+hieronder onderzoekt of we daar nu wél een betrouwbaar signaal voor hebben.
+
+---
+
+## 7. Nieuwe bevinding: containerformaat (MXF vs. MP4) als FX3-signaal
+
+Onderzoek op de externe SSD naar crew-gelabelde "FX3"-mappen (dezelfde methode als
+bij FX6 in sectie 2b) leverde drie onafhankelijke, door de crew zelf "FX3" genoemde
+mappen op, in drie verschillende projecten — waaronder **hetzelfde DTC-project**
+dat ook de bevestigde FX6-map bevat:
+
+| Map (crew-gelabeld) | Bestanden |
+|---|---|
+| `DTC/Video/Fx6` | 48× `611_####.MXF` |
+| `DTC/Video/Fx3` | 85× `C####.MP4` |
+| `Hype/FX3` | 22× `C####.MP4` |
+| `VdPanne/Fx3` | 25× `C####.MP4` |
+| (plus 5 andere FX6-mappen, zie sectie 2b) | uitsluitend `.MXF` |
+
+**Over alle 9 gecontroleerde mappen, in 3 onafhankelijke projecten: FX6-mappen
+bevatten uitsluitend `.MXF`, FX3-mappen uitsluitend `.MP4` — geen enkele
+uitzondering.** Een volledige `ffprobe`-dump van een bevestigde FX3-clip
+(`C0690.MP4` uit `DTC/Video/Fx3`) bevestigt: `major_brand: XAVC`,
+`compatible_brands: XAVCmp42iso6` — **identiek** aan de FX6 XAVC-MP4-bevinding uit
+sectie 2, en nog steeds **geen** make/model-tag.
+
+**Wat dit wél en niet bewijst:**
+- Het bevestigt **niet** iets nieuws over de camera's zelf — FX6 en FX3 zijn beide
+  technisch prima in staat om zowel MXF als XAVC-MP4 op te nemen. Dit is een
+  camera-menu-instelling (opnameformaat), geen vaste hardware-eigenschap.
+- Het bevestigt wél, empirisch en zonder uitzondering, dat **binnen ManyFast's
+  huidige workflow** de FX6 kennelijk altijd op MXF staat ingesteld en de FX3
+  altijd op XAVC-MP4 — een consistente operationele conventie, net als bij de
+  `611_####`-naamgeving.
+- **Risico, expliciet benoemd:** dit is dus een iets ander soort bewijs dan
+  `company_name`/`model_contains` (onveranderlijke hardware-feiten). Het is een
+  workflow-conventie die in theorie kan veranderen als iemand ooit een
+  camera-instelling wijzigt. Zolang de conventie standhoudt is het signaal
+  betrouwbaar; als de conventie ooit doorbroken wordt, misclassificeert dit
+  signaal in plaats van "Onbekend" te tonen.
+- **Nog te bevestigen:** of Sony A7IV ook XAVC-MP4 met een vergelijkbaar
+  `C####`-patroon gebruikt (staat al op de checklist in sectie 5). Zo ja, dan moet
+  het containerformaat-signaal ook tegen A7IV getoetst worden vóór het als
+  onderscheidend voor specifiek FX3 wordt vastgelegd.
+
+---
+
+## 8. Voorstel: containerformaat als generiek metadata-signaal — **toegepast**
+
+Voeg **containerformaat** (ffprobe `format.format_name`, bijv. `"mxf"` versus
+`"mov,mp4,m4a,3gp,3g2,mj2"`) toe als nieuw, generiek metadata-veld — net zo generiek
+als `make`/`model`/`brand_contains` nu al zijn, geen FX6/FX3-specifieke code:
+
+- `ProbeResult` krijgt een `container_format`-veld (rechtstreeks uit ffprobe).
+- `CameraProfile`/`camera_profiles.yaml` krijgt een optioneel
+  `metadata_match.container_contains` (net als `make_contains`/`brand_contains`).
+- `sony_fx3` krijgt `container_contains: ["mov,mp4"]` (of specifieker) — dit is het
+  stuk dat het "Onbekend"-probleem voor FX3 daadwerkelijk oplost.
+- `sony_fx6` kan optioneel `container_contains: ["mxf"]` erbij krijgen — een tweede,
+  onafhankelijke bevestiging naast de al bestaande `611_####.MXF`-match, niet
+  strikt nodig maar wel consistent.
+
+**Voorgestelde confidence-tier:** HIGH, net als `confirmed_filename_patterns` —
+dit is qua bewijskracht (crew-conventie, 100% consistent over 9 mappen) gelijkwaardig
+aan hoe de `611_####`-match tot stand kwam, dus verdient dezelfde behandeling. De
+kanttekening uit sectie 7 (workflow-conventie i.p.v. hardware-feit) staat dan als
+commentaar in de YAML, net zoals dat nu al bij `611_####.MXF` gebeurt.
+
+**Akkoord ontvangen en geïmplementeerd** (`ProbeResult.container_format`,
+`CameraProfile.metadata_container_contains`, `_matches_container()` in de HIGH-tier
+van `classify()`). `sony_fx3` kreeg `container_contains: ["mp4"]`, `sony_fx6` kreeg
+`container_contains: ["mxf"]` als tweede, onafhankelijke bevestiging. De
+A7IV-onzekerheid uit sectie 7 blijft een open risico — nog niet weggenomen, alleen
+bewust geaccepteerd voor dit besluit (zie sectie 5-checklist).
+
+**Bevestigd op echte Jan Rotmans-footage:** `C9666.MP4` t/m `C9677.MP4` gaan nu naar
+`Camera / "Sony FX3" / confidence: hoog` (was: `Onbekend`). Alle `611_####.MXF`
+blijven `Camera / "Sony FX6" / confidence: hoog`. 40 tests slagen, inclusief 3
+nieuwe die specifiek dit scenario en het "container onbekend, blijft ambigu"-randgeval
+dekken.
 
 ---
 
@@ -267,6 +371,10 @@ op bewijs in plaats van aannames gebouwd worden.
    model-match toch als "Camera / Sony (model onbekend)" i.p.v. "Onbekend"
    classificeert. Dit staat los van de nu doorgevoerde confidence-tiers en vereist
    nog steeds een aparte, expliciete `classify()`-uitbreiding.
-4. Antwoord op de drie vragen in sectie 4 en de checklist in sectie 5, zodat
-   FX6/FX3/DJI/GoPro verder op echte data in plaats van aannames gebaseerd kunnen
-   worden.
+4. ~~Akkoord op sectie 8 (containerformaat)~~ — **toegepast.**
+5. Antwoord op de drie vragen in sectie 4 en de checklist in sectie 5 (met name
+   A7IV nog volledig open), zodat verdere uitbreidingen op echte data in plaats van
+   aannames gebaseerd kunnen worden.
+5. **Nieuw: akkoord op sectie 8** (containerformaat als generiek HIGH-signaal,
+   lost het FX3-"Onbekend"-probleem op) — inclusief bewust akkoord op het
+   workflow-conventie-risico uit sectie 7, vóór implementatie.
