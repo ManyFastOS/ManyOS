@@ -4,12 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-ManyOS is currently in the **design/planning stage** — no application code exists yet.
-The repository only contains architecture and planning documents under `docs/`, plus
-empty `modules/` and `tests/` directories reserved for future code. There are no
-build, lint, or test commands yet because there is nothing to build. Once the first
-module (Many Ingest) is implemented, this file should be updated with the actual
-commands (e.g. how to install dependencies, run the CLI, run tests).
+The first module, **Many Ingest**, is built and working (`modules/many_ingest/`) —
+scans a folder, classifies files by type and probable camera source, previews via
+`--dry-run`, copies with checksum verification, and logs every action. See
+`docs/MANY_INGEST_BUILD_PLAN.md` for what it does and
+`docs/MANY_INGEST_V0.1_READINESS_ASSESSMENT.md` for what's still missing before
+non-technical daily use. To develop/test it:
+
+```
+cd modules/many_ingest
+.venv/bin/pip install -e ".[dev]"   # venv created via: python3.11 -m venv .venv
+.venv/bin/pytest                     # runs tests/many_ingest/
+.venv/bin/many-ingest run --source ... --client ... --project ... --dry-run
+```
+
+No other modules are built yet — see "Module structure" below for how future
+modules (Many Select, Many Review, Many Delivery, ...) are meant to be organized.
 
 ## What ManyOS is
 
@@ -20,6 +30,33 @@ improve. ManyOS is not a single tool but an orchestration layer that will eventu
 connect production stages (intake → asset ingestion → editing → review → delivery) via
 an event-driven core, with AI agents automating specific steps (transcription, tagging,
 rough cuts, notifications).
+
+## Module structure
+
+Every ManyOS capability is its own fully independent module — never a shared
+monolith. This is VISION.md's *Modular by Design* principle made concrete: each
+module must be replaceable, extendable, and independently testable on its own.
+
+Anticipated modules (only Many Ingest exists so far — the others are named here so
+future work follows the same convention from the start, not because they're built
+or scheduled):
+- `many_ingest` — asset ingestion (built)
+- `many_select` — not yet built
+- `many_review` — not yet built
+- `many_delivery` — not yet built
+
+**The established pattern (from `modules/many_ingest/`), to repeat for every new
+module:**
+- Its own directory under `modules/<name>/`, with its own `pyproject.toml`,
+  dependencies, and (gitignored) `.venv/` — never a shared/root-level dependency
+  set across modules.
+- Its own README pointing back to its design docs in `docs/`.
+- Its own tests, mirrored under `tests/<name>/` at the repo root (not nested inside
+  the module directory — that's the layout choice already made for Many Ingest).
+- No direct imports between module packages. If two modules need to share
+  something later (e.g. a common ManyFast Asset Schema client), that becomes its
+  own small, separately-versioned package — not one module reaching into another's
+  internals.
 
 ## Vision & Principles
 
