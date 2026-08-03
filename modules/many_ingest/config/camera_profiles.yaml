@@ -6,7 +6,11 @@
 #   - confirmed_filename_patterns: getoetst tegen echte ManyFast-footage -> HIGH confidence
 #   - filename_patterns: illustratief/generiek, nog niet bevestigd -> MEDIUM confidence
 # container_contains (containerformaat, bijv. "mxf" vs "mp4") is ook een HIGH-signaal
-# als het bevestigd is tegen echte footage — zie sony_fx6/sony_fx3 hieronder.
+# als het bevestigd is tegen echte footage — zie sony_fx6/sony_fx3 hieronder. Niet elk
+# containerformaat is even specifiek: "mp4" komt bij vrijwel elk toestel voor, dus een
+# profiel kan container_requires_brand: true zetten om te eisen dat brand_contains ook
+# matcht vóórdat container meetelt (zie sony_fx3). "mxf" is smal genoeg om op zichzelf
+# te staan (zie sony_fx6) — dit is per profiel een databeslissing, geen codewijziging.
 # Metadata weegt binnen elk niveau zwaarder dan bestandsnaam (zie
 # docs/MANY_INGEST_BUILD_PLAN.md, sectie 4) — dat is met name relevant hier omdat
 # Sony FX6 en FX3 dezelfde generieke clip-naamgeving kunnen gebruiken; alleen
@@ -72,6 +76,13 @@ profiles:
       container_contains:
         - "mp4"   # bevestigd over 3 onafhankelijke crew-gelabelde "FX3"-mappen:
                    # deze camera staat bij ManyFast altijd op XAVC-MP4, nooit MXF.
+      container_requires_brand: true   # "mp4" alleen is te generiek (bijna elk toestel
+                                        # produceert MP4) — vereist ook brand_contains
+                                        # (XAVC) vóórdat container meetelt. Fix voor een
+                                        # bevestigde bug: willekeurige MP4-bestanden
+                                        # classificeerden anders als "Sony FX3" met
+                                        # hoge confidence. Zie
+                                        # docs/MANY_INGEST_V0.1_READINESS_ASSESSMENT.md.
 
   - id: dji
     label: "DJI"

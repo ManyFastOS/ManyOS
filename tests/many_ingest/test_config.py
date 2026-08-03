@@ -50,3 +50,44 @@ def test_load_camera_profiles_rejects_unknown_category(tmp_path):
     path.write_text("profiles:\n  - id: x\n    label: X\n    category: Spaceship\n")
     with pytest.raises(ValueError, match="Spaceship"):
         load_camera_profiles(path)
+
+
+def test_container_requires_brand_defaults_to_false(tmp_path):
+    path = tmp_path / "camera_profiles.yaml"
+    path.write_text(
+        "profiles:\n"
+        "  - id: x\n"
+        "    label: X\n"
+        "    category: Camera\n"
+        "    metadata_match:\n"
+        "      container_contains: [\"mp4\"]\n"
+    )
+    profiles = load_camera_profiles(path)
+    assert profiles[0].container_requires_brand is False
+
+
+def test_container_requires_brand_loads_when_set_true(tmp_path):
+    path = tmp_path / "camera_profiles.yaml"
+    path.write_text(
+        "profiles:\n"
+        "  - id: x\n"
+        "    label: X\n"
+        "    category: Camera\n"
+        "    metadata_match:\n"
+        "      container_contains: [\"mp4\"]\n"
+        "      container_requires_brand: true\n"
+    )
+    profiles = load_camera_profiles(path)
+    assert profiles[0].container_requires_brand is True
+
+
+def test_sony_fx3_in_the_real_config_requires_brand_for_its_container_signal(camera_profiles):
+    fx3 = next(p for p in camera_profiles if p.id == "sony_fx3")
+    assert fx3.container_requires_brand is True
+
+
+def test_sony_fx6_in_the_real_config_does_not_require_brand_for_its_container_signal(
+    camera_profiles,
+):
+    fx6 = next(p for p in camera_profiles if p.id == "sony_fx6")
+    assert fx6.container_requires_brand is False

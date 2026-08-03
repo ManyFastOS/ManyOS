@@ -72,7 +72,10 @@ def test_container_format_resolves_fx3_without_model_tag(camera_profiles, make_p
     """The real-world fix: C9666.MP4-style Sony XAVC MP4 files carry no make/model
     tag, but container_contains=["mp4"] is confirmed FX3-specific within ManyFast's
     workflow (see docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md sections 7-8) — no
-    longer Onbekend."""
+    longer Onbekend. sony_fx3 has container_requires_brand=true, so this only works
+    because major_brand="XAVC" is also present here — see
+    test_generic_mp4_without_sony_metadata_is_never_classified_as_fx3 for what
+    happens when it's absent."""
     probe_result = make_probe_result(
         major_brand="XAVC",
         compatible_brands="XAVCmp42iso6",
@@ -90,12 +93,32 @@ def test_container_format_resolves_fx6_independent_of_confirmed_filename(
     """An MXF file that doesn't match the 611_####.MXF confirmed filename pattern
     (e.g. a different numbering scheme) still resolves to Sony FX6 via the
     container-format signal alone — the container match doesn't depend on the
-    filename pattern also matching."""
+    filename pattern also matching. FX6 has no container_requires_brand set, so
+    this stays unaffected by the FX3 fix below."""
     probe_result = make_probe_result(container_format="mxf")
     result = classify(Path("some_other_name.MXF"), probe_result, camera_profiles)
     assert result.category == "Camera"
     assert result.camera_profile == "Sony FX6"
     assert result.confidence == Confidence.HIGH
+
+
+def test_generic_mp4_without_sony_metadata_is_never_classified_as_fx3(
+    camera_profiles, make_probe_result
+):
+    """Regression test for a real, confirmed bug (2026-08-03): container_contains
+    ["mp4"] alone matched almost any MP4 file. A plain, non-Sony MP4 (real-world
+    equivalent: major_brand="isom", no XAVC brand, no Sony tags at all, and a
+    filename that doesn't match any pattern) must resolve to Onbekend, never to
+    "Sony FX3" — container_requires_brand on sony_fx3 is the fix."""
+    probe_result = make_probe_result(
+        major_brand="isom",
+        compatible_brands="isomiso2avc1mp41",
+        container_format="mov,mp4,m4a,3gp,3g2,mj2",
+    )
+    result = classify(Path("random_export.mp4"), probe_result, camera_profiles)
+    assert result.camera_profile != "Sony FX3"
+    assert result.category == "Onbekend"
+    assert result.confidence == Confidence.LOW
 
 
 def test_xavc_brand_with_model_still_disambiguates(camera_profiles, make_probe_result):

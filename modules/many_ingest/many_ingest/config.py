@@ -33,6 +33,7 @@ class CameraProfile:
     metadata_brand_contains: list[str]
     metadata_container_contains: list[str]
     audio_only: bool = False
+    container_requires_brand: bool = False
 
 
 def load_ingest_config(path: Path) -> IngestConfig:
@@ -79,6 +80,7 @@ def load_camera_profiles(path: Path) -> list[CameraProfile]:
                 metadata_brand_contains=metadata_match.get("brand_contains", []),
                 metadata_container_contains=metadata_match.get("container_contains", []),
                 audio_only=entry.get("audio_only", False),
+                container_requires_brand=metadata_match.get("container_requires_brand", False),
             )
         )
     return profiles

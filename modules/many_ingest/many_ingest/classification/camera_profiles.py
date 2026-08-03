@@ -14,6 +14,16 @@ tiers are generic across all profiles, there is no per-camera special-casing:
   and the explicit caveat: this is a confirmed *workflow convention*, not an
   immutable hardware fact like make/model — reliable as long as the convention
   holds.
+
+  **Not all container values are equally specific.** MXF is rare/specific enough
+  (in ManyFast's own equipment) to stand alone. MP4 is nearly universal — almost
+  any camera or phone produces it — so on its own it identifies nothing. A profile
+  can opt in to `metadata_match.container_requires_brand: true` (e.g. Sony FX3) to
+  require its `brand_contains` to *also* match before the container counts for
+  anything; this fixed a real bug where generic MP4 files (no Sony metadata at
+  all) were classifying as "Sony FX3" at HIGH confidence. This is a per-profile
+  data decision, not a hardcoded FX3 exception — any profile whose container
+  value turns out to be similarly generic can opt in the same way.
 - **MEDIUM** — a container-brand match (major_brand/compatible_brands, e.g. Sony's
   "XAVC" — real metadata, but shared across models so less specific), OR a generic,
   not-yet-confirmed filename pattern (`filename_patterns` — e.g. `DJI_*`, `GH*`,
@@ -119,6 +129,9 @@ def _matches_brand(probe_result: ProbeResult | None, profile: CameraProfile) -> 
 def _matches_container(probe_result: ProbeResult | None, profile: CameraProfile) -> bool:
     if probe_result is None or not profile.metadata_container_contains:
         return False
+
+    if profile.container_requires_brand and not _matches_brand(probe_result, profile):
+        return False  # bijv. "mp4" alleen is te generiek — vereist ook een merksignaal
 
     container = (probe_result.container_format or "").lower()
     return any(needle.lower() in container for needle in profile.metadata_container_contains)
