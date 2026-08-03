@@ -1,0 +1,25 @@
+[project]
+name = "many-ingest"
+version = "0.1.0"
+description = "ManyOS Many Ingest — automatically organizes raw video files after a shoot."
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+many-ingest = "many_ingest.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["many_ingest*"]
+
+[tool.pytest.ini_options]
+testpaths = ["../../tests/many_ingest"]

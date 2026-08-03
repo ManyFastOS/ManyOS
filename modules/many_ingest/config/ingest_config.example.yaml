@@ -1,0 +1,10 @@
+# ManyOS Many Ingest — lokale configuratie (v0.1)
+#
+# Kopieer dit bestand naar ~/.many-ingest/config.yaml en pas storage_root aan naar de
+# daadwerkelijke opslaglocatie (externe SSD/NAS). Klant en project worden per run als
+# CLI-argument meegegeven, niet hier geconfigureerd (zie MANY_INGEST_BUILD_PLAN.md,
+# sectie 7: "Geen automatische klant/project-herkenning").
+
+storage_root: "~/ManyFast/Ingest"
+manifest_path: "~/.many-ingest/asset_schema.json"
+log_dir: "~/.many-ingest/logs"

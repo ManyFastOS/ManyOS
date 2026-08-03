@@ -1,0 +1,66 @@
+# ManyOS Many Ingest — camera-profielen (v0.1)
+#
+# Elk profiel matcht op bestandsnaam-patronen en/of ffprobe-metadata (make/model-tags).
+# Metadata weegt zwaarder dan bestandsnaam (zie docs/MANY_INGEST_BUILD_PLAN.md, sectie 4)
+# — dat is met name relevant hier omdat Sony FX6 en FX3 dezelfde clip-naamgeving kunnen
+# gebruiken; alleen de metadata `model`-tag onderscheidt ze betrouwbaar.
+#
+# Nieuw apparaat toevoegen = nieuwe entry hieronder. Geen codewijziging nodig.
+
+profiles:
+  - id: sony_fx6
+    label: "Sony FX6"
+    category: Camera
+    filename_patterns:
+      - "^C\\d{4}\\..*"
+    metadata_match:
+      model_contains:
+        - "FX6"
+        - "ILME-FX6"
+
+  - id: sony_a7iv
+    label: "Sony A7 IV"
+    category: Camera
+    filename_patterns:
+      - "^DSC\\d+\\..*"
+    metadata_match:
+      model_contains:
+        - "A7M4"
+        - "ILCE-7M4"
+
+  - id: sony_fx3
+    label: "Sony FX3"
+    category: Camera
+    filename_patterns:
+      - "^C\\d{4}\\..*"
+    metadata_match:
+      model_contains:
+        - "FX3"
+        - "ILME-FX3"
+
+  - id: dji
+    label: "DJI"
+    category: Drone
+    filename_patterns:
+      - "^DJI_.*"
+    metadata_match:
+      make_contains:
+        - "DJI"
+
+  - id: gopro
+    label: "GoPro"
+    category: Camera
+    filename_patterns:
+      - "^GH\\d+\\..*"
+      - "^GOPR\\d+\\..*"
+      - "^GX\\d+\\..*"
+    metadata_match:
+      make_contains:
+        - "GoPro"
+
+  - id: audio
+    label: "Audio"
+    category: Audio
+    audio_only: true
+    filename_patterns:
+      - ".*\\.(wav|mp3)$"
