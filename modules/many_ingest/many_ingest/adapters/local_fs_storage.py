@@ -25,6 +25,9 @@ class LocalFilesystemStorage(Storage):
                 continue
             yield path
 
+    def exists(self, path: Path) -> bool:
+        return Path(path).exists()
+
     def checksum(self, path: Path) -> str:
         digest = hashlib.sha256()
         with Path(path).open("rb") as handle:

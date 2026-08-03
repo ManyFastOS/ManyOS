@@ -22,6 +22,14 @@ class Storage(abc.ABC):
         """
 
     @abc.abstractmethod
+    def exists(self, path: Path) -> bool:
+        """Return True if a file already exists at `path`.
+
+        Added for collision protection: the ingest pipeline must know whether a
+        destination is already occupied before ever writing to it.
+        """
+
+    @abc.abstractmethod
     def checksum(self, path: Path) -> str:
         """Return a SHA-256 hex digest of the file's contents."""
 

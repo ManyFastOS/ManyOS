@@ -46,3 +46,13 @@ def test_copy_creates_destination_dirs_and_preserves_content_and_source(tmp_path
 
     assert destination.read_bytes() == b"payload"
     assert source.exists()  # copy-only in v0.1 — bron blijft altijd onaangeroerd
+
+
+def test_exists_reflects_real_filesystem_state(tmp_path):
+    present = tmp_path / "present.bin"
+    present.write_bytes(b"x")
+    absent = tmp_path / "absent.bin"
+
+    storage = LocalFilesystemStorage()
+    assert storage.exists(present) is True
+    assert storage.exists(absent) is False

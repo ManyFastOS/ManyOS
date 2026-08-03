@@ -9,7 +9,14 @@ import click
 from many_ingest.adapters.json_manifest import JSONManifest
 from many_ingest.adapters.local_fs_storage import LocalFilesystemStorage
 from many_ingest.config import load_camera_profiles, load_ingest_config
-from many_ingest.core.ingest_service import AssetOutcome, IngestReport, IngestService
+from many_ingest.core.ingest_service import (
+    AssetOutcome,
+    IngestReport,
+    IngestService,
+    ProgressUpdate,
+)
+from many_ingest.core.report import render_report, summarize
+from many_ingest.metadata_extractor import FfprobeNotFoundError
 
 DEFAULT_CONFIG_PATH = Path("~/.many-ingest/config.yaml").expanduser()
 DEFAULT_CAMERA_PROFILES_PATH = Path("~/.many-ingest/camera_profiles.yaml").expanduser()
@@ -60,8 +67,36 @@ def run(
         camera_profiles=camera_profiles,
     )
 
-    report = service.run(source=source, client=client, project=project, dry_run=dry_run)
+    try:
+        report = service.run(
+            source=source,
+            client=client,
+            project=project,
+            dry_run=dry_run,
+            progress_callback=_print_progress,
+        )
+    except FfprobeNotFoundError as exc:
+        click.echo(f"\n{exc}", err=True)
+        raise SystemExit(1) from exc
+
+    click.echo()  # sluit de laatste voortgangsregel af met een newline
     _print_report(report)
+
+    summary = summarize(report)
+    report_text = render_report(summary)
+    click.echo("\n" + report_text)
+
+    report_path = report.log_path.with_name(f"{report.run_id}_report.txt")
+    report_path.write_text(report_text, encoding="utf-8")
+
+
+def _print_progress(update: ProgressUpdate) -> None:
+    percentage = round((update.processed / update.total) * 100) if update.total else 100
+    click.echo(
+        f"\rVerwerken {update.processed}/{update.total} ({percentage}%) "
+        f"— {update.current_file}" + " " * 20,
+        nl=False,
+    )
 
 
 def _print_report(report: IngestReport) -> None:
@@ -83,6 +118,9 @@ def _print_report(report: IngestReport) -> None:
             marker = f" [MISLUKT: {asset.error}]"
         else:
             marker = _OUTCOME_MARKERS.get(asset.outcome, "")
+
+        if asset.name_conflict_resolved:
+            marker += " [hernoemd i.v.m. naamconflict]"
 
         click.echo(
             f"  {asset.source_path.name} -> {asset.destination_path} "

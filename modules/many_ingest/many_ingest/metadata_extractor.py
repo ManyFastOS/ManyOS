@@ -17,6 +17,19 @@ class FfprobeNotFoundError(RuntimeError):
     """Raised when the `ffprobe` binary isn't available on PATH."""
 
 
+FFPROBE_INSTALL_MESSAGE = (
+    "❌ ffprobe niet gevonden.\n\n"
+    "Installeer met:\n\n"
+    "    brew install ffmpeg"
+)
+
+
+def is_ffprobe_available() -> bool:
+    """Cheap pre-flight check — used by the ingest pipeline to fail fast and loudly
+    instead of letting every asset silently degrade to "Onbekend" (no metadata)."""
+    return shutil.which("ffprobe") is not None
+
+
 @dataclasses.dataclass(frozen=True)
 class ProbeResult:
     has_video_stream: bool
@@ -37,9 +50,7 @@ class ProbeResult:
 def _ffprobe_path() -> str:
     path = shutil.which("ffprobe")
     if path is None:
-        raise FfprobeNotFoundError(
-            "ffprobe niet gevonden op PATH. Installeer via `brew install ffmpeg`."
-        )
+        raise FfprobeNotFoundError(FFPROBE_INSTALL_MESSAGE)
     return path
 
 
