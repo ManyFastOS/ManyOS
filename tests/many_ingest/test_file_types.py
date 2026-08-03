@@ -14,6 +14,8 @@ def test_extension_only_classification():
     assert detect_file_type(Path("take.wav"), None) == FileType.AUDIO
     assert detect_file_type(Path("take.mp3"), None) == FileType.AUDIO
     assert detect_file_type(Path("Jan Rotmans.m4a"), None) == FileType.AUDIO
+    assert detect_file_type(Path("recording.aif"), None) == FileType.AUDIO
+    assert detect_file_type(Path("recording.aiff"), None) == FileType.AUDIO
     assert detect_file_type(Path("weird.xyz"), None) == FileType.UNKNOWN
 
 

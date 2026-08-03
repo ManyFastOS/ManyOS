@@ -13,7 +13,7 @@ from pathlib import Path
 from many_ingest.metadata_extractor import ProbeResult
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mxf"}
-AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a"}
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".aif", ".aiff"}
 
 
 class FileType(enum.Enum):

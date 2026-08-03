@@ -72,4 +72,4 @@ profiles:
     category: Audio
     audio_only: true
     filename_patterns:
-      - ".*\\.(wav|mp3|m4a)$"
+      - ".*\\.(wav|mp3|m4a|aif|aiff)$"
