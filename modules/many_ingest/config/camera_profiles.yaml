@@ -1,9 +1,13 @@
 # ManyOS Many Ingest — camera-profielen (v0.1)
 #
 # Elk profiel matcht op bestandsnaam-patronen en/of ffprobe-metadata (make/model/brand-tags).
-# Metadata weegt zwaarder dan bestandsnaam (zie docs/MANY_INGEST_BUILD_PLAN.md, sectie 4)
-# — dat is met name relevant hier omdat Sony FX6 en FX3 dezelfde clip-naamgeving kunnen
-# gebruiken; alleen metadata onderscheidt ze betrouwbaar.
+# Twee soorten bestandsnaam-patronen, met verschillend gewicht in classify():
+#   - confirmed_filename_patterns: getoetst tegen echte ManyFast-footage -> HIGH confidence
+#   - filename_patterns: illustratief/generiek, nog niet bevestigd -> MEDIUM confidence
+# Metadata weegt binnen elk niveau zwaarder dan bestandsnaam (zie
+# docs/MANY_INGEST_BUILD_PLAN.md, sectie 4) — dat is met name relevant hier omdat
+# Sony FX6 en FX3 dezelfde generieke clip-naamgeving kunnen gebruiken; alleen
+# metadata of een bevestigd patroon onderscheidt ze betrouwbaar.
 #
 # Getoetst tegen echte footage (2026-08-03): Sony XAVC-bestanden (.MP4) schrijven geen
 # make/model in format.tags, maar wel een herkenbare major_brand "XAVC" — vandaar
@@ -16,17 +20,13 @@ profiles:
   - id: sony_fx6
     label: "Sony FX6"
     category: Camera
+    confirmed_filename_patterns:
+      - "^611_\\d{4}\\.MXF$"   # bevestigd over drie onafhankelijke ManyFast-projecten
+                                # met crew-gelabelde "FX6"-mappen, zie
+                                # docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md sectie 2b/3c.
     filename_patterns:
-      - "^C\\d{4}\\..*"
-      - "^611_\\d{4}\\.MXF$"   # bewijs-onderbouwd (niet illustratief): bevestigd over
-                                # drie onafhankelijke ManyFast-projecten met crew-
-                                # gelabelde "FX6"-mappen, zie
-                                # docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md sectie 2b.
-                                # Let op: dit matcht via bestandsnaam, dus confidence
-                                # blijft "middel" zolang er geen model-tag aanwezig is
-                                # (classify() kent geen hogere confidence toe aan dit
-                                # specifieke, bevestigde patroon t.o.v. de andere,
-                                # nog illustratieve bestandsnaam-patronen).
+      - "^C\\d{4}\\..*"   # generiek Sony-clipnamenpatroon, gedeeld met FX3 — niet
+                           # op zichzelf onderscheidend, vandaar niet "confirmed".
     metadata_match:
       model_contains:
         - "FX6"

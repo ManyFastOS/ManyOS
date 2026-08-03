@@ -54,12 +54,6 @@ def test_audio_via_extension_without_metadata(camera_profiles):
     assert result.confidence == Confidence.MEDIUM
 
 
-def test_completely_unknown_file(camera_profiles):
-    result = classify(Path("random_export.mp4"), None, camera_profiles)
-    assert result.category == "Onbekend"
-    assert result.confidence == Confidence.LOW
-
-
 def test_xavc_brand_without_model_stays_ambiguous_between_fx6_and_fx3(
     camera_profiles, make_probe_result
 ):
@@ -93,14 +87,31 @@ def test_sony_mxf_company_name_alone_is_not_enough_for_a_specific_model_match(
     assert result.category == "Onbekend"
 
 
-def test_611_pattern_matches_fx6_via_filename_at_medium_confidence(camera_profiles):
+def test_confirmed_611_pattern_matches_fx6_at_high_confidence(camera_profiles):
     """611_####.MXF is evidence-backed, not illustrative (see
     docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md section 2b: confirmed Sony FX6
     across three independent ManyFast projects with crew-labeled "FX6" folders).
-    Without a model tag this still only matches at the filename tier, so confidence
-    stays MEDIUM -- classify() doesn't yet distinguish confirmed patterns from
-    illustrative ones (see proposal section 3c)."""
+    It lives in confirmed_filename_patterns, so it matches at the HIGH tier even
+    without a model tag -- unlike the shared, generic ^C####.* pattern."""
     result = classify(Path("611_3894.MXF"), None, camera_profiles)
     assert result.camera_profile == "Sony FX6"
     assert result.category == "Camera"
+    assert result.confidence == Confidence.HIGH
+
+
+def test_generic_filename_pattern_still_only_reaches_medium_confidence(camera_profiles):
+    """DJI_0001.MP4 has no metadata backing it here, only the generic (not
+    ManyFast-confirmed) ^DJI_.* pattern -- existing classification retained: still
+    identified as DJI, but at MEDIUM rather than HIGH, since only a confirmed
+    filename pattern or a make/model metadata hit reaches HIGH."""
+    result = classify(Path("DJI_0001.MP4"), None, camera_profiles)
+    assert result.category == "Drone"
+    assert result.camera_profile == "DJI"
     assert result.confidence == Confidence.MEDIUM
+
+
+def test_unknown_file_has_low_confidence(camera_profiles):
+    """No signal at any tier -> Onbekend at LOW, never guessed."""
+    result = classify(Path("random_export.mp4"), None, camera_profiles)
+    assert result.category == "Onbekend"
+    assert result.confidence == Confidence.LOW

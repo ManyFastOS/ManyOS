@@ -27,6 +27,7 @@ class CameraProfile:
     label: str
     category: str
     filename_patterns: list[str]
+    confirmed_filename_patterns: list[str]
     metadata_make_contains: list[str]
     metadata_model_contains: list[str]
     metadata_brand_contains: list[str]
@@ -71,6 +72,7 @@ def load_camera_profiles(path: Path) -> list[CameraProfile]:
                 label=entry["label"],
                 category=category,
                 filename_patterns=entry.get("filename_patterns", []),
+                confirmed_filename_patterns=entry.get("confirmed_filename_patterns", []),
                 metadata_make_contains=metadata_match.get("make_contains", []),
                 metadata_model_contains=metadata_match.get("model_contains", []),
                 metadata_brand_contains=metadata_match.get("brand_contains", []),

@@ -152,21 +152,35 @@ extra tussenstap i.p.v. alleen ja/nee.
 
 ### 3c. `611_####.MXF` als bewijs-onderbouwd FX6-patroon — **toegepast**
 
-Op basis van sectie 2b is `filename_patterns: ["^611_\\d{4}\\.MXF$"]` toegevoegd aan
-het bestaande `sony_fx6`-profiel in `camera_profiles.yaml`. Alleen dit profiel is
-aangepast; A7IV/FX3/DJI/GoPro/Audio blijven ongewijzigd.
+Op basis van sectie 2b is `^611_\\d{4}\\.MXF$` toegevoegd aan het bestaande
+`sony_fx6`-profiel in `camera_profiles.yaml`. Alleen dit profiel is aangepast;
+A7IV/FX3/DJI/GoPro/Audio zijn qua matching-regels ongewijzigd.
 
-**Kanttekening over confidence, niet verzwijgen:** de matching-logica in
-`classify()` kent bestandsnaam-matches altijd `Confidence.MEDIUM` toe, ongeacht welk
-patroon matcht — er bestaat momenteel geen manier om één specifiek,
-bewijs-onderbouwd patroon een hogere confidence te geven dan de andere (nog
-illustratieve) patronen. Een `611_####.MXF`-bestand krijgt dus, zolang er geen
-model-tag aanwezig is, **`confidence: middel`**, niet `hoog` — ook al is het
-onderliggende bewijs voor dít specifieke patroon sterker dan voor de rest. Dit
-verschil zichtbaar maken (bijv. een vijfde niveau "bevestigd bestandsnaam-patroon"
-tussen brand en generieke bestandsnaam-matching in) is een aparte, kleine
-`classify()`-aanpassing — net als 3b nog niet doorgevoerd, wel hier genoteerd zodat
-het niet verloren gaat.
+Bij het toevoegen bleek de matching-logica in `classify()` geen onderscheid te
+maken tussen dit bewijs-onderbouwde patroon en de andere, nog illustratieve
+bestandsnaam-patronen — beide kregen altijd `Confidence.MEDIUM`. Dat is inmiddels
+opgelost, zie 3d.
+
+### 3d. Confidence-tier-uitbreiding — **toegepast**
+
+`classify()` maakt nu generiek onderscheid tussen twee soorten bestandsnaam-signalen,
+i.p.v. ze allebei hetzelfde te behandelen:
+
+- **HIGH**: exacte make/model-metadata-match (of, voor Audio, echte streamanalyse),
+  **of** een `confirmed_filename_patterns`-match — bestandsnaam-patronen die tegen
+  échte footage zijn getoetst.
+- **MEDIUM**: een brand-match (major_brand/compatible_brands), **of** een
+  `filename_patterns`-match — nog illustratieve, niet-bevestigde patronen.
+- **LOW ("Onbekend")**: niets matcht, of meerdere profielen matchen op hetzelfde
+  niveau — een conflict lost nooit stilzwijgend op naar een zwakker niveau.
+
+Dit is een **datakeuze, geen codekeuze**: een patroon in `confirmed_filename_patterns`
+zetten in plaats van `filename_patterns` is een YAML-wijziging. Er is geen
+FX6-specifieke uitzondering in `classify()` — het `sony_fx6`-profiel is vooralsnog
+gewoon het enige profiel met een ingevulde `confirmed_filename_patterns`-lijst.
+
+Resultaat op de echte Jan Rotmans-footage: alle `611_####.MXF`-bestanden gaan nu naar
+`Camera / "Sony FX6" / confidence: hoog` (was: `Onbekend / laag`).
 
 ---
 
@@ -244,11 +258,15 @@ op bewijs in plaats van aannames gebouwd worden.
 
 ---
 
-## Openstaand vóór dit wordt toegepast
+## Openstaand
 
-1. Akkoord op 3a (audio-extensies) — dit kan direct in de bestaande YAML.
-2. Akkoord op het principe achter 3b (vierde matching-tier) — bij akkoord volgt een
-   apart implementatieplan voor die `classify()`-aanpassing, net als bij de eerdere
-   bouwstappen.
-3. Antwoord op de drie vragen in sectie 4, zodat FX6/FX3/DJI/GoPro op echte data
-   in plaats van aannames gebaseerd kunnen worden.
+1. ~~Akkoord op 3a (audio-extensies)~~ — **toegepast.**
+2. ~~Confidence-tier-uitbreiding (was hier "3b" genoemd)~~ — **toegepast, zie 3d.**
+3. **Nog open: 3b, het generieke "Sony (model onbekend)"-fallback-niveau** — een
+   ánder idee dan 3d: een vierde/vijfde tier die een Sony-bestand zonder specifieke
+   model-match toch als "Camera / Sony (model onbekend)" i.p.v. "Onbekend"
+   classificeert. Dit staat los van de nu doorgevoerde confidence-tiers en vereist
+   nog steeds een aparte, expliciete `classify()`-uitbreiding.
+4. Antwoord op de drie vragen in sectie 4 en de checklist in sectie 5, zodat
+   FX6/FX3/DJI/GoPro verder op echte data in plaats van aannames gebaseerd kunnen
+   worden.

@@ -1,23 +1,27 @@
 """Applies camera_profiles.yaml rules to classify an asset's probable source.
 
 Rule-based, not Asset Intelligence (see CLAUDE.md) — deterministic pattern/metadata
-matching, no AI/ML. Matching is tiered by specificity, most reliable first:
+matching, no AI/ML. Matching is tiered by how trustworthy each *signal* is — the
+tiers are generic across all profiles, there is no per-camera special-casing:
 
-1. make/model (or, for the Audio profile, real stream analysis) — the most specific
-   signal, wins outright if exactly one profile matches.
-2. container brand (major_brand/compatible_brands, e.g. Sony's "XAVC") — real
-   metadata, but less specific: several camera models can share the same brand, so
-   this only decides things when make/model didn't match anything.
-3. filename pattern — the least reliable signal (files get renamed), used only when
-   neither metadata tier found anything.
+- **HIGH** — an exact make/model metadata match (or, for the Audio profile, real
+  stream analysis), OR a filename pattern ManyFast has confirmed against real
+  footage (`confirmed_filename_patterns` in camera_profiles.yaml — e.g.
+  `611_####.MXF`, confirmed as Sony FX6 across three independent projects, see
+  docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md).
+- **MEDIUM** — a container-brand match (major_brand/compatible_brands, e.g. Sony's
+  "XAVC" — real metadata, but shared across models so less specific), OR a generic,
+  not-yet-confirmed filename pattern (`filename_patterns` — e.g. `DJI_*`, `GH*`,
+  `DSC####`).
+- **LOW ("Onbekend")** — nothing matched, or more than one profile matched at the
+  same tier. A conflict is never silently resolved by falling through to a weaker
+  tier; it resolves straight to Onbekend (see docs/MANY_INGEST_BUILD_PLAN.md,
+  section 4).
 
-At every tier, a conflict (more than one profile matching) resolves to "Onbekend" at
-low confidence — never a silent guess (see docs/MANY_INGEST_BUILD_PLAN.md, section 4).
-Brand alone must never be allowed to out-vote a specific make/model hit; that's why
-it's a strictly separate, lower-priority tier rather than an equal-weight OR
-condition (learned from real footage: Sony FX6 and FX3 share the same XAVC brand,
-so brand-only matching would otherwise make them permanently ambiguous even when a
-model tag clearly identifies one of them).
+Whether a filename pattern lives in `confirmed_filename_patterns` or
+`filename_patterns` is a data decision (evidence from real footage), not a code
+decision — adding a new confirmed pattern for any camera is a YAML change, not a
+code change.
 """
 
 from __future__ import annotations
@@ -52,26 +56,34 @@ def classify(
     probe_result: ProbeResult | None,
     profiles: list[CameraProfile],
 ) -> ClassificationResult:
-    strong_matches = [p for p in profiles if _matches_make_or_model(probe_result, p)]
-    if len(strong_matches) == 1:
-        return _result_for(strong_matches[0], Confidence.HIGH)
-    if len(strong_matches) > 1:
-        return _unknown()  # tegenstrijdige make/model-matches -> te onzeker om te kiezen
+    high_matches = [
+        p
+        for p in profiles
+        if _matches_make_or_model(probe_result, p) or _matches_confirmed_filename(path, p)
+    ]
+    if len(high_matches) == 1:
+        return _result_for(high_matches[0], Confidence.HIGH)
+    if len(high_matches) > 1:
+        return _unknown()  # tegenstrijdige signalen op het hoogste niveau -> te onzeker
 
-    brand_matches = [p for p in profiles if _matches_brand(probe_result, p)]
-    if len(brand_matches) == 1:
-        return _result_for(brand_matches[0], Confidence.MEDIUM)
-    if len(brand_matches) > 1:
+    medium_matches = [
+        p
+        for p in profiles
+        if _matches_brand(probe_result, p) or _matches_generic_filename(path, p)
+    ]
+    if len(medium_matches) == 1:
+        return _result_for(medium_matches[0], Confidence.MEDIUM)
+    if len(medium_matches) > 1:
         return _unknown()  # bijv. Sony XAVC zonder model -> kan FX6 of FX3 zijn
 
-    filename_matches = [p for p in profiles if _matches_filename(path, p)]
-    if len(filename_matches) == 1:
-        return _result_for(filename_matches[0], Confidence.MEDIUM)
-
-    return _unknown()  # geen match, of meerdere profielen matchen dezelfde bestandsnaam
+    return _unknown()  # geen enkel signaal matcht
 
 
-def _matches_filename(path: Path, profile: CameraProfile) -> bool:
+def _matches_confirmed_filename(path: Path, profile: CameraProfile) -> bool:
+    return any(re.match(pattern, path.name) for pattern in profile.confirmed_filename_patterns)
+
+
+def _matches_generic_filename(path: Path, profile: CameraProfile) -> bool:
     return any(re.match(pattern, path.name) for pattern in profile.filename_patterns)
 
 

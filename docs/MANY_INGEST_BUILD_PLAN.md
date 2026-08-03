@@ -148,19 +148,27 @@ ManyFast geverifieerd worden vóór implementatie):
 **Elk profiel in `camera_profiles.yaml` bevat:**
 - `id` / `label` — bijv. `sony_fx6` / "Sony FX6"
 - `category` — Camera / Drone / Audio (bepaalt de Project Workspace-submap)
-- `filename_patterns` — lijst met regex-patronen (optioneel)
-- `metadata_match` — te zoeken waarden in ffprobe `make`/`model`-tags (optioneel)
-- Voor **Audio**: een `stream_match`-regel (alleen-audio-stream) i.p.v.
-  bestandsnaam/metadata, want dat is feitelijk vast te stellen, niet te gokken.
+- `confirmed_filename_patterns` — regex-patronen die tegen échte ManyFast-footage
+  zijn getoetst (optioneel; bepaalt HIGH-confidence, zie hieronder)
+- `filename_patterns` — nog illustratieve/niet-bevestigde regex-patronen (optioneel;
+  bepaalt MEDIUM-confidence)
+- `metadata_match` — te zoeken waarden in ffprobe `make`/`model`/brand-tags (optioneel)
+- Voor **Audio**: `audio_only` (alleen-audiostream-check) i.p.v. bestandsnaam/metadata,
+  want dat is feitelijk vast te stellen, niet te gokken.
 
-**Prioriteit en onzekerheid:**
-- Metadata weegt zwaarder dan bestandsnaam (bestandsnamen kunnen hernoemd zijn).
-- Matcht geen enkel profiel, of spreken bestandsnaam en metadata elkaar tegen? Dan wordt
-  het bestand **"Onbekend"** met confidence "laag" — nooit stilzwijgend fout
-  classificeren.
+**Prioriteit en confidence** (bijgewerkt na validatie tegen echte footage — zie
+`docs/MANY_INGEST_CAMERA_PROFILES_V2_PROPOSAL.md` voor de volledige aanleiding):
+generiek getierd naar betrouwbaarheid van het *signaal*, niet per camera:
+- **HIGH** — exacte make/model-metadata-match (of, voor Audio, echte
+  streamanalyse), **of** een `confirmed_filename_patterns`-match.
+- **MEDIUM** — een brand-match (major_brand/compatible_brands, bijv. Sony's
+  "XAVC"), **of** een generieke, nog niet-bevestigde `filename_patterns`-match.
+- **LOW ("Onbekend")** — niets matcht, of meerdere profielen matchen op hetzelfde
+  niveau. Een conflict lost nooit stilzwijgend op naar een zwakker niveau — nooit
+  stilzwijgend fout classificeren.
 - Elk asset krijgt in de ManyFast Asset Schema drie velden: `category` (voor de
-  mapstructuur), `camera_profile` (het specifieke profiel, bijv. "Sony FX6" — bewaard
-  voor later gebruik, ook al bepaalt het in v0.1 geen aparte submap) en `confidence`.
+  mapstructuur), `camera_profile` (het specifieke profiel, bijv. "Sony FX6") en
+  `confidence`.
 - Een editor kan een classificatie later altijd corrigeren. Het systeem suggereert, het
   beslist niet definitief (VISION.md: *AI as an Assistant*, ook al is dit geen AI).
 
