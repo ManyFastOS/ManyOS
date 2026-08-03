@@ -1,10 +1,15 @@
 # ManyOS Many Ingest — lokale configuratie (v0.1)
 #
-# Kopieer dit bestand naar ~/.many-ingest/config.yaml en pas storage_root aan naar de
-# daadwerkelijke opslaglocatie (externe SSD/NAS). Klant en project worden per run als
-# CLI-argument meegegeven, niet hier geconfigureerd (zie MANY_INGEST_BUILD_PLAN.md,
-# sectie 7: "Geen automatische klant/project-herkenning").
+# Alles staat op de externe SSD/NAS, bewust niets op de Mac zelf (zie
+# docs/MANY_INGEST_STORAGE_LAYOUT.md). Pas het volumepad aan naar de daadwerkelijke
+# schijfnaam/NAS-mount op de machine die dit draait — die naam kan per Mac verschillen.
+#
+# storage_root is de GEDEELDE root voor alle klanten/projecten — de code zet er zelf
+# al Klanten/{client}/{project}/{datum}_Raw/{categorie}/ achteraan (per CLI-argument,
+# zie MANY_INGEST_BUILD_PLAN.md sectie 7: "Geen automatische klant/project-herkenning").
+# Zet storage_root dus nooit op een specifiek project — dat geeft een dubbele,
+# geneste structuur en moet dan voor elk nieuw project opnieuw aangepast worden.
 
-storage_root: "~/ManyFast/Ingest"
-manifest_path: "~/.many-ingest/asset_schema.json"
-log_dir: "~/.many-ingest/logs"
+storage_root: "/Volumes/Extreme SSD/ManyFast/Footage"
+manifest_path: "/Volumes/Extreme SSD/ManyFast/ManyOS/AssetSchema/asset_schema.json"
+log_dir: "/Volumes/Extreme SSD/ManyFast/ManyOS/Logs"
