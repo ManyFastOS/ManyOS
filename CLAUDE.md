@@ -90,9 +90,10 @@ approach when implementing this module:
 
 - **Ports & adapters (hexagonal architecture).** Core ingest logic must depend only on
   abstract interfaces (`Storage`, `Manifest`, `MetadataExtractor`), never directly on
-  `os.path`/`shutil` or SQLite-specific calls. Local implementations (filesystem,
-  SQLite) are adapters behind those interfaces; cloud implementations (S3, Postgres)
-  are meant to be added later as drop-in replacements without touching core logic.
+  `os.path`/`shutil` or storage-specific calls. Local implementations (filesystem, JSON
+  file for the manifest) are adapters behind those interfaces; SQLite/Postgres and
+  cloud implementations (S3) are meant to be added later as drop-in replacements
+  without touching core logic.
 - **Content-addressable asset identity.** Assets are identified by SHA-256 checksum,
   never by file path or an autoincrement ID — this is what makes multi-machine/cloud
   migration safe later.
@@ -110,5 +111,20 @@ approach when implementing this module:
   start rather than retrofitted.
 - **No cloud infra, message queue, or multi-user support in v0.1.** Many Ingest v0.1 is
   a manually-triggered local CLI tool; deliberately no background daemon/file-watcher,
-  no AI transcription/tagging, no web UI, no automatic deletion of source files (SD
-  card clearing is always an explicit, human-confirmed action).
+  no Asset Intelligence (AI transcription/tagging), no web UI.
+- **Copy-only in v0.1 — no move/delete functionality.** Source files are never touched
+  or removed. Move is deferred to a later version, to be added as an extension of the
+  `Storage` interface (not a redesign).
+- **ManyFast Asset Schema is stored as JSON in v0.1, not SQLite.** Deliberately simpler
+  to start with — no schema migrations needed while the schema is still taking shape.
+  Lives behind the same `Manifest` interface, so moving to SQLite/Postgres later is an
+  adapter swap, not a rewrite.
+- **A `--dry-run` mode must exist before any file is actually copied.** It runs the same
+  code path (scan, classify, resolve destination, dedupe-check) with the side-effecting
+  steps (copy, schema update) skipped and replaced by a preview report — not a separate
+  implementation that could drift from the real run.
+- **Camera/source detection uses extensible camera profiles, not Asset Intelligence.**
+  Rule-based matching (filename patterns + ffprobe metadata, configurable in
+  `camera_profiles.yaml`), metadata takes priority over filename. v0.1 ships profiles
+  for Sony FX6, Sony A7IV, Sony FX3, DJI, GoPro, and Audio. Unclear cases are labeled
+  "Onbekend"/low confidence rather than guessed — never silently misclassified.

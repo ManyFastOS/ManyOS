@@ -37,7 +37,7 @@ later in — zonder dat de kernlogica verandert.
                  │                       │
         ┌────────┴────────┐     ┌────────┴────────┐
         ▼                 ▼     ▼                 ▼
-  LocalFilesystem      S3Storage  SQLiteManifest  PostgresManifest
+  LocalFilesystem      S3Storage  JSONManifest    SQLiteManifest / PostgresManifest
   Storage (v0.1)       (later)    (v0.1)          (later)
 ```
 
@@ -45,8 +45,8 @@ Concreet betekent dit nu al drie interfaces vastleggen:
 - **`Storage`** — lezen/schrijven/kopiëren/bestaat-check van bestanden, ongeacht of de
   bron een gemount volume, een netwerkschijf of straks een S3-bucket is.
 - **`Manifest`** — vastleggen en opvragen van ingestgegevens volgens de ManyFast Asset
-  Schema (asset, checksum, bestemming, tijdstip), ongeacht of dat SQLite of straks
-  Postgres is.
+  Schema (asset, checksum, bestemming, tijdstip), ongeacht of dat een JSON-bestand
+  (v0.1), SQLite of straks Postgres is.
 - **`MetadataExtractor`** — ffprobe-wrapper; blijft technisch vrijwel identiek lokaal en
   in de cloud, maar toch als interface zodat een cloud-variant (bijv. een managed
   transcodeservice) er later achter kan.
@@ -96,9 +96,9 @@ ManyOS-architectuur) direct kan consumeren.
 - **Geen bedrijfslogica die rechtstreeks `os.path`/`shutil` aanroept.** Alles via de
   `Storage`-interface — anders zit lokale-bestandssysteemkennis straks overal
   verspreid in code die niet cloud-bewust hoeft te zijn.
-- **Geen SQLite-specifieke queries of aannames in de kernlogica.** Toegang tot de
-  ManyFast Asset Schema loopt via de `Manifest`-interface met gewone, portable SQL —
-  geen SQLite-only functies diep in de businesslogica.
+- **Geen opslagformaat-specifieke aannames in de kernlogica.** Toegang tot de ManyFast
+  Asset Schema loopt via de `Manifest`-interface — geen JSON-bestandsstructuur-specifieke
+  trucs nu, en geen SQL-specifieke aannames straks, diep in de businesslogica.
 - **Geen autoincrement-ID's of pad-als-identiteit.** Zoals hierboven: dit werkt lokaal
   prima, maar botst zodra er meerdere bronnen tegelijk schrijven. Checksum-gebaseerde
   ID's nu voorkomt een pijnlijke identiteitsmigratie later.
@@ -114,7 +114,7 @@ ManyOS-architectuur) direct kan consumeren.
 - **Niet nu al een message-queue, microservices of multi-server opzet bouwen.** Dat is
   overbouwen voor v0.1. Het punt is niet "bouw de cloud-versie alvast", maar "laat de
   naad open" via de interfaces hierboven.
-- **Geen hardcoded lokale paden diep in de logica** (bijv. `~/.many-ingest/manifest.db`
+- **Geen hardcoded lokale paden diep in de logica** (bijv. `~/.many-ingest/asset_schema.json`
   letterlijk in `organizer.py`). Alles komt uit config, ook al is er nu maar één
   waarde mogelijk.
 
@@ -122,8 +122,9 @@ ManyOS-architectuur) direct kan consumeren.
 
 ## 3. Hoe we lokaal beginnen
 
-Dit volgt exact het bouwplan (v0.1: Python CLI, lokaal bestandssysteem, SQLite,
-ffprobe), maar nu opgebouwd achter de interfaces uit sectie 1:
+Dit volgt exact het bouwplan (v0.1: Python CLI, lokaal bestandssysteem, JSON-opslag
+voor de ManyFast Asset Schema, ffprobe), maar nu opgebouwd achter de interfaces uit
+sectie 1:
 
 ```
 many_ingest/
@@ -134,7 +135,7 @@ many_ingest/
 │   └── manifest.py             # interface: register/is_duplicate/query
 ├── adapters/
 │   ├── local_fs_storage.py       # implementatie van Storage voor lokaal bestandssysteem
-│   └── sqlite_manifest.py         # implementatie van Manifest via SQLite
+│   └── json_manifest.py           # implementatie van Manifest via een JSON-bestand
 ├── config.py                       # laadt YAML, bepaalt welke adapters actief zijn
 └── cli.py                            # dunne laag: parse args → composition root → run()
 ```
@@ -152,7 +153,7 @@ many_ingest/
 
 Dit is niet meer werk dan het oorspronkelijke bouwplan — het is vooral een kwestie van
 de mappenstructuur en een paar interface-definities vooraf vastleggen, in plaats van
-alles rechtstreeks tegen SQLite/bestandssysteem te schrijven.
+alles rechtstreeks tegen het JSON-bestand/bestandssysteem te schrijven.
 
 ---
 
@@ -165,8 +166,9 @@ nooit in één keer:
 1. **Opslag**: `storage.backend: local` → `storage.backend: s3`. Een nieuwe
    `S3Storage`-adapter implementeert dezelfde `Storage`-interface. `IngestService`
    verandert geen regel.
-2. **ManyFast Asset Schema-opslag**: `manifest.backend: sqlite` → `manifest.backend:
-   postgres`. Een nieuwe `PostgresManifest`-adapter implementeert dezelfde
+2. **ManyFast Asset Schema-opslag**: `manifest.backend: json` → `manifest.backend:
+   sqlite` (tussenstap) of direct → `manifest.backend: postgres`. Een nieuwe
+   `SQLiteManifest`- of `PostgresManifest`-adapter implementeert dezelfde
    `Manifest`-interface. Omdat het schema al `client_id`/`project_id`/checksum-ID's
    had, is dit een export/import, geen herontwerp.
 3. **Aansturing**: naast de bestaande CLI komt er een dunne **HTTP-API** (bijv.
