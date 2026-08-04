@@ -7,6 +7,10 @@ multi-volume chooser — hoofdstuk 5 names "schijven" as the canonical Card use
 case. Qt style sheets have no real box-shadow, so the card uses a subtle
 border instead of the "minimale schaduw" the Design Language describes — an
 accepted, documented platform limitation, not a deviation in intent.
+Fase 2 adds: form fields with an always-visible label (hoofdstuk 6 — never a
+placeholder as the only label), a disabled Primary state (the "Bekijk
+inhoud"-button before both fields are filled in), and a progress bar
+(hoofdstuk 8 — never a spinner for something with a measurable duration).
 """
 
 from __future__ import annotations
@@ -72,5 +76,48 @@ QPushButton#volumeCard {
 
 QPushButton#volumeCard:hover {
     background-color: #3a3a3c;
+}
+
+QPushButton#primaryButton:disabled {
+    background-color: #3a3a3c;
+    color: #6e6e73;
+}
+
+QLabel#fieldLabel {
+    font-size: 13px;
+    color: #9a9aa0;
+    padding-top: 4px;
+}
+
+QLabel#previewLine {
+    font-size: 14px;
+    color: #e5e5e7;
+}
+
+QLineEdit {
+    background-color: #2c2c2e;
+    color: #e5e5e7;
+    border: 1px solid #3a3a3c;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 14px;
+}
+
+QLineEdit:focus {
+    border: 1px solid #0a84ff;
+}
+
+QProgressBar {
+    background-color: #2c2c2e;
+    border: none;
+    border-radius: 6px;
+    min-height: 8px;
+    max-height: 8px;
+    text-align: center;
+}
+
+QProgressBar::chunk {
+    background-color: #0a84ff;
+    border-radius: 6px;
 }
 """

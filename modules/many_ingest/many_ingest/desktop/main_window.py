@@ -1,28 +1,48 @@
-"""Fase 1: automatic source detection layered on the Fase 0 shell.
+"""Fase 2: dry-run preview, layered on the Fase 0/1 shell.
 
-Still no coupling to the ingest engine (see docs/MANY_INGEST_V1_UX_DESIGN.md,
-hoofdstuk 3/4, and CLAUDE.md: no business logic in the GUI). Volume detection
-itself lives in `desktop/volumes.py`, a separate, testable OS-integration
-layer — this window only renders whatever it returns and reacts to clicks.
+Architecture (see the Fase 2 build plan and CLAUDE.md — no business logic in
+the GUI, no second ingest implementation):
 
-Four states, one window (content is swapped, no new dialogs/screens):
-- empty: no candidates found — manual picker + "Opnieuw zoeken"
-- single: exactly one candidate — auto-selected immediately
-- chooser: multiple candidates — one card per volume
-- selected: name + quick media summary, never a full path
+    GUI (this file) -> Controller (desktop/controller.py) -> IngestService
+    -> Storage -> Manifest -> Report
 
-`detect_volumes` is injected (defaults to the real /Volumes scan) so tests can
-drive every state deterministically without touching the real filesystem.
+This window never calls IngestService directly and never re-derives anything
+it computes (classification, duplicates, ...) — it only renders the
+IngestSummary the Controller hands back, and reacts to clicks. Volume
+detection stays in desktop/volumes.py, unchanged from Fase 1.
+
+Six states, one window (content is swapped, no new dialogs/screens):
+- empty / chooser / selected(-with-form)   [Fase 1, now selected also has
+                                             client/project fields + Start]
+- analyzing   [new: progress while the background dry-run runs]
+- preview     [new: the dry-run result, in plain language]
+- failed      [new: a friendly message, never a stack trace]
+
+`detect_volumes` and `start_dry_run` are both injected (defaulting to the
+real implementations) so tests can drive every state deterministically,
+without a real /Volumes, a real config, or a real background thread.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QFileDialog, QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt, QThread
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QLabel,
+    QLineEdit,
+    QProgressBar,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
+from many_ingest.core.ingest_service import ProgressUpdate
+from many_ingest.core.report import IngestSummary
+from many_ingest.desktop import controller
 from many_ingest.desktop.volumes import (
     VolumeInfo,
     format_size,
@@ -36,25 +56,113 @@ CHOOSE_ANOTHER_BUTTON_TEXT = "Andere map kiezen"
 OTHER_DISK_TEXT = "Andere schijf gebruiken"
 RETRY_TEXT = "Opnieuw zoeken"
 CHOOSER_TITLE_TEXT = "Welke schijf wil je gebruiken?"
+CLIENT_LABEL_TEXT = "Klant"
+PROJECT_LABEL_TEXT = "Project"
+PREVIEW_BUTTON_TEXT = "Bekijk inhoud"
+ANALYZING_TEXT = "Bezig met bekijken..."
+PREVIEW_TITLE_TEXT = "Wat we hebben gevonden"
+UNKNOWN_PROFILE_LABEL = "Onbekend"
+BACK_TEXT = "Terug"
 
 DetectVolumes = Callable[[], list[VolumeInfo]]
+StartDryRun = Callable[..., tuple[QThread | None, object | None]]
+
+
+@dataclasses.dataclass(frozen=True)
+class _SelectionInfo:
+    source_path: Path
+    name: str
+    media_file_count: int
+    media_total_bytes: int
+    via_auto_detection: bool
 
 
 class MainWindow(QWidget):
-    def __init__(self, detect_volumes: DetectVolumes | None = None) -> None:
+    def __init__(
+        self,
+        detect_volumes: DetectVolumes | None = None,
+        start_dry_run: StartDryRun | None = None,
+        config_path: Path = controller.DEFAULT_CONFIG_PATH,
+        camera_profiles_path: Path = controller.DEFAULT_CAMERA_PROFILES_PATH,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("Many Ingest")
-        self.setMinimumSize(480, 320)
+        self.setMinimumSize(480, 380)
 
         self._detect_volumes: DetectVolumes = detect_volumes or (
             lambda: list_candidate_volumes(storage_root=None)
         )
+        self._start_dry_run: StartDryRun = start_dry_run or controller.start_dry_run
+        self._config_path = config_path
+        self._camera_profiles_path = camera_profiles_path
+
         self.selected_source: Path | None = None
+        self._selection: _SelectionInfo | None = None
+        self._analysis_thread: QThread | None = None
+        self._analysis_worker: object | None = None
 
         self._outer_layout = QVBoxLayout(self)
         self._content: QWidget | None = None
 
         self._run_detection()
+
+    def closeEvent(self, event) -> None:
+        """Waits for a still-running analysis thread before letting the
+        window close. See `_wait_for_analysis_to_stop` for why this alone is
+        NOT sufficient — `app.aboutToQuit` (wired in app.py) is the other
+        required half.
+        """
+        self._wait_for_analysis_to_stop()
+        super().closeEvent(event)
+
+    def _wait_for_analysis_to_stop(self) -> None:
+        """Blocks until any running analysis thread has genuinely stopped.
+
+        Fixes a reproducible crash: dropping the last Python reference to a
+        *running* QThread makes Qt's own destructor treat that as fatal
+        ("QThread: Destroyed while thread is still running") and abort the
+        whole process — confirmed against real macOS crash reports.
+
+        `closeEvent()` alone does not cover this: `QApplication.quit()`
+        called directly — which is what macOS actually does for Cmd+Q / the
+        app-menu Quit item, confirmed by reproduction — never sends this
+        widget a `QCloseEvent` at all, so `closeEvent()` never runs, and
+        Python's interpreter shutdown then destroys `_analysis_thread` while
+        it's still running. This method is therefore called from *two*
+        places: here (closeEvent) and from `QApplication.aboutToQuit` (see
+        app.py) — whichever fires first does the real work; the guard below
+        makes calling it twice for the same run harmless.
+
+        `thread.quit()` cannot interrupt a synchronous, non-Qt-event-loop
+        call like `IngestService.run()` mid-flight — the thread's event loop
+        can't process the quit request until `run()` returns control to it.
+        The actual safety guarantee here is `thread.wait()` blocking until
+        the thread has *actually* finished, however long that takes — not
+        `quit()`, which is a request, not an interruption.
+        """
+        thread = self._analysis_thread
+        if thread is not None and thread.isRunning():
+            thread.quit()
+            thread.wait()
+
+    def _on_analysis_thread_finished(self) -> None:
+        """The only place references are cleared — connected to
+        `thread.finished`, which Qt emits only once the thread has genuinely
+        stopped (not merely once `quit()` was requested). Never cleared
+        eagerly from `on_finished`/`on_failed`, which fire slightly earlier
+        in the same event-processing pass (see `_start_preview`).
+
+        Guarded with `self.sender()`: this signal is queued, so it can still
+        be delivered *after* a second analysis has already legitimately
+        started (its own `isRunning()` guard in `_start_preview` already
+        passed because the first thread had genuinely stopped). Without this
+        check, a late-arriving `finished` from the *first* thread would wipe
+        out the reference to the *second*, already-running one — found via a
+        real crash while testing several sequential analyses in a row.
+        """
+        if self.sender() is self._analysis_thread:
+            self._analysis_thread = None
+            self._analysis_worker = None
 
     # -- public introspection (used by the app and by tests) ----------------
 
@@ -75,6 +183,20 @@ class MainWindow(QWidget):
     def volume_cards(self) -> list[QPushButton]:
         return self._content.findChildren(QPushButton, "volumeCard") if self._content else []
 
+    def client_input(self) -> QLineEdit | None:
+        return self._content.findChild(QLineEdit, "clientInput") if self._content else None
+
+    def project_input(self) -> QLineEdit | None:
+        return self._content.findChild(QLineEdit, "projectInput") if self._content else None
+
+    def progress_bar(self) -> QProgressBar | None:
+        return self._content.findChild(QProgressBar, "analysisProgress") if self._content else None
+
+    def preview_lines(self) -> list[str]:
+        if self._content is None:
+            return []
+        return [label.text() for label in self._content.findChildren(QLabel, "previewLine")]
+
     # -- detection ------------------------------------------------------------
 
     def _run_detection(self) -> None:
@@ -88,14 +210,16 @@ class MainWindow(QWidget):
 
     def _select_volume(self, volume: VolumeInfo) -> None:
         self.selected_source = volume.path
-        self._render_selected(
+        self._selection = _SelectionInfo(
+            source_path=volume.path,
             name=volume.name,
             media_file_count=volume.media_file_count,
             media_total_bytes=volume.media_total_bytes,
             via_auto_detection=True,
         )
+        self._render_selected()
 
-    # -- manual folder picking (native dialog, unchanged behavior) -----------
+    # -- manual folder picking (native dialog) --------------------------------
 
     def _on_choose_source_clicked(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Kies een bronmap")
@@ -105,12 +229,56 @@ class MainWindow(QWidget):
     def _set_manual_source(self, path: Path) -> None:
         self.selected_source = path
         media_file_count, media_total_bytes = scan_media_summary(path)
-        self._render_selected(
+        self._selection = _SelectionInfo(
+            source_path=path,
             name=path.name,
             media_file_count=media_file_count,
             media_total_bytes=media_total_bytes,
             via_auto_detection=False,
         )
+        self._render_selected()
+
+    # -- dry-run analysis (via the Controller, never IngestService directly) --
+
+    def _start_preview(self, client: str, project: str) -> None:
+        if self._selection is None:
+            return
+        if self._analysis_thread is not None and self._analysis_thread.isRunning():
+            return  # een analyse loopt al; niet bereikbaar via de UI, extra zekerheid
+        self._render_analyzing()
+        self._analysis_thread, self._analysis_worker = self._start_dry_run(
+            self._selection.source_path,
+            client,
+            project,
+            on_progress=self._on_analysis_progress,
+            on_finished=self._on_analysis_finished,
+            on_failed=self._on_analysis_failed,
+            config_path=self._config_path,
+            camera_profiles_path=self._camera_profiles_path,
+        )
+        if self._analysis_thread is not None:
+            self._analysis_thread.finished.connect(self._on_analysis_thread_finished)
+
+    def _on_analysis_progress(self, update: ProgressUpdate) -> None:
+        bar = self.progress_bar()
+        if bar is not None:
+            if bar.maximum() == 0 and update.total:
+                bar.setRange(0, update.total)
+            bar.setValue(update.processed)
+
+        detail = self._content.findChild(QLabel, "captionLabel") if self._content else None
+        if detail is not None:
+            detail.setText(f"{update.processed} van {update.total} bestanden bekeken")
+
+    def _on_analysis_finished(self, summary: IngestSummary) -> None:
+        self._render_preview(summary)
+
+    def _on_analysis_failed(self, message: str) -> None:
+        self._render_analysis_failed(message)
+
+    def _return_to_selection(self) -> None:
+        if self._selection is not None:
+            self._render_selected()
 
     # -- rendering --------------------------------------------------------------
 
@@ -171,35 +339,158 @@ class MainWindow(QWidget):
         layout.addStretch()
         self._set_content(content)
 
-    def _render_selected(
-        self,
-        *,
-        name: str,
-        media_file_count: int,
-        media_total_bytes: int,
-        via_auto_detection: bool,
-    ) -> None:
+    def _render_selected(self) -> None:
+        selection = self._selection
+        assert selection is not None
+
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.addStretch()
 
-        name_label = QLabel(name)
+        name_label = QLabel(selection.name)
         name_label.setObjectName("statusLabel")
         name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(name_label)
 
         detail_label = QLabel(
-            f"{_pluralize_media(media_file_count)} · {format_size(media_total_bytes)}"
+            f"{_pluralize_media(selection.media_file_count)} · "
+            f"{format_size(selection.media_total_bytes)}"
         )
         detail_label.setObjectName("captionLabel")
         detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(detail_label)
+        layout.addSpacing(20)
+
+        client_label = QLabel(CLIENT_LABEL_TEXT)
+        client_label.setObjectName("fieldLabel")
+        layout.addWidget(client_label)
+        client_input = QLineEdit()
+        client_input.setObjectName("clientInput")
+        layout.addWidget(client_input)
+        layout.addSpacing(8)
+
+        project_label = QLabel(PROJECT_LABEL_TEXT)
+        project_label.setObjectName("fieldLabel")
+        layout.addWidget(project_label)
+        project_input = QLineEdit()
+        project_input.setObjectName("projectInput")
+        layout.addWidget(project_input)
         layout.addSpacing(16)
 
-        other_button = QPushButton(OTHER_DISK_TEXT if via_auto_detection else CHOOSE_ANOTHER_BUTTON_TEXT)
+        preview_button = QPushButton(PREVIEW_BUTTON_TEXT)
+        preview_button.setObjectName("primaryButton")
+        preview_button.setEnabled(False)
+
+        def _update_enabled() -> None:
+            preview_button.setEnabled(
+                bool(client_input.text().strip()) and bool(project_input.text().strip())
+            )
+
+        client_input.textChanged.connect(_update_enabled)
+        project_input.textChanged.connect(_update_enabled)
+        preview_button.clicked.connect(
+            lambda: self._start_preview(client_input.text().strip(), project_input.text().strip())
+        )
+        layout.addWidget(preview_button, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addSpacing(12)
+
+        other_button = QPushButton(OTHER_DISK_TEXT if selection.via_auto_detection else CHOOSE_ANOTHER_BUTTON_TEXT)
         other_button.setObjectName("linkButton")
         other_button.clicked.connect(self._on_choose_source_clicked)
         layout.addWidget(other_button, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        layout.addStretch()
+        self._set_content(content)
+
+    def _render_analyzing(self) -> None:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.addStretch()
+
+        label = QLabel(ANALYZING_TEXT)
+        label.setObjectName("statusLabel")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(label)
+        layout.addSpacing(16)
+
+        progress = QProgressBar()
+        progress.setObjectName("analysisProgress")
+        progress.setRange(0, 0)  # onbepaald tot het eerste bestand geteld is
+        layout.addWidget(progress)
+        layout.addSpacing(8)
+
+        detail_label = QLabel("")
+        detail_label.setObjectName("captionLabel")
+        detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(detail_label)
+
+        layout.addStretch()
+        self._set_content(content)
+
+    def _render_preview(self, summary: IngestSummary) -> None:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.addStretch()
+
+        title = QLabel(PREVIEW_TITLE_TEXT)
+        title.setObjectName("statusLabel")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        destination_label = QLabel(f"{summary.client} → {summary.project}")
+        destination_label.setObjectName("captionLabel")
+        destination_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(destination_label)
+        layout.addSpacing(16)
+
+        known_profiles = {
+            label: count
+            for label, count in summary.camera_profile_counts.items()
+            if label != UNKNOWN_PROFILE_LABEL
+        }
+        unknown_count = summary.camera_profile_counts.get(UNKNOWN_PROFILE_LABEL, 0)
+
+        lines = [
+            f"{_pluralize_media(summary.total_files)} · {format_size(summary.total_bytes)}",
+            f"{summary.video_count} video's",
+            f"{summary.audio_count} audio",
+            *[f"{label}: {known_profiles[label]}" for label in sorted(known_profiles)],
+            f"Niet herkend: {unknown_count}",
+            f"Duplicaten (worden overgeslagen): {summary.duplicates}",
+            f"Naamconflicten (worden automatisch opgelost): {summary.name_conflicts_resolved}",
+        ]
+        for line in lines:
+            line_label = QLabel(line)
+            line_label.setObjectName("previewLine")
+            line_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(line_label)
+
+        layout.addSpacing(16)
+
+        back_button = QPushButton(BACK_TEXT)
+        back_button.setObjectName("linkButton")
+        back_button.clicked.connect(self._return_to_selection)
+        layout.addWidget(back_button, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        layout.addStretch()
+        self._set_content(content)
+
+    def _render_analysis_failed(self, message: str) -> None:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.addStretch()
+
+        label = QLabel(message)
+        label.setObjectName("statusLabel")
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(label)
+        layout.addSpacing(16)
+
+        back_button = QPushButton(BACK_TEXT)
+        back_button.setObjectName("linkButton")
+        back_button.clicked.connect(self._return_to_selection)
+        layout.addWidget(back_button, alignment=Qt.AlignmentFlag.AlignCenter)
 
         layout.addStretch()
         self._set_content(content)

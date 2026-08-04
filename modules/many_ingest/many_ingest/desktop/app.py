@@ -37,6 +37,13 @@ def main() -> None:
     detect_volumes = functools.partial(list_candidate_volumes, storage_root=storage_root)
 
     window = MainWindow(detect_volumes=detect_volumes)
+    # Required in addition to MainWindow.closeEvent(), not instead of it:
+    # QApplication.quit() — what macOS actually sends for Cmd+Q / the
+    # app-menu Quit item, confirmed by reproduction — never delivers a
+    # QCloseEvent to the window, so closeEvent() alone misses that path.
+    # aboutToQuit fires for every quit path. See
+    # MainWindow._wait_for_analysis_to_stop for the shared, idempotent logic.
+    app.aboutToQuit.connect(window._wait_for_analysis_to_stop)
     window.show()
 
     sys.exit(app.exec())
