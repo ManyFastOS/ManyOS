@@ -30,12 +30,16 @@ from many_ingest.core.report import IngestSummary
 from many_ingest.desktop.main_window import (
     ANALYZING_TEXT,
     BACK_TEXT,
+    CANCEL_BUTTON_TEXT,
     CHOOSE_ANOTHER_BUTTON_TEXT,
     CHOOSE_BUTTON_TEXT,
+    DESTINATION_ORG_LABEL,
     EMPTY_STATE_TEXT,
     OTHER_DISK_TEXT,
     PREVIEW_TITLE_TEXT,
     RETRY_TEXT,
+    START_INGEST_AVAILABILITY_TEXT,
+    START_INGEST_BUTTON_TEXT,
     MainWindow,
 )
 from many_ingest.desktop.volumes import VolumeInfo
@@ -56,14 +60,26 @@ def _volume(name: str, path, *, capacity=500_000_000_000, media_count=10, media_
     )
 
 
+class _FakeWorker:
+    """Stands in for controller.DryRunWorker — only what MainWindow actually
+    touches on it: `request_cancel()`."""
+
+    def __init__(self) -> None:
+        self.cancel_requested = False
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
+
+
 class _CapturingStartDryRun:
     """A fake Controller entry point — records each call's arguments and
     callbacks instead of touching IngestService or a real thread, so tests
-    can drive on_progress/on_finished/on_failed at will and inspect exactly
-    what MainWindow asked for."""
+    can drive on_progress/on_finished/on_failed/on_cancelled at will and
+    inspect exactly what MainWindow asked for."""
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
+        self.workers: list[_FakeWorker] = []
 
     def __call__(
         self,
@@ -74,6 +90,7 @@ class _CapturingStartDryRun:
         on_progress,
         on_finished,
         on_failed,
+        on_cancelled=None,
         config_path,
         camera_profiles_path,
     ):
@@ -85,9 +102,12 @@ class _CapturingStartDryRun:
                 "on_progress": on_progress,
                 "on_finished": on_finished,
                 "on_failed": on_failed,
+                "on_cancelled": on_cancelled,
             }
         )
-        return None, None
+        worker = _FakeWorker()
+        self.workers.append(worker)
+        return None, worker
 
 
 def _make_summary(**overrides) -> IngestSummary:
@@ -249,23 +269,148 @@ def test_finished_analysis_shows_the_preview_in_plain_language(qapp, tmp_path):
     window.project_input().setText("Zomer Campagne")
     window.choose_button().click()
 
-    starter.calls[0]["on_finished"](_make_summary())
+    starter.calls[0]["on_finished"](
+        _make_summary(
+            total_files=327,
+            camera_profile_counts={"Sony FX6": 188, "Sony FX3": 121, "DJI": 14, "Audio": 18, "Onbekend": 6},
+            duplicates=3,
+            name_conflicts_resolved=0,
+            total_bytes=914_000_000_000,
+        )
+    )
 
     assert window.current_message() == PREVIEW_TITLE_TEXT
-    assert window.current_detail() == "Nike → Zomer Campagne"
     lines = window.preview_lines()
-    assert "5 mediabestanden · 4.7 GB" in lines
-    assert "4 video's" in lines
-    assert "1 audio" in lines
-    assert "Sony FX3: 1" in lines
-    assert "Sony FX6: 3" in lines
-    assert "Niet herkend: 1" in lines
-    assert "Duplicaten (worden overgeslagen): 2" in lines
-    assert "Naamconflicten (worden automatisch opgelost): 1" in lines
+
+    # Bron
+    assert "SD_CARD_1" in lines
+    # Bestemming — in mensentaal, geen storage_root/pad
+    assert lines.index(DESTINATION_ORG_LABEL) < lines.index("Nike") < lines.index("Zomer Campagne")
+    # Bestanden
+    assert "327 bestanden" in lines
+    # Camera's — hardware eerst aflopend op aantal, Audio en Onbekend altijd als laatste twee
+    assert lines.index("Sony FX6: 188") < lines.index("Sony FX3: 121") < lines.index("DJI: 14")
+    assert lines.index("DJI: 14") < lines.index("Audio: 18") < lines.index("Onbekend: 6")
+    # Duplicaten / Naamconflicten
+    assert "3" in lines
+    assert "0" in lines
+    # Bijzonderheden
+    assert "6 bestanden konden niet automatisch worden herkend. Ze worden wel meegenomen." in lines
+
+    # De uitgeschakelde "Start Ingest"-knop hoort er al te staan (fase 3)
+    start_button = window.choose_button()
+    assert start_button.text() == START_INGEST_BUTTON_TEXT
+    assert start_button.isEnabled() is False
+    assert window.current_detail() == START_INGEST_AVAILABILITY_TEXT
+
     # Nooit technische termen (Design Language hoofdstuk 15):
     joined = " ".join(lines).lower()
-    for forbidden in ("checksum", "manifest", "storage_root", "dry_run", "outcome"):
+    for forbidden in ("checksum", "manifest", "storage_root", "dry_run", "outcome", "volumes"):
         assert forbidden not in joined
+
+
+def test_preview_with_an_empty_source_folder(qapp, tmp_path):
+    starter = _CapturingStartDryRun()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+    window.client_input().setText("Nike")
+    window.project_input().setText("Zomer Campagne")
+    window.choose_button().click()
+
+    starter.calls[0]["on_finished"](
+        _make_summary(
+            total_files=0,
+            video_count=0,
+            audio_count=0,
+            unknown_type_count=0,
+            camera_profile_counts={},
+            duplicates=0,
+            name_conflicts_resolved=0,
+            total_bytes=0,
+        )
+    )
+
+    lines = window.preview_lines()
+    assert "0 bestanden" in lines
+    # Geen Camera's-sectie zonder één relevant bestand, en geen Bijzonderheden:
+    assert not any("herkend" in line for line in lines)
+    assert all(":" not in line or line.split(":")[0] not in ("Sony FX6", "Sony FX3", "DJI") for line in lines)
+
+
+def test_preview_with_only_audio_files(qapp, tmp_path):
+    starter = _CapturingStartDryRun()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+    window.client_input().setText("Nike")
+    window.project_input().setText("Zomer Campagne")
+    window.choose_button().click()
+
+    starter.calls[0]["on_finished"](
+        _make_summary(
+            total_files=18,
+            video_count=0,
+            audio_count=18,
+            unknown_type_count=0,
+            camera_profile_counts={"Audio": 18},
+            duplicates=0,
+            name_conflicts_resolved=0,
+            total_bytes=1_800_000_000,
+        )
+    )
+
+    lines = window.preview_lines()
+    assert "18 bestanden" in lines
+    assert "Audio: 18" in lines
+    assert not any("herkend" in line for line in lines)  # geen Bijzonderheden, niets is onbekend
+
+
+def test_preview_with_only_unrecognized_files(qapp, tmp_path):
+    starter = _CapturingStartDryRun()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+    window.client_input().setText("Nike")
+    window.project_input().setText("Zomer Campagne")
+    window.choose_button().click()
+
+    starter.calls[0]["on_finished"](
+        _make_summary(
+            total_files=6,
+            video_count=6,
+            audio_count=0,
+            unknown_type_count=6,
+            camera_profile_counts={"Onbekend": 6},
+            duplicates=0,
+            name_conflicts_resolved=0,
+            total_bytes=600_000_000,
+        )
+    )
+
+    lines = window.preview_lines()
+    assert "6 bestanden" in lines
+    assert "Onbekend: 6" in lines
+    assert "6 bestanden konden niet automatisch worden herkend. Ze worden wel meegenomen." in lines
+
+
+def test_cancelling_during_analysis_requests_it_on_the_worker_and_returns_to_the_form(qapp, tmp_path):
+    starter = _CapturingStartDryRun()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+    window.client_input().setText("Nike")
+    window.project_input().setText("Zomer Campagne")
+    window.choose_button().click()
+
+    assert window.current_message() == ANALYZING_TEXT
+    assert window.secondary_action_button().text() == CANCEL_BUTTON_TEXT
+
+    window.secondary_action_button().click()
+
+    worker = starter.workers[0]
+    assert worker.cancel_requested is True
+
+    # Bevestigt wat de echte Controller doet na een geslaagde annulering
+    # (zie controller.DryRunWorker._progress_callback): de on_cancelled-
+    # callback vuurt, en de GUI gaat terug naar het formulier — geen
+    # foutscherm, een annulering is geen fout.
+    starter.calls[0]["on_cancelled"]()
+
+    assert window.current_message() == "SD_CARD_1"
+    assert window.client_input() is not None
 
 
 def test_back_from_preview_returns_to_the_selection_form(qapp, tmp_path):

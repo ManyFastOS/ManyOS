@@ -131,7 +131,18 @@ def _make_slow_start_dry_run(delay_seconds: float = 0.5):
     suite runs, where the earlier all-real-subprocess version was not).
     """
 
-    def _start(source, client, project, *, on_progress, on_finished, on_failed, config_path, camera_profiles_path):
+    def _start(
+        source,
+        client,
+        project,
+        *,
+        on_progress,
+        on_finished,
+        on_failed,
+        on_cancelled=None,
+        config_path,
+        camera_profiles_path,
+    ):
         worker = _SlowWorker(delay_seconds)
         thread = QThread()
         worker.moveToThread(thread)

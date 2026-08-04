@@ -32,10 +32,12 @@ from typing import Callable
 from PySide6.QtCore import Qt, QThread
 from PySide6.QtWidgets import (
     QFileDialog,
+    QFrame,
     QLabel,
     QLineEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -60,9 +62,26 @@ CLIENT_LABEL_TEXT = "Klant"
 PROJECT_LABEL_TEXT = "Project"
 PREVIEW_BUTTON_TEXT = "Bekijk inhoud"
 ANALYZING_TEXT = "Bezig met bekijken..."
+CANCEL_BUTTON_TEXT = "Annuleren"
 PREVIEW_TITLE_TEXT = "Wat we hebben gevonden"
 UNKNOWN_PROFILE_LABEL = "Onbekend"
+AUDIO_PROFILE_LABEL = "Audio"
 BACK_TEXT = "Terug"
+START_INGEST_BUTTON_TEXT = "Start Ingest"
+START_INGEST_AVAILABILITY_TEXT = "Beschikbaar in de volgende fase."
+
+# Vaste naam van de organisatie in de bestemmings-breadcrumb (Bestemming →
+# ManyFast → klant → project) — geen configwaarde, geen storage_root: dit is
+# altijd hetzelfde omdat dit ManyFast's eigen tool is (zie CLAUDE.md).
+DESTINATION_ORG_LABEL = "ManyFast"
+
+SECTION_SOURCE = "Bron"
+SECTION_DESTINATION = "Bestemming"
+SECTION_FILES = "Bestanden"
+SECTION_CAMERAS = "Camera's"
+SECTION_DUPLICATES = "Duplicaten"
+SECTION_NAME_CONFLICTS = "Naamconflicten"
+SECTION_NOTES = "Bijzonderheden"
 
 DetectVolumes = Callable[[], list[VolumeInfo]]
 StartDryRun = Callable[..., tuple[QThread | None, object | None]]
@@ -87,7 +106,15 @@ class MainWindow(QWidget):
     ) -> None:
         super().__init__()
         self.setWindowTitle("Many Ingest")
-        self.setMinimumSize(480, 380)
+        # 480x420 is de ondergrens (kleinste bruikbare venstergrootte, o.a. voor
+        # het lege scherm) — 560x760 is de vaste openingsgrootte, ruim genoeg
+        # om een normale preview (Bron/Bestemming/Bestanden/Camera's/Duplicaten/
+        # Naamconflicten + knoppen) direct leesbaar te tonen zonder handmatig
+        # uitrekken. Zie _scroll_area hieronder voor wat er gebeurt als de
+        # inhoud dit tóch overschrijdt (veel camera-profielen, een lang
+        # klant/projectnaam, of een kleiner venster dan dit).
+        self.setMinimumSize(480, 420)
+        self.resize(560, 760)
 
         self._detect_volumes: DetectVolumes = detect_volumes or (
             lambda: list_candidate_volumes(storage_root=None)
@@ -102,6 +129,20 @@ class MainWindow(QWidget):
         self._analysis_worker: object | None = None
 
         self._outer_layout = QVBoxLayout(self)
+
+        # Elke schermstaat (leeg/keuze/geselecteerd/analyseren/preview/fout)
+        # wordt in dit ene scroll-gebied gehangen (zie _set_content) in plaats
+        # van rechtstreeks in _outer_layout. `setWidgetResizable(True)` laat
+        # de inhoud altijd de volle breedte van het venster gebruiken; alleen
+        # als de inhoud hóger is dan het venster (bv. een preview met veel
+        # secties, of het venster kleiner dan het standaardformaat) verschijnt
+        # een verticale scrollbalk in plaats van dat labels elkaar overlappen
+        # of afgekapt worden.
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self._outer_layout.addWidget(self._scroll_area)
+
         self._content: QWidget | None = None
 
         self._run_detection()
@@ -253,11 +294,20 @@ class MainWindow(QWidget):
             on_progress=self._on_analysis_progress,
             on_finished=self._on_analysis_finished,
             on_failed=self._on_analysis_failed,
+            on_cancelled=self._on_analysis_cancelled,
             config_path=self._config_path,
             camera_profiles_path=self._camera_profiles_path,
         )
         if self._analysis_thread is not None:
             self._analysis_thread.finished.connect(self._on_analysis_thread_finished)
+
+    def _on_cancel_clicked(self) -> None:
+        """A single, unconfirmed click — unlike a real ingest, cancelling a
+        dry-run has zero risk (nothing is ever written), so the "only
+        confirm what's truly consequential" rule (Design Language hoofdstuk
+        12) means this deliberately does NOT ask "are you sure?"."""
+        if self._analysis_worker is not None:
+            self._analysis_worker.request_cancel()
 
     def _on_analysis_progress(self, update: ProgressUpdate) -> None:
         bar = self.progress_bar()
@@ -276,6 +326,9 @@ class MainWindow(QWidget):
     def _on_analysis_failed(self, message: str) -> None:
         self._render_analysis_failed(message)
 
+    def _on_analysis_cancelled(self) -> None:
+        self._return_to_selection()
+
     def _return_to_selection(self) -> None:
         if self._selection is not None:
             self._render_selected()
@@ -283,11 +336,11 @@ class MainWindow(QWidget):
     # -- rendering --------------------------------------------------------------
 
     def _set_content(self, widget: QWidget) -> None:
-        if self._content is not None:
-            self._outer_layout.removeWidget(self._content)
-            self._content.deleteLater()
+        # QScrollArea.setWidget() verwijdert en verwijdert (delete) de vorige
+        # inhoud zelf al — een extra deleteLater() hier op de oude widget zou
+        # een al verwijderd C++-object aanraken.
         self._content = widget
-        self._outer_layout.addWidget(widget)
+        self._scroll_area.setWidget(widget)
 
     def _render_empty_state(self) -> None:
         content = QWidget()
@@ -349,6 +402,7 @@ class MainWindow(QWidget):
 
         name_label = QLabel(selection.name)
         name_label.setObjectName("statusLabel")
+        name_label.setWordWrap(True)
         name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(name_label)
 
@@ -423,9 +477,47 @@ class MainWindow(QWidget):
         detail_label.setObjectName("captionLabel")
         detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(detail_label)
+        layout.addSpacing(16)
+
+        cancel_button = QPushButton(CANCEL_BUTTON_TEXT)
+        cancel_button.setObjectName("linkButton")
+        cancel_button.clicked.connect(self._on_cancel_clicked)
+        layout.addWidget(cancel_button, alignment=Qt.AlignmentFlag.AlignCenter)
 
         layout.addStretch()
         self._set_content(content)
+
+    def _add_preview_section(self, layout: QVBoxLayout, header_text: str, value_lines: list[str]) -> None:
+        header = QLabel(header_text)
+        header.setObjectName("fieldLabel")
+        header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(header)
+        for value in value_lines:
+            line_label = QLabel(value)
+            line_label.setObjectName("previewLine")
+            line_label.setWordWrap(True)
+            line_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(line_label)
+        layout.addSpacing(14)
+
+    def _camera_breakdown_lines(self, summary: IngestSummary) -> list[str]:
+        counts = summary.camera_profile_counts
+        camera_only = {
+            label: count
+            for label, count in counts.items()
+            if label not in (AUDIO_PROFILE_LABEL, UNKNOWN_PROFILE_LABEL) and count > 0
+        }
+        lines = [f"{label}: {count}" for label, count in sorted(camera_only.items(), key=lambda kv: -kv[1])]
+
+        audio_count = counts.get(AUDIO_PROFILE_LABEL, 0)
+        if audio_count:
+            lines.append(f"{AUDIO_PROFILE_LABEL}: {audio_count}")
+
+        unknown_count = counts.get(UNKNOWN_PROFILE_LABEL, 0)
+        if unknown_count:
+            lines.append(f"{UNKNOWN_PROFILE_LABEL}: {unknown_count}")
+
+        return lines
 
     def _render_preview(self, summary: IngestSummary) -> None:
         content = QWidget()
@@ -436,36 +528,42 @@ class MainWindow(QWidget):
         title.setObjectName("statusLabel")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(title)
+        layout.addSpacing(20)
 
-        destination_label = QLabel(f"{summary.client} → {summary.project}")
-        destination_label.setObjectName("captionLabel")
-        destination_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(destination_label)
-        layout.addSpacing(16)
+        source_name = self._selection.name if self._selection is not None else ""
+        self._add_preview_section(layout, SECTION_SOURCE, [source_name])
+        self._add_preview_section(
+            layout,
+            SECTION_DESTINATION,
+            [DESTINATION_ORG_LABEL, summary.client, summary.project],
+        )
+        self._add_preview_section(
+            layout,
+            SECTION_FILES,
+            [_pluralize_files(summary.total_files), format_size(summary.total_bytes)],
+        )
 
-        known_profiles = {
-            label: count
-            for label, count in summary.camera_profile_counts.items()
-            if label != UNKNOWN_PROFILE_LABEL
-        }
+        camera_lines = self._camera_breakdown_lines(summary)
+        if camera_lines:
+            self._add_preview_section(layout, SECTION_CAMERAS, camera_lines)
+
+        self._add_preview_section(layout, SECTION_DUPLICATES, [str(summary.duplicates)])
+        self._add_preview_section(layout, SECTION_NAME_CONFLICTS, [str(summary.name_conflicts_resolved)])
+
         unknown_count = summary.camera_profile_counts.get(UNKNOWN_PROFILE_LABEL, 0)
+        if unknown_count:
+            self._add_preview_section(layout, SECTION_NOTES, [_unrecognized_files_note(unknown_count)])
 
-        lines = [
-            f"{_pluralize_media(summary.total_files)} · {format_size(summary.total_bytes)}",
-            f"{summary.video_count} video's",
-            f"{summary.audio_count} audio",
-            *[f"{label}: {known_profiles[label]}" for label in sorted(known_profiles)],
-            f"Niet herkend: {unknown_count}",
-            f"Duplicaten (worden overgeslagen): {summary.duplicates}",
-            f"Naamconflicten (worden automatisch opgelost): {summary.name_conflicts_resolved}",
-        ]
-        for line in lines:
-            line_label = QLabel(line)
-            line_label.setObjectName("previewLine")
-            line_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(line_label)
+        start_ingest_button = QPushButton(START_INGEST_BUTTON_TEXT)
+        start_ingest_button.setObjectName("primaryButton")
+        start_ingest_button.setEnabled(False)
+        layout.addWidget(start_ingest_button, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        layout.addSpacing(16)
+        availability_label = QLabel(START_INGEST_AVAILABILITY_TEXT)
+        availability_label.setObjectName("captionLabel")
+        availability_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(availability_label)
+        layout.addSpacing(4)
 
         back_button = QPushButton(BACK_TEXT)
         back_button.setObjectName("linkButton")
@@ -498,3 +596,12 @@ class MainWindow(QWidget):
 
 def _pluralize_media(count: int) -> str:
     return f"{count} mediabestand" if count == 1 else f"{count} mediabestanden"
+
+
+def _pluralize_files(count: int) -> str:
+    return f"{count} bestand" if count == 1 else f"{count} bestanden"
+
+
+def _unrecognized_files_note(count: int) -> str:
+    subject = "bestand kon" if count == 1 else "bestanden konden"
+    return f"{count} {subject} niet automatisch worden herkend. Ze worden wel meegenomen."

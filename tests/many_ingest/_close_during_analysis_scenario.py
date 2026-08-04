@@ -37,7 +37,9 @@ class _SlowWorker(QObject):
         self.finished.emit(None)
 
 
-def _fake_start_dry_run(source, client, project, *, on_progress, on_finished, on_failed, config_path, camera_profiles_path):
+def _fake_start_dry_run(
+    source, client, project, *, on_progress, on_finished, on_failed, on_cancelled=None, config_path, camera_profiles_path
+):
     worker = _SlowWorker()
     thread = QThread()
     worker.moveToThread(thread)

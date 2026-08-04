@@ -26,6 +26,7 @@ from PySide6.QtCore import QEventLoop, QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication
 
 from many_ingest.desktop import controller
+from many_ingest.desktop.main_window import MainWindow
 
 CAMERA_PROFILES_PATH = (
     Path(__file__).resolve().parents[2]
@@ -65,6 +66,7 @@ class _ResultCollector(QObject):
         self.progress: list = []
         self.summary = None
         self.failed: str | None = None
+        self.cancelled = False
 
     def on_progress(self, update) -> None:
         self.progress.append(update)
@@ -75,6 +77,10 @@ class _ResultCollector(QObject):
 
     def on_failed(self, message: str) -> None:
         self.failed = message
+        self.finished_signal.emit()
+
+    def on_cancelled(self) -> None:
+        self.cancelled = True
         self.finished_signal.emit()
 
 
@@ -104,6 +110,7 @@ def _run_and_wait(
         on_progress=collector.on_progress,
         on_finished=collector.on_finished,
         on_failed=collector.on_failed,
+        on_cancelled=collector.on_cancelled,
         config_path=config_path,
         camera_profiles_path=camera_profiles_path,
     )
@@ -115,7 +122,7 @@ def _run_and_wait(
 
     loop.exec()
 
-    if collector.summary is None and collector.failed is None:
+    if collector.summary is None and collector.failed is None and not collector.cancelled:
         raise TimeoutError("Dry run via de Controller was niet op tijd klaar.")
     thread.wait(2000)
     return collector
@@ -197,3 +204,94 @@ def test_unreadable_source_produces_a_friendly_message_not_a_stacktrace(qapp, tm
 
     assert result.summary is None
     assert result.failed
+
+
+def test_cancelling_a_real_dry_run_stops_it_without_a_failure_message(qapp, tmp_path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    for i in range(20):
+        (input_dir / f"C{i:04d}.MP4").write_bytes(b"x" * 2_000_000)
+    config_path = _write_config(tmp_path)
+
+    collector = _ResultCollector()
+    loop = QEventLoop()
+    collector.finished_signal.connect(loop.quit)
+
+    thread, worker = controller.start_dry_run(
+        input_dir,
+        "Nike",
+        "Zomer",
+        on_progress=collector.on_progress,
+        on_finished=collector.on_finished,
+        on_failed=collector.on_failed,
+        on_cancelled=collector.on_cancelled,
+        config_path=config_path,
+        camera_profiles_path=CAMERA_PROFILES_PATH,
+    )
+    assert thread.isRunning(), "test-aanname: de analyse moet nog bezig zijn om te kunnen annuleren"
+    QTimer.singleShot(0, worker.request_cancel)
+
+    timeout_timer = QTimer()
+    timeout_timer.setSingleShot(True)
+    timeout_timer.timeout.connect(loop.quit)
+    timeout_timer.start(10_000)
+    loop.exec()
+    thread.wait(2000)
+
+    assert collector.cancelled is True
+    assert collector.failed is None
+    assert collector.summary is None
+    assert not thread.isRunning()
+    # Een dry-run schrijft sowieso niets, maar dit bevestigt het ook nog eens
+    # expliciet voor het geannuleerde geval:
+    assert not (tmp_path / "storage").exists()
+
+
+def test_missing_source_folder_shows_a_friendly_message_in_the_real_window(qapp, tmp_path):
+    """End-to-end: a real MainWindow (default, real controller.start_dry_run)
+    pointed at a source folder that no longer exists — the exact "foutmelding
+    bij ontbrekende bronmap" scenario, verified all the way through the GUI
+    layer, not just at the Controller (see
+    test_unreadable_source_produces_a_friendly_message_not_a_stacktrace
+    above for that half)."""
+    missing_source = tmp_path / "does_not_exist"
+    config_path = _write_config(tmp_path)
+
+    window = MainWindow(
+        detect_volumes=lambda: [], config_path=config_path, camera_profiles_path=CAMERA_PROFILES_PATH
+    )
+    window._set_manual_source(missing_source)
+    window.client_input().setText("Nike")
+    window.project_input().setText("Zomer")
+
+    loop = QEventLoop()
+    real_on_failed = window._on_analysis_failed
+
+    def observed_on_failed(message: str) -> None:
+        real_on_failed(message)
+        loop.quit()
+
+    window._on_analysis_failed = observed_on_failed
+    window.choose_button().click()
+
+    timeout_timer = QTimer()
+    timeout_timer.setSingleShot(True)
+    timeout_timer.timeout.connect(loop.quit)
+    timeout_timer.start(10_000)
+    loop.exec()
+
+    # Wacht expliciet tot de achtergrondthread aantoonbaar gestopt is vóórdat
+    # `window` aan het einde van deze test wordt opgeruimd — anders kan de
+    # laatste Python-referentie naar een nog niet écht gestopte QThread
+    # verdwijnen, en dat is precies de fatale "QThread: Destroyed while
+    # thread is still running"-crash uit eerdere rondes (zie
+    # MainWindow._wait_for_analysis_to_stop). `on_failed`/`thread.quit()`
+    # zijn allebei losse, gequeuede reacties op hetzelfde signaal — dat de
+    # loop hierboven al gestopt is, garandeert niet dat de thread zelf ook
+    # al is afgerond.
+    window._wait_for_analysis_to_stop()
+
+    assert "Traceback" not in window.current_message()
+    assert "OSError" not in window.current_message()
+    assert window.current_message()  # een niet-lege, vertaalde boodschap
+    assert window.secondary_action_button() is not None  # "Terug" blijft bereikbaar

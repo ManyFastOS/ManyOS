@@ -53,6 +53,11 @@ _SOURCE_UNREADABLE_MESSAGE = (
 _UNEXPECTED_ERROR_MESSAGE = "Er ging iets mis tijdens het analyseren. Probeer het opnieuw."
 
 
+class _AnalysisCancelled(Exception):
+    """Internal-only signal that the user cancelled — never crosses out of
+    DryRunWorker.run(), never shown to the GUI as an error."""
+
+
 def _summarize_for_preview(report):
     """`summarize()` from core/report.py, with one correction for dry-run
     previews — not a reimplementation, a targeted fix of a real gap found
@@ -96,6 +101,7 @@ class DryRunWorker(QObject):
     progress = Signal(object)  # ProgressUpdate
     finished = Signal(object)  # IngestSummary
     failed = Signal(str)  # plain-language message, never a raw exception
+    cancelled = Signal()  # a deliberate user action, never treated as a failure
 
     def __init__(
         self,
@@ -111,17 +117,47 @@ class DryRunWorker(QObject):
         self._project = project
         self._config_path = config_path
         self._camera_profiles_path = camera_profiles_path
+        self._cancel_requested = False
+
+    def request_cancel(self) -> None:
+        """Called from the GUI thread (see main_window.py). A single bool
+        flag, checked from the worker thread inside `_progress_callback` —
+        no lock needed for a simple "has this been requested yet" latch;
+        CPython's GIL makes the get/set itself atomic, and the only
+        consequence of a one-tick-late read is finishing one extra file
+        before stopping, never a correctness issue (dry-run: nothing is
+        written either way)."""
+        self._cancel_requested = True
 
     def run(self) -> None:
+        # Config-/camera-profielen laden staat in een eigen try/except, apart
+        # van service.run() hieronder: beide kunnen een OSError geven, maar
+        # met een heel andere oorzaak (ontbrekend/onleesbaar config-bestand
+        # op deze Mac vs. een niet meer aangesloten bronschijf) — één
+        # gezamenlijke except OSError hierboven liet een ontbrekend
+        # config.yaml ten onrechte de "schijf niet aangesloten"-melding tonen
+        # (gevonden via reproductie: Resolved path/Worker received bleken
+        # steeds correct en bestaand, terwijl de fout toch verscheen).
         try:
             service = build_ingest_service(self._config_path, self._camera_profiles_path)
+        except (OSError, ValueError):
+            self.failed.emit(_CONFIG_INVALID_MESSAGE)
+            return
+        except Exception:  # nooit een stacktrace tonen — altijd vertaald
+            self.failed.emit(_UNEXPECTED_ERROR_MESSAGE)
+            return
+
+        try:
             report = service.run(
                 source=self._source,
                 client=self._client,
                 project=self._project,
                 dry_run=True,
-                progress_callback=self.progress.emit,
+                progress_callback=self._progress_callback,
             )
+        except _AnalysisCancelled:
+            self.cancelled.emit()
+            return
         except FfprobeNotFoundError:
             self.failed.emit(_FFPROBE_MISSING_MESSAGE)
             return
@@ -137,6 +173,19 @@ class DryRunWorker(QObject):
 
         self.finished.emit(_summarize_for_preview(report))
 
+    def _progress_callback(self, update) -> None:
+        """Passed to IngestService.run() unchanged in spirit — the engine
+        doesn't know about cancellation, it just calls this after every
+        fully-processed file (see ingest_service.py's own docstring: the
+        callback runs outside any try/except, so raising here propagates
+        straight out of run(), stopping the loop — the current file is
+        already safely finished, dry-run writes nothing regardless. This is
+        an existing, documented property of the callback contract, not new
+        engine behavior."""
+        self.progress.emit(update)
+        if self._cancel_requested:
+            raise _AnalysisCancelled()
+
 
 def start_dry_run(
     source: Path,
@@ -146,12 +195,14 @@ def start_dry_run(
     on_progress,
     on_finished,
     on_failed,
+    on_cancelled=None,
     config_path: Path = DEFAULT_CONFIG_PATH,
     camera_profiles_path: Path = DEFAULT_CAMERA_PROFILES_PATH,
 ) -> tuple[QThread, DryRunWorker]:
     """Starts a dry run on a background QThread and wires the given
     callbacks to its signals. Returns (thread, worker) so the caller can keep
-    them alive for the run's duration (see main_window.py)."""
+    them alive for the run's duration (see main_window.py). `worker` also
+    exposes `request_cancel()` for the caller to invoke on demand."""
     worker = DryRunWorker(source, client, project, config_path, camera_profiles_path)
     thread = QThread()
     worker.moveToThread(thread)
@@ -162,6 +213,9 @@ def start_dry_run(
     worker.failed.connect(on_failed)
     worker.finished.connect(thread.quit)
     worker.failed.connect(thread.quit)
+    worker.cancelled.connect(thread.quit)
+    if on_cancelled is not None:
+        worker.cancelled.connect(on_cancelled)
     thread.finished.connect(worker.deleteLater)
     thread.finished.connect(thread.deleteLater)
     # This only safely deletes `thread` once it has actually stopped (Qt
