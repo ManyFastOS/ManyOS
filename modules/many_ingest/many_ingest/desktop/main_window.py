@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
 
 from many_ingest.core.ingest_service import ProgressUpdate
 from many_ingest.core.report import IngestSummary
-from many_ingest.desktop import controller
+from many_ingest.desktop import controller, thread_lifecycle
 from many_ingest.desktop.volumes import (
     VolumeInfo,
     format_size,
@@ -148,43 +148,51 @@ class MainWindow(QWidget):
         self._run_detection()
 
     def closeEvent(self, event) -> None:
-        """Waits for a still-running analysis thread before letting the
-        window close. See `_wait_for_analysis_to_stop` for why this alone is
-        NOT sufficient — `app.aboutToQuit` (wired in app.py) is the other
-        required half.
+        """Waits for every active QThread (not just this window's own
+        `_analysis_thread`) before letting the window close. See
+        `_wait_for_analysis_to_stop` for why this alone is NOT sufficient —
+        `app.aboutToQuit` (wired in app.py) is the other required half.
         """
         self._wait_for_analysis_to_stop()
         super().closeEvent(event)
 
     def _wait_for_analysis_to_stop(self) -> None:
-        """Blocks until any running analysis thread has genuinely stopped.
+        """Blocks until every QThread the desktop app has created has
+        genuinely stopped — delegates to `thread_lifecycle.shutdown()` (see
+        that module's docstring), the single central choke point for this
+        guarantee, rather than checking only `self._analysis_thread` here.
 
         Fixes a reproducible crash: dropping the last Python reference to a
         *running* QThread makes Qt's own destructor treat that as fatal
         ("QThread: Destroyed while thread is still running") and abort the
-        whole process — confirmed against real macOS crash reports.
+        whole process — confirmed against real macOS crash reports. The
+        original version of this method only ever checked
+        `self._analysis_thread`, which is correct for the one thread
+        MainWindow itself tracks, but is a guarantee that has to be
+        re-derived by hand for every future background QThread this app
+        might grow — `thread_lifecycle.shutdown()` covers all of them by
+        construction, this window's analysis thread included, without
+        MainWindow needing to enumerate them.
 
         `closeEvent()` alone does not cover this: `QApplication.quit()`
         called directly — which is what macOS actually does for Cmd+Q / the
         app-menu Quit item, confirmed by reproduction — never sends this
         widget a `QCloseEvent` at all, so `closeEvent()` never runs, and
-        Python's interpreter shutdown then destroys `_analysis_thread` while
-        it's still running. This method is therefore called from *two*
+        Python's interpreter shutdown then destroys any still-running thread
+        while it's still running. This method is therefore called from *two*
         places: here (closeEvent) and from `QApplication.aboutToQuit` (see
-        app.py) — whichever fires first does the real work; the guard below
-        makes calling it twice for the same run harmless.
+        app.py) — whichever fires first does the real work;
+        `thread_lifecycle.shutdown()` is itself idempotent, so calling it
+        twice for the same run is harmless.
 
         `thread.quit()` cannot interrupt a synchronous, non-Qt-event-loop
         call like `IngestService.run()` mid-flight — the thread's event loop
         can't process the quit request until `run()` returns control to it.
-        The actual safety guarantee here is `thread.wait()` blocking until
-        the thread has *actually* finished, however long that takes — not
+        The actual safety guarantee is `thread.wait()` blocking until the
+        thread has *actually* finished, however long that takes — not
         `quit()`, which is a request, not an interruption.
         """
-        thread = self._analysis_thread
-        if thread is not None and thread.isRunning():
-            thread.quit()
-            thread.wait()
+        thread_lifecycle.shutdown()
 
     def _on_analysis_thread_finished(self) -> None:
         """The only place references are cleared — connected to
@@ -299,6 +307,17 @@ class MainWindow(QWidget):
             camera_profiles_path=self._camera_profiles_path,
         )
         if self._analysis_thread is not None:
+            # Registreren bij het startpunt van MainWindow's eigen tracking
+            # — niet alleen in controller.start_dry_run() — zodat elke
+            # thread die MainWindow ooit als `_analysis_thread` bijhoudt
+            # gegarandeerd in de centrale registry zit, ook wanneer een
+            # geïnjecteerde (test-)implementatie van `start_dry_run` zijn
+            # eigen QThread aanmaakt zonder ooit door controller.py te gaan.
+            # Zie thread_lifecycle.py's moduledocstring voor de regressie
+            # die dit dichttimmert. `register()` is idempotent, dus dit is
+            # onschadelijk voor het gewone pad waar controller.start_dry_run()
+            # dezelfde thread al registreerde.
+            thread_lifecycle.register(self._analysis_thread)
             self._analysis_thread.finished.connect(self._on_analysis_thread_finished)
 
     def _on_cancel_clicked(self) -> None:

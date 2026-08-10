@@ -238,8 +238,8 @@ class _LoopQuitter(QObject):
 # -- 1. Venster sluiten tijdens analyse -----------------------------------------
 
 
-def test_closing_the_window_during_analysis_does_not_crash():
-    """Runs in its own fresh process — see
+def test_closing_the_window_during_analysis_does_not_crash_50_times_in_a_row(tmp_path):
+    """Runs each repetition in its own fresh process — see
     _close_during_analysis_scenario.py's module docstring for why: this
     exact scenario, run inside the shared pytest process alongside ~90 other
     tests (several of which spawn real ffprobe subprocesses on other
@@ -249,42 +249,139 @@ def test_closing_the_window_during_analysis_does_not_crash():
     real usage never creates (closing the window ends the process). A fresh
     process per session is also simply the more faithful reproduction of
     what `many-ingest-desktop` actually does.
-    """
+
+    Bumped from a single run to 50 (this round's requested sweep, see
+    thread_lifecycle.py) — this scenario uses a fake `start_dry_run` that
+    creates its own raw QThread, bypassing controller.start_dry_run()
+    entirely, which is exactly the case that exposed a real gap in this
+    round's first version of the central thread registry: registering only
+    inside controller.start_dry_run() left this test's thread unregistered,
+    so `thread_lifecycle.shutdown()` had nothing to wait on even though
+    MainWindow was still tracking a live one. See thread_lifecycle.py's
+    module docstring for the fix (MainWindow registers too, at the point it
+    starts tracking a thread, regardless of which factory produced it)."""
     script = Path(__file__).with_name("_close_during_analysis_scenario.py")
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
 
-    result = subprocess.run(
-        [sys.executable, str(script)],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env=env,
-    )
+    for i in range(50):
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"run {i}: scenario-proces crashte (returncode={result.returncode})\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert "OK" in result.stdout, f"run {i}: geen 'OK' in stdout:\n{result.stdout}"
 
-    assert result.returncode == 0, (
-        f"scenario-proces crashte (returncode={result.returncode})\n"
-        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    )
-    assert "OK" in result.stdout
 
-
-def test_quitting_via_aboutToQuit_during_analysis_does_not_crash_20_times_in_a_row(tmp_path):
-    """The exact regression for this round's bug: `QApplication.quit()`
+def test_quitting_via_aboutToQuit_during_analysis_does_not_crash_50_times_in_a_row(tmp_path):
+    """The exact regression for an earlier round's bug: `QApplication.quit()`
     (Cmd+Q / app-menu Quit — never `window.close()`) called while an
     analysis is still running. Before wiring `aboutToQuit` to
     `MainWindow._wait_for_analysis_to_stop()`, this reliably crashed with
     SIGABRT even after the first `closeEvent()` fix, because this path never
     goes through `closeEvent()` at all.
 
-    20 independent, fresh processes — not 20 iterations in one process — so
-    each run is the most faithful possible reproduction of a real
-    `many-ingest-desktop` session (one process, one window, one quit), and
-    so a failure on run N doesn't depend on what runs 1..N-1 left behind.
+    50 independent, fresh processes (bumped from 20 this round) — not 50
+    iterations in one process — so each run is the most faithful possible
+    reproduction of a real `many-ingest-desktop` session (one process, one
+    window, one quit), and so a failure on run N doesn't depend on what
+    runs 1..N-1 left behind.
     """
     script = Path(__file__).with_name("_quit_during_analysis_scenario.py")
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
 
-    for i in range(20):
+    for i in range(50):
+        run_dir = tmp_path / f"run_{i:02d}"
+        run_dir.mkdir()
+        result = subprocess.run(
+            [sys.executable, str(script), str(run_dir)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"run {i}: scenario-proces crashte (returncode={result.returncode})\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert "OK" in result.stdout, f"run {i}: geen 'OK' in stdout:\n{result.stdout}"
+
+
+def test_opening_and_closing_the_window_without_any_analysis_does_not_crash_50_times_in_a_row(
+    tmp_path,
+):
+    """Baseline control: nothing is ever started, so no QThread is ever
+    created — included in this round's 50x sweep anyway (per the requested
+    coverage) so the whole lifecycle is swept, not only the cases already
+    known to be risky."""
+    script = Path(__file__).with_name("_open_close_no_analysis_scenario.py")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+
+    for i in range(50):
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"run {i}: scenario-proces crashte (returncode={result.returncode})\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert "OK" in result.stdout, f"run {i}: geen 'OK' in stdout:\n{result.stdout}"
+
+
+def test_closing_right_after_a_volume_scan_does_not_crash_50_times_in_a_row(tmp_path):
+    """Volume detection (`MainWindow._run_detection()`) is entirely
+    synchronous on the GUI thread today — no QThread, no worker. Qt's
+    single-threaded event loop cannot process a close/quit event while
+    `_run_detection()` is still running, so "close while a volume scan is
+    active" is not a reachable state in the current architecture, by
+    construction. This test (and its scenario script) documents that
+    directly and guards against a future change that moves volume detection
+    onto a background thread reintroducing the shutdown race this round is
+    about, without that thread being registered/waited on correctly."""
+    script = Path(__file__).with_name("_close_after_volume_scan_scenario.py")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+
+    for i in range(50):
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"run {i}: scenario-proces crashte (returncode={result.returncode})\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert "OK" in result.stdout, f"run {i}: geen 'OK' in stdout:\n{result.stdout}"
+
+
+def test_closing_immediately_after_a_finished_preview_does_not_crash_50_times_in_a_row(tmp_path):
+    """The most timing-sensitive case in this round's sweep: closes the
+    window from inside the same `worker.finished` signal delivery that
+    renders the preview — the earliest possible moment after an analysis
+    completes, before the sibling queued `worker.finished -> thread.quit()`
+    connection (wired in controller.start_dry_run) is guaranteed to have
+    run yet. Uses a real analysis (real ffprobe subprocess) for realistic,
+    fast completion timing rather than the artificial 0.5s
+    `_SlowWorker` sleep used elsewhere in this file — see
+    _close_immediately_after_finish_scenario.py's module docstring for the
+    full reasoning, including a test-script-only bug this scenario
+    surfaced and fixed along the way (a bare function used as a
+    cross-thread signal receiver)."""
+    script = Path(__file__).with_name("_close_immediately_after_finish_scenario.py")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+
+    for i in range(50):
         run_dir = tmp_path / f"run_{i:02d}"
         run_dir.mkdir()
         result = subprocess.run(
@@ -341,6 +438,72 @@ def test_analysis_finishes_normally_and_the_thread_stops_cleanly(qapp, tmp_path)
     assert waiter.failed is None
     assert waiter.summary is not None and waiter.summary.total_files == 1
     assert not thread.isRunning()
+
+
+def test_config_loading_happens_on_the_calling_thread_not_the_worker_thread(qapp, tmp_path, monkeypatch):
+    """Regression test for the segfault this round fixed: a reproducible
+    crash (found only inside a long-lived full-suite pytest run, never in an
+    isolated run) with a stack trace bottoming out in PyYAML's C accelerator
+    (`yaml.safe_load`) invoked from `load_ingest_config`, called from
+    `build_ingest_service`, which at the time ran inside `DryRunWorker.run()`
+    on the background QThread.
+
+    The structural fix (see controller.py's module docstring and
+    `start_dry_run()`) moves `build_ingest_service()` — and therefore every
+    `yaml.safe_load()` call — to whichever thread calls
+    `controller.start_dry_run()`. In production that's always the GUI
+    thread; here it's this test function's own thread. This test proves
+    that placement directly, by spying on `controller.load_ingest_config`
+    and recording which OS thread called it."""
+    import threading
+
+    from many_ingest.desktop import controller as controller_module
+
+    calling_thread_id = threading.get_ident()
+    observed_thread_ids: list[int] = []
+
+    real_load_ingest_config = controller_module.load_ingest_config
+
+    def spy_load_ingest_config(path):
+        observed_thread_ids.append(threading.get_ident())
+        return real_load_ingest_config(path)
+
+    monkeypatch.setattr(controller_module, "load_ingest_config", spy_load_ingest_config)
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+    config_path = _write_config(tmp_path)
+
+    waiter, thread = _run_and_wait(input_dir, "Nike", "Zomer", config_path)
+
+    assert waiter.failed is None
+    assert observed_thread_ids, "load_ingest_config werd nooit aangeroepen"
+    assert observed_thread_ids == [calling_thread_id] * len(observed_thread_ids), (
+        "load_ingest_config (en dus yaml.safe_load) liep op de achtergrond-"
+        "QThread in plaats van op de aanroepende thread — precies de situatie "
+        "die de segfault veroorzaakte"
+    )
+
+
+def test_100_preview_runs_in_a_row_do_not_crash(qapp, tmp_path):
+    """Direct regression test for the segfault itself: 100 sequential real
+    dry-run previews (real QThread, real ffprobe subprocess call, config
+    loading on the calling thread per the fix above) in one long-lived
+    process must not crash. This is the shape of repeatedly clicking
+    "Bekijk inhoud" in one session, and the shape (repeated real-QThread +
+    real-subprocess churn in one long-lived process) that made the original
+    segfault reproducible."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+    config_path = _write_config(tmp_path)
+
+    for i in range(100):
+        waiter, thread = _run_and_wait(input_dir, "Nike", "Zomer", config_path)
+        assert waiter.failed is None, f"run {i}: {waiter.failed}"
+        assert waiter.summary is not None and waiter.summary.total_files == 1
+        assert not thread.isRunning()
 
 
 # -- 3. Meerdere analyses achter elkaar ------------------------------------------

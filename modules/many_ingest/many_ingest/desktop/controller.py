@@ -19,6 +19,30 @@ core/report.py — "a future GUI reuses IngestSummary directly") and never a
 raw exception — every failure is translated to one plain-language message
 here, so main_window.py never has to know what a checksum, a manifest, or
 ffprobe is.
+
+**`build_ingest_service()` (and therefore every `yaml.safe_load()` call) is
+always invoked from `start_dry_run()`, i.e. on the CALLER's thread — never
+inside `DryRunWorker.run()` on the background QThread.** This is a deliberate
+fix for a reproducible segfault (found inside a long-lived pytest session
+running the full test suite, never in a single isolated test run) with a
+stack trace bottoming out in PyYAML's C accelerator (`libyaml`, `yaml.safe_load`
+→ `many_ingest.config.load_ingest_config`) invoked from
+`build_ingest_service()` at the very start of what was `DryRunWorker.run()`.
+Minimal repro scripts ruled out "libyaml + QThread" as inherently unsafe in
+isolation (800 sequential real QThreads each doing two `yaml.safe_load()`
+calls, in one process, never crashed) — the crash needed the accumulated
+state of the full suite (many real ffprobe subprocess calls interleaved with
+real QThread churn across many prior tests; a 2-file subset of ~14 similarly
+heavy tests also never reproduced it). The exact mechanism is therefore most
+likely heap/resource corruption from that broader subprocess+thread churn
+surfacing at whatever C-extension call happened to run next — not a defect
+in this file's design as such — but `yaml.safe_load()` inside the worker
+thread was nonetheless an avoidable, unnecessary C-extension call from a
+background QThread, for no benefit: loading two small local YAML files is
+the same bounded, synchronous cost already paid at app startup (see
+app.py's `_load_storage_root_safely`), so doing it once on the calling
+thread, before the worker thread even exists, removes that call from the
+worker thread's C-extension footprint entirely, for free.
 """
 
 from __future__ import annotations
@@ -33,6 +57,7 @@ from many_ingest.adapters.local_fs_storage import LocalFilesystemStorage
 from many_ingest.config import load_camera_profiles, load_ingest_config
 from many_ingest.core.ingest_service import IngestService
 from many_ingest.core.report import summarize
+from many_ingest.desktop import thread_lifecycle
 from many_ingest.metadata_extractor import FfprobeNotFoundError
 
 DEFAULT_CONFIG_PATH = Path("~/.many-ingest/config.yaml").expanduser()
@@ -96,7 +121,12 @@ def build_ingest_service(config_path: Path, camera_profiles_path: Path) -> Inges
 
 class DryRunWorker(QObject):
     """Runs one dry-run analysis. Plain data out via signals — no widgets,
-    no text formatting beyond translating exceptions to user-facing copy."""
+    no text formatting beyond translating exceptions to user-facing copy.
+
+    Receives an already-constructed `IngestService` (or, if construction
+    already failed on the caller's thread, a pre-translated error message) —
+    never a config path. See this module's docstring for why: no YAML
+    parsing ever happens on this worker's background QThread."""
 
     progress = Signal(object)  # ProgressUpdate
     finished = Signal(object)  # IngestSummary
@@ -105,18 +135,19 @@ class DryRunWorker(QObject):
 
     def __init__(
         self,
+        service: IngestService | None,
         source: Path,
         client: str,
         project: str,
-        config_path: Path,
-        camera_profiles_path: Path,
+        *,
+        preload_error: str | None = None,
     ) -> None:
         super().__init__()
+        self._service = service
         self._source = source
         self._client = client
         self._project = project
-        self._config_path = config_path
-        self._camera_profiles_path = camera_profiles_path
+        self._preload_error = preload_error
         self._cancel_requested = False
 
     def request_cancel(self) -> None:
@@ -130,25 +161,24 @@ class DryRunWorker(QObject):
         self._cancel_requested = True
 
     def run(self) -> None:
-        # Config-/camera-profielen laden staat in een eigen try/except, apart
-        # van service.run() hieronder: beide kunnen een OSError geven, maar
-        # met een heel andere oorzaak (ontbrekend/onleesbaar config-bestand
-        # op deze Mac vs. een niet meer aangesloten bronschijf) — één
-        # gezamenlijke except OSError hierboven liet een ontbrekend
-        # config.yaml ten onrechte de "schijf niet aangesloten"-melding tonen
-        # (gevonden via reproductie: Resolved path/Worker received bleken
-        # steeds correct en bestaand, terwijl de fout toch verscheen).
-        try:
-            service = build_ingest_service(self._config_path, self._camera_profiles_path)
-        except (OSError, ValueError):
-            self.failed.emit(_CONFIG_INVALID_MESSAGE)
-            return
-        except Exception:  # nooit een stacktrace tonen — altijd vertaald
-            self.failed.emit(_UNEXPECTED_ERROR_MESSAGE)
+        # Config/camera-profielen zijn al geladen (of het laden is al
+        # mislukt) vóórdat deze worker ooit startte — zie start_dry_run() en
+        # de moduledocstring hierboven. Dat is ook waarom een mislukte
+        # config-load hier een aparte, losstaande melding blijft i.p.v. in
+        # dezelfde except-tak als service.run() hieronder terecht te komen:
+        # beide kunnen ooit een OSError zijn, maar met een heel andere
+        # oorzaak (ontbrekend/onleesbaar config-bestand op deze Mac vs. een
+        # niet meer aangesloten bronschijf) — één gezamenlijke except OSError
+        # liet een ontbrekend config.yaml ten onrechte de "schijf niet
+        # aangesloten"-melding tonen (gevonden via reproductie: Resolved
+        # path/Worker received bleken steeds correct en bestaand, terwijl de
+        # fout toch verscheen).
+        if self._preload_error is not None:
+            self.failed.emit(self._preload_error)
             return
 
         try:
-            report = service.run(
+            report = self._service.run(
                 source=self._source,
                 client=self._client,
                 project=self._project,
@@ -202,9 +232,37 @@ def start_dry_run(
     """Starts a dry run on a background QThread and wires the given
     callbacks to its signals. Returns (thread, worker) so the caller can keep
     them alive for the run's duration (see main_window.py). `worker` also
-    exposes `request_cancel()` for the caller to invoke on demand."""
-    worker = DryRunWorker(source, client, project, config_path, camera_profiles_path)
+    exposes `request_cancel()` for the caller to invoke on demand.
+
+    `build_ingest_service()` (config + camera-profiles YAML) is loaded right
+    here, synchronously, on whichever thread calls `start_dry_run()` — the
+    GUI thread in production — deliberately BEFORE the worker/thread objects
+    are even created. See this module's docstring for why: this keeps every
+    `yaml.safe_load()` call off the background QThread entirely. A failure
+    here is not raised to the caller — it's translated to the same
+    plain-language message the worker would have shown, and carried into the
+    worker as `preload_error` so the caller still gets its usual
+    `(thread, worker)` pair and its usual `on_failed` callback, on the usual
+    signal path, with no change to callers (see main_window.py, unchanged)."""
+    try:
+        service = build_ingest_service(config_path, camera_profiles_path)
+        preload_error = None
+    except (OSError, ValueError):
+        service = None
+        preload_error = _CONFIG_INVALID_MESSAGE
+    except Exception:  # nooit een stacktrace tonen — altijd vertaald
+        service = None
+        preload_error = _UNEXPECTED_ERROR_MESSAGE
+
+    worker = DryRunWorker(service, source, client, project, preload_error=preload_error)
     thread = QThread()
+    # Registreren zodra de thread bestaat, vóór .start() — zie
+    # thread_lifecycle.py. Dit is vandaag de enige plek in de hele desktop-
+    # app die een QThread aanmaakt (volume-detectie is volledig synchroon,
+    # zie main_window.py's _run_detection()), maar deze registratie hangt
+    # niet van die aanname af: elke toekomstige QThread die zich hier of
+    # elders registreert, wordt automatisch meegenomen door shutdown().
+    thread_lifecycle.register(thread)
     worker.moveToThread(thread)
 
     thread.started.connect(worker.run)
