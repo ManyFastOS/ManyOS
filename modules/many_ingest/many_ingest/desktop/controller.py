@@ -4,11 +4,13 @@ Fase 2 architecture (see the build plan for this phase):
 
     GUI -> Controller -> IngestService -> Storage -> Manifest -> Report
 
-`build_ingest_service` wires up *exactly* what cli.py's composition root
+`build_ingest_service` (imported from `many_ingest.service_factory`, kept
+Qt-free so `ingest_worker.py`'s separate OS process can use it too — see
+that module's docstring) wires up *exactly* what cli.py's composition root
 wires up — same `load_ingest_config`/`load_camera_profiles`, same
 `LocalFilesystemStorage`/`JSONManifest` adapters. No second implementation of
-any of this; if it ever needs to change, it changes once, here, and both
-front-ends (CLI and Desktop) pick it up.
+any of this; if it ever needs to change, it changes once, and every
+front-end (CLI, Desktop preview, Desktop real ingest) picks it up.
 
 `DryRunWorker` runs `IngestService.run(dry_run=True)` on a background
 QThread so the GUI never blocks (see docs/MANY_INGEST_V1_UX_DESIGN.md,
@@ -52,13 +54,11 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from many_ingest.adapters.json_manifest import JSONManifest
-from many_ingest.adapters.local_fs_storage import LocalFilesystemStorage
-from many_ingest.config import load_camera_profiles, load_ingest_config
 from many_ingest.core.ingest_service import IngestService
 from many_ingest.core.report import summarize
 from many_ingest.desktop import thread_lifecycle
 from many_ingest.metadata_extractor import FfprobeNotFoundError
+from many_ingest.service_factory import build_ingest_service
 
 DEFAULT_CONFIG_PATH = Path("~/.many-ingest/config.yaml").expanduser()
 DEFAULT_CAMERA_PROFILES_PATH = Path("~/.many-ingest/camera_profiles.yaml").expanduser()
@@ -105,18 +105,6 @@ def _summarize_for_preview(report):
         return summary
     actual_duplicates = sum(1 for asset in report.assets if asset.is_duplicate)
     return dataclasses.replace(summary, duplicates=actual_duplicates)
-
-
-def build_ingest_service(config_path: Path, camera_profiles_path: Path) -> IngestService:
-    """Same wiring as cli.py's composition root — see the module docstring."""
-    ingest_config = load_ingest_config(config_path)
-    camera_profiles = load_camera_profiles(camera_profiles_path)
-    return IngestService(
-        storage=LocalFilesystemStorage(),
-        manifest=JSONManifest(ingest_config.manifest_path),
-        config=ingest_config,
-        camera_profiles=camera_profiles,
-    )
 
 
 class DryRunWorker(QObject):

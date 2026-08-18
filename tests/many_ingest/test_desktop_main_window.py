@@ -38,7 +38,6 @@ from many_ingest.desktop.main_window import (
     OTHER_DISK_TEXT,
     PREVIEW_TITLE_TEXT,
     RETRY_TEXT,
-    START_INGEST_AVAILABILITY_TEXT,
     START_INGEST_BUTTON_TEXT,
     MainWindow,
 )
@@ -297,11 +296,10 @@ def test_finished_analysis_shows_the_preview_in_plain_language(qapp, tmp_path):
     # Bijzonderheden
     assert "6 bestanden konden niet automatisch worden herkend. Ze worden wel meegenomen." in lines
 
-    # De uitgeschakelde "Start Ingest"-knop hoort er al te staan (fase 3)
+    # De "Start Ingest"-knop staat klaar en is actief na een geslaagde preview (Fase 3)
     start_button = window.choose_button()
     assert start_button.text() == START_INGEST_BUTTON_TEXT
-    assert start_button.isEnabled() is False
-    assert window.current_detail() == START_INGEST_AVAILABILITY_TEXT
+    assert start_button.isEnabled() is True
 
     # Nooit technische termen (Design Language hoofdstuk 15):
     joined = " ".join(lines).lower()

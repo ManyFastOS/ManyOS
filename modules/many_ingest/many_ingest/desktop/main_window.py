@@ -29,7 +29,7 @@ import dataclasses
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import Qt, QThread
+from PySide6.QtCore import Qt, QThread, QTimer
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
 
 from many_ingest.core.ingest_service import ProgressUpdate
 from many_ingest.core.report import IngestSummary
-from many_ingest.desktop import controller, thread_lifecycle
+from many_ingest.desktop import controller, ingest_process, thread_lifecycle
 from many_ingest.desktop.volumes import (
     VolumeInfo,
     format_size,
@@ -68,7 +68,10 @@ UNKNOWN_PROFILE_LABEL = "Onbekend"
 AUDIO_PROFILE_LABEL = "Audio"
 BACK_TEXT = "Terug"
 START_INGEST_BUTTON_TEXT = "Start Ingest"
-START_INGEST_AVAILABILITY_TEXT = "Beschikbaar in de volgende fase."
+INGESTING_TEXT = "Bezig met kopiëren..."
+INGEST_DONE_TITLE_TEXT = "Klaar"
+INGEST_PARTIAL_TITLE_TEXT = "Bijna klaar"
+NEW_INGEST_TEXT = "Nieuwe ingest"
 
 # Vaste naam van de organisatie in de bestemmings-breadcrumb (Bestemming →
 # ManyFast → klant → project) — geen configwaarde, geen storage_root: dit is
@@ -82,9 +85,14 @@ SECTION_CAMERAS = "Camera's"
 SECTION_DUPLICATES = "Duplicaten"
 SECTION_NAME_CONFLICTS = "Naamconflicten"
 SECTION_NOTES = "Bijzonderheden"
+SECTION_ERRORS = "Fouten"
+SECTION_SOURCE_STATUS = "Bron"
+SAFE_TO_DELETE_YES_TEXT = "Veilig om de bron te verwijderen."
+SAFE_TO_DELETE_NO_TEXT = "Nog niet veilig om de bron te verwijderen."
 
 DetectVolumes = Callable[[], list[VolumeInfo]]
 StartDryRun = Callable[..., tuple[QThread | None, object | None]]
+StartRealIngest = Callable[..., object]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,6 +109,7 @@ class MainWindow(QWidget):
         self,
         detect_volumes: DetectVolumes | None = None,
         start_dry_run: StartDryRun | None = None,
+        start_real_ingest: StartRealIngest | None = None,
         config_path: Path = controller.DEFAULT_CONFIG_PATH,
         camera_profiles_path: Path = controller.DEFAULT_CAMERA_PROFILES_PATH,
     ) -> None:
@@ -120,6 +129,9 @@ class MainWindow(QWidget):
             lambda: list_candidate_volumes(storage_root=None)
         )
         self._start_dry_run: StartDryRun = start_dry_run or controller.start_dry_run
+        self._start_real_ingest: StartRealIngest = (
+            start_real_ingest or ingest_process.start_real_ingest
+        )
         self._config_path = config_path
         self._camera_profiles_path = camera_profiles_path
 
@@ -127,6 +139,17 @@ class MainWindow(QWidget):
         self._selection: _SelectionInfo | None = None
         self._analysis_thread: QThread | None = None
         self._analysis_worker: object | None = None
+
+        # Vastgelegd zodra een analyse *start* (zie _start_preview), pas
+        # bevestigd zodra hij ook echt succesvol afrondt (zie
+        # _on_analysis_finished) — "Start Ingest" mag alleen de exacte
+        # (bron, klant, project) gebruiken van de laatst getoonde, geslaagde
+        # preview, nooit een combinatie die ondertussen gewijzigd is zonder
+        # nieuwe preview. Ongeldig gemaakt zodra de gebruiker teruggaat naar
+        # het formulier (_return_to_selection) of een nieuwe analyse start.
+        self._pending_preview_input: tuple[Path, str, str] | None = None
+        self._confirmed_preview_input: tuple[Path, str, str] | None = None
+        self._ingest_runner: object | None = None
 
         self._outer_layout = QVBoxLayout(self)
 
@@ -152,8 +175,16 @@ class MainWindow(QWidget):
         `_analysis_thread`) before letting the window close. See
         `_wait_for_analysis_to_stop` for why this alone is NOT sufficient —
         `app.aboutToQuit` (wired in app.py) is the other required half.
+
+        Also stops a real ingest (a QProcess, Fase 3 — see
+        `_wait_for_ingest_to_stop`) if one is still active. These are two
+        independent guarantees for two different kinds of background work
+        (QThread vs. QProcess), deliberately not merged into one — see
+        ingest_process.py's module docstring for why a real ingest is a
+        separate OS process rather than another QThread.
         """
         self._wait_for_analysis_to_stop()
+        self._wait_for_ingest_to_stop()
         super().closeEvent(event)
 
     def _wait_for_analysis_to_stop(self) -> None:
@@ -193,6 +224,23 @@ class MainWindow(QWidget):
         `quit()`, which is a request, not an interruption.
         """
         thread_lifecycle.shutdown()
+
+    def _wait_for_ingest_to_stop(self) -> None:
+        """The Fase 3 equivalent of `_wait_for_analysis_to_stop`, for a real
+        ingest's `IngestRunner`/`QProcess` (see desktop/ingest_process.py)
+        rather than the preview's `QThread`. A `QProcess` object has none of
+        `QThread`'s fatal-abort-on-destroy failure mode — dropping the last
+        Python reference to it while the OS process is still running does
+        not crash this process — but leaving it running unattended after the
+        window/app is gone would silently keep copying files in the
+        background with no UI and no way to see progress or a final report,
+        which is its own kind of unsafe surprise for the editor. This calls
+        `IngestRunner.stop_and_wait()` — a synchronous terminate-then-kill
+        (never removes source files, v0.1 is copy-only) — so the app never
+        actually quits while a real ingest could still be silently running.
+        """
+        if self._ingest_runner is not None:
+            self._ingest_runner.stop_and_wait()
 
     def _on_analysis_thread_finished(self) -> None:
         """The only place references are cleared — connected to
@@ -294,6 +342,12 @@ class MainWindow(QWidget):
             return
         if self._analysis_thread is not None and self._analysis_thread.isRunning():
             return  # een analyse loopt al; niet bereikbaar via de UI, extra zekerheid
+        # Een nieuwe analyse maakt elke eerder bevestigde preview-input
+        # ongeldig totdat déze analyse ook echt slaagt (zie
+        # _on_analysis_finished) — Start Ingest mag nooit een combinatie
+        # gebruiken die niet exact overeenkomt met de laatst getoonde preview.
+        self._confirmed_preview_input = None
+        self._pending_preview_input = (self._selection.source_path, client, project)
         self._render_analyzing()
         self._analysis_thread, self._analysis_worker = self._start_dry_run(
             self._selection.source_path,
@@ -340,6 +394,10 @@ class MainWindow(QWidget):
             detail.setText(f"{update.processed} van {update.total} bestanden bekeken")
 
     def _on_analysis_finished(self, summary: IngestSummary) -> None:
+        # Pas hier bevestigen (niet al bij het starten) — dit is het enige
+        # moment waarop we weten dat déze exacte (bron, klant, project) ook
+        # daadwerkelijk de preview is die de gebruiker nu ziet.
+        self._confirmed_preview_input = self._pending_preview_input
         self._render_preview(summary)
 
     def _on_analysis_failed(self, message: str) -> None:
@@ -349,8 +407,94 @@ class MainWindow(QWidget):
         self._return_to_selection()
 
     def _return_to_selection(self) -> None:
+        # Elke terugkeer naar het formulier maakt een bevestigde preview
+        # ongeldig — een nieuwe "Start Ingest" vereist altijd eerst weer een
+        # verse, geslaagde preview (zie hoofdstuk 14 van de Fase 3-opdracht).
+        self._confirmed_preview_input = None
         if self._selection is not None:
             self._render_selected()
+
+    # -- echte ingest (Fase 3, via IngestRunner/QProcess — nooit IngestService
+    # rechtstreeks, zie ingest_process.py) --------------------------------------
+
+    def _on_start_ingest_clicked(self) -> None:
+        if self._confirmed_preview_input is None:
+            return  # niet bereikbaar via de UI (knop staat dan uit), extra zekerheid
+        if self._ingest_runner is not None and self._ingest_runner.is_running():
+            return  # een ingest loopt al; niet bereikbaar via de UI, extra zekerheid
+        if self._analysis_thread is not None:
+            # De preview die dit scherm liet zien is al klaar (on_finished is
+            # al geweest, anders zou deze knop niet bestaan) — maar de
+            # onderliggende QThread kan een paar milliseconden later pas
+            # aantoonbaar volledig gestopt zijn (zie
+            # _on_analysis_thread_finished, gekoppeld aan thread.finished,
+            # niet aan worker.finished). Een echte klik is hier in de
+            # praktijk altijd ruim op tijd, maar een zeer snel opeenvolgende
+            # klik + venster sluiten kan deze paar milliseconden wél raken —
+            # gereproduceerd als een QThread-teardownrace (SIGSEGV in de
+            # QThread zelf, "faultingThread: QThread") bij het meteen
+            # starten van een echte ingest (nieuwe QProcess-activiteit) vlak
+            # ná een preview. Nooit een tweede zware achtergrondtaak starten
+            # terwijl de vorige QThread nog niet aantoonbaar weg is (zie
+            # thread_lifecycle.py) — een korte retry i.p.v. de klik stil
+            # laten verdwijnen.
+            QTimer.singleShot(10, self._on_start_ingest_clicked)
+            return
+
+        source, client, project = self._confirmed_preview_input
+        self._render_ingesting()
+        self._ingest_runner = self._start_real_ingest(
+            source,
+            client,
+            project,
+            on_progress=self._on_ingest_progress,
+            on_completed=self._on_ingest_completed,
+            on_failed=self._on_ingest_failed,
+            on_cancelled=self._on_ingest_cancelled,
+            config_path=self._config_path,
+            camera_profiles_path=self._camera_profiles_path,
+        )
+
+    def _on_cancel_ingest_clicked(self) -> None:
+        """Zoals bij annuleren van een preview: een enkele klik. In
+        tegenstelling tot de preview annuleert dit een actie die al wél
+        bestanden heeft weggeschreven — de precieze bevestigingsvraag
+        daarvoor (Design Language hoofdstuk 12, UX-blauwdruk hoofdstuk 6) is
+        bewust niet in deze fase gebouwd (niet in de Fase 3-opdracht), maar
+        blijft een expliciete, latere toevoeging, geen vergeten stap."""
+        if self._ingest_runner is not None:
+            self._ingest_runner.cancel()
+
+    def _on_ingest_progress(self, update: ProgressUpdate) -> None:
+        bar = self.progress_bar()
+        if bar is not None:
+            if bar.maximum() == 0 and update.total:
+                bar.setRange(0, update.total)
+            bar.setValue(update.processed)
+
+        detail = self._content.findChild(QLabel, "captionLabel") if self._content else None
+        if detail is not None:
+            detail.setText(
+                f"{update.processed} van {update.total} bestanden · "
+                f"{format_size(update.bytes_processed)} verwerkt"
+            )
+
+    def _on_ingest_completed(self, summary: IngestSummary) -> None:
+        self._ingest_runner = None
+        # Een voltooide ingest maakt de preview die hem startte ongeldig —
+        # nogmaals op "Start Ingest" klikken zonder nieuwe preview mag nooit
+        # dezelfde run herhalen.
+        self._confirmed_preview_input = None
+        self._render_ingest_report(summary)
+
+    def _on_ingest_failed(self, message: str) -> None:
+        self._ingest_runner = None
+        self._render_analysis_failed(message)
+
+    def _on_ingest_cancelled(self) -> None:
+        self._ingest_runner = None
+        self._confirmed_preview_input = None
+        self._return_to_selection()
 
     # -- rendering --------------------------------------------------------------
 
@@ -506,6 +650,37 @@ class MainWindow(QWidget):
         layout.addStretch()
         self._set_content(content)
 
+    def _render_ingesting(self) -> None:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.addStretch()
+
+        label = QLabel(INGESTING_TEXT)
+        label.setObjectName("statusLabel")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(label)
+        layout.addSpacing(16)
+
+        progress = QProgressBar()
+        progress.setObjectName("analysisProgress")
+        progress.setRange(0, 0)  # onbepaald tot het eerste bestand geteld is
+        layout.addWidget(progress)
+        layout.addSpacing(8)
+
+        detail_label = QLabel("")
+        detail_label.setObjectName("captionLabel")
+        detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(detail_label)
+        layout.addSpacing(16)
+
+        cancel_button = QPushButton(CANCEL_BUTTON_TEXT)
+        cancel_button.setObjectName("linkButton")
+        cancel_button.clicked.connect(self._on_cancel_ingest_clicked)
+        layout.addWidget(cancel_button, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        layout.addStretch()
+        self._set_content(content)
+
     def _add_preview_section(self, layout: QVBoxLayout, header_text: str, value_lines: list[str]) -> None:
         header = QLabel(header_text)
         header.setObjectName("fieldLabel")
@@ -575,19 +750,65 @@ class MainWindow(QWidget):
 
         start_ingest_button = QPushButton(START_INGEST_BUTTON_TEXT)
         start_ingest_button.setObjectName("primaryButton")
-        start_ingest_button.setEnabled(False)
+        start_ingest_button.clicked.connect(self._on_start_ingest_clicked)
         layout.addWidget(start_ingest_button, alignment=Qt.AlignmentFlag.AlignCenter)
-
-        availability_label = QLabel(START_INGEST_AVAILABILITY_TEXT)
-        availability_label.setObjectName("captionLabel")
-        availability_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(availability_label)
-        layout.addSpacing(4)
+        layout.addSpacing(12)
 
         back_button = QPushButton(BACK_TEXT)
         back_button.setObjectName("linkButton")
         back_button.clicked.connect(self._return_to_selection)
         layout.addWidget(back_button, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        layout.addStretch()
+        self._set_content(content)
+
+    def _render_ingest_report(self, summary: IngestSummary) -> None:
+        """The Fase 3 eindscherm — reuses the exact same `IngestSummary` and
+        section-rendering helper as `_render_preview` (see
+        `_add_preview_section`), for a REAL result instead of a dry-run
+        preview. Never a functional "verwijder de bron"-knop: only the text
+        status the engine itself already computes
+        (`summary.safe_to_delete_source`) — an actual delete/eject action is
+        out of scope for this phase (see CLAUDE.md: v0.1 is copy-only)."""
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.addStretch()
+
+        title_text = INGEST_DONE_TITLE_TEXT if summary.errors == 0 else INGEST_PARTIAL_TITLE_TEXT
+        title = QLabel(title_text)
+        title.setObjectName("statusLabel")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        layout.addSpacing(20)
+
+        self._add_preview_section(
+            layout,
+            SECTION_DESTINATION,
+            [DESTINATION_ORG_LABEL, summary.client, summary.project],
+        )
+        self._add_preview_section(
+            layout,
+            SECTION_FILES,
+            [_pluralize_files(summary.total_files), format_size(summary.total_bytes)],
+        )
+
+        camera_lines = self._camera_breakdown_lines(summary)
+        if camera_lines:
+            self._add_preview_section(layout, SECTION_CAMERAS, camera_lines)
+
+        self._add_preview_section(layout, SECTION_DUPLICATES, [str(summary.duplicates)])
+        self._add_preview_section(layout, SECTION_NAME_CONFLICTS, [str(summary.name_conflicts_resolved)])
+
+        if summary.errors:
+            self._add_preview_section(layout, SECTION_ERRORS, [str(summary.errors)])
+
+        safe_text = SAFE_TO_DELETE_YES_TEXT if summary.safe_to_delete_source else SAFE_TO_DELETE_NO_TEXT
+        self._add_preview_section(layout, SECTION_SOURCE_STATUS, [safe_text])
+
+        new_ingest_button = QPushButton(NEW_INGEST_TEXT)
+        new_ingest_button.setObjectName("linkButton")
+        new_ingest_button.clicked.connect(self._return_to_selection)
+        layout.addWidget(new_ingest_button, alignment=Qt.AlignmentFlag.AlignCenter)
 
         layout.addStretch()
         self._set_content(content)
