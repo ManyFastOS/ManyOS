@@ -1,7 +1,7 @@
-"""The Fase 3 Controller layer for a REAL ingest run — the GUI-facing half
-of the QProcess boundary (see many_ingest/ingest_worker.py for the other
-half, and its module docstring for why this is a separate OS process rather
-than a QThread like the preview in controller.py).
+"""The GUI-facing half of the QProcess boundary — one generic runner for
+BOTH a preview/dry-run and a real ingest (see many_ingest/ingest_worker.py
+for the Qt-free worker half, and its module docstring for why this is a
+separate OS process rather than a QThread).
 
     MainWindow -> IngestRunner (this file) -> QProcess -> ingest_worker.py
     -> IngestService -> Storage/Manifest/Report
@@ -10,9 +10,24 @@ than a QThread like the preview in controller.py).
 business meaning out of anything beyond the JSON-lines protocol
 `ingest_worker.py` documents — it only launches the worker process, buffers
 and parses its stdout line by line, and re-emits each event as a Qt signal,
-reconstructing the exact same `ProgressUpdate`/`IngestSummary` types the
-preview path already uses (see core/ingest_service.py, core/report.py) so
-main_window.py renders both paths through the same plain-data shapes.
+reconstructing the exact same `ProgressUpdate`/`IngestSummary` types for
+both a preview and a real run (see core/ingest_service.py, core/report.py)
+so main_window.py renders both through the same plain-data shapes.
+
+Until this round, preview ran on a background `QThread`
+(desktop/controller.py, now removed) while only the real ingest used this
+QProcess runner. That split was removed after a real macOS crash report
+(`faultingThread: QThread`, `QThread::~QThread()` on the main thread racing
+`QObject::~QObject()`/`disconnectNotify` on the background thread —
+confirmed via `~/Library/Logs/DiagnosticReports`) traced back to the
+preview's unparented `QThread()`: its C++ object could be torn down
+concurrently by Python refcounting (dropping the GUI's last reference once
+`finished` fired) and by Qt's own `deleteLater()` — a genuine race, not a
+timing detail a longer grace period or an extra guard could close. A
+`QProcess` has no second thread and no shared Qt/Python object graph for two
+threads to fight over, so it has no equivalent failure mode. `dry_run`
+below is the only difference between the two call shapes — one worker
+entrypoint, one runner class, one protocol.
 """
 
 from __future__ import annotations
@@ -25,7 +40,9 @@ from PySide6.QtCore import QObject, QProcess, QTimer, Signal
 
 from many_ingest.core.ingest_service import ProgressUpdate
 from many_ingest.core.report import IngestSummary
-from many_ingest.desktop.controller import DEFAULT_CAMERA_PROFILES_PATH, DEFAULT_CONFIG_PATH
+
+DEFAULT_CONFIG_PATH = Path("~/.many-ingest/config.yaml").expanduser()
+DEFAULT_CAMERA_PROFILES_PATH = Path("~/.many-ingest/camera_profiles.yaml").expanduser()
 
 # Hoe lang IngestRunner.cancel() wacht op een nette stop (SIGTERM, zie
 # ingest_worker.py) voordat hij forceert (kill(), SIGKILL) — "probeer eerst
@@ -36,20 +53,29 @@ from many_ingest.desktop.controller import DEFAULT_CAMERA_PROFILES_PATH, DEFAULT
 # voelen voor de editor.
 _CANCEL_GRACE_MS = 5_000
 
-_WORKER_CRASHED_MESSAGE = (
+_INGEST_CRASHED_MESSAGE = (
     "Er ging onverwacht iets mis tijdens het kopiëren. Er is niets "
     "overschreven — controleer de verbinding met de schijf en probeer het "
     "opnieuw."
 )
-_WORKER_COULD_NOT_START_MESSAGE = (
+_INGEST_COULD_NOT_START_MESSAGE = (
     "Kon het kopiëren niet starten op deze Mac. Neem contact op met de beheerder."
+)
+_PREVIEW_CRASHED_MESSAGE = (
+    "Er ging onverwacht iets mis tijdens het bekijken van de inhoud. Er is "
+    "niets gewijzigd — probeer het opnieuw."
+)
+_PREVIEW_COULD_NOT_START_MESSAGE = (
+    "Kon de inhoud niet bekijken op deze Mac. Neem contact op met de beheerder."
 )
 
 
 class IngestRunner(QObject):
-    """Wraps one real-ingest `QProcess`. Plain data out via signals — no
-    widgets, no text formatting beyond what `ingest_worker.py` already
-    translated. Never raises a raw exception across this boundary."""
+    """Wraps one worker `QProcess` — a preview/dry-run OR a real ingest,
+    `dry_run` is the only difference (see this module's docstring). Plain
+    data out via signals — no widgets, no text formatting beyond what
+    `ingest_worker.py` already translated. Never raises a raw exception
+    across this boundary."""
 
     started = Signal(dict)  # {"source", "client", "project"}
     progress = Signal(object)  # ProgressUpdate
@@ -66,11 +92,13 @@ class IngestRunner(QObject):
         *,
         config_path: Path,
         camera_profiles_path: Path,
+        dry_run: bool = False,
         _command_override: list[str] | None = None,
     ) -> None:
         super().__init__()
         self._buffer = ""
         self._terminal_event_seen = False
+        self._dry_run = dry_run
 
         self._process = QProcess(self)
         if _command_override is not None:
@@ -85,24 +113,25 @@ class IngestRunner(QObject):
             self._process.setArguments(_command_override[1:])
         else:
             self._process.setProgram(sys.executable)
-            self._process.setArguments(
-                [
-                    "-m",
-                    "many_ingest.ingest_worker",
-                    "--source",
-                    str(source),
-                    "--client",
-                    client,
-                    "--project",
-                    project,
-                    "--config",
-                    str(config_path),
-                    "--camera-profiles",
-                    str(camera_profiles_path),
-                    "--mode",
-                    "copy",
-                ]
-            )
+            args = [
+                "-m",
+                "many_ingest.ingest_worker",
+                "--source",
+                str(source),
+                "--client",
+                client,
+                "--project",
+                project,
+                "--config",
+                str(config_path),
+                "--camera-profiles",
+                str(camera_profiles_path),
+                "--mode",
+                "copy",
+            ]
+            if dry_run:
+                args.append("--dry-run")
+            self._process.setArguments(args)
         self._process.readyReadStandardOutput.connect(self._on_ready_read)
         self._process.finished.connect(self._on_finished)
         self._process.errorOccurred.connect(self._on_error_occurred)
@@ -195,7 +224,7 @@ class IngestRunner(QObject):
             self.completed.emit(IngestSummary(**payload))
         elif event == "ingest_failed":
             self._terminal_event_seen = True
-            self.failed.emit(payload.get("message", _WORKER_CRASHED_MESSAGE))
+            self.failed.emit(payload.get("message", self._crashed_message()))
         elif event == "ingest_cancelled":
             self._terminal_event_seen = True
             self.cancelled.emit()
@@ -205,6 +234,12 @@ class IngestRunner(QObject):
 
     # -- process lifecycle -----------------------------------------------------
 
+    def _crashed_message(self) -> str:
+        return _PREVIEW_CRASHED_MESSAGE if self._dry_run else _INGEST_CRASHED_MESSAGE
+
+    def _could_not_start_message(self) -> str:
+        return _PREVIEW_COULD_NOT_START_MESSAGE if self._dry_run else _INGEST_COULD_NOT_START_MESSAGE
+
     def _on_finished(self, exit_code: int, exit_status) -> None:
         self._kill_timer.stop()
         if not self._terminal_event_seen:
@@ -213,7 +248,7 @@ class IngestRunner(QObject):
             # GUI blijft leven; dit wordt vertaald naar dezelfde soort
             # vriendelijke melding als elke andere mislukking, nooit een
             # stacktrace (Design Language hoofdstuk 15).
-            self.failed.emit(_WORKER_CRASHED_MESSAGE)
+            self.failed.emit(self._crashed_message())
 
     def _on_error_occurred(self, error) -> None:
         # Alleen FailedToStart hier apart afhandelen: dat is het ene
@@ -226,7 +261,26 @@ class IngestRunner(QObject):
         # "nooit gestart" en "halverwege gecrasht" onterecht verdoezelen.
         if error == QProcess.ProcessError.FailedToStart and not self._terminal_event_seen:
             self._terminal_event_seen = True
-            self.failed.emit(_WORKER_COULD_NOT_START_MESSAGE)
+            self.failed.emit(self._could_not_start_message())
+
+
+def _start(runner: IngestRunner, *, on_started, on_progress, on_asset_processed, on_completed, on_failed, on_cancelled) -> IngestRunner:
+    """Shared wiring for `start_real_ingest`/`start_preview` — one runner
+    class, one place that connects its signals, so the two only ever differ
+    in the one thing that's actually different (`dry_run`, passed to
+    `IngestRunner` by the caller)."""
+    if on_started is not None:
+        runner.started.connect(on_started)
+    runner.progress.connect(on_progress)
+    if on_asset_processed is not None:
+        runner.asset_processed.connect(on_asset_processed)
+    runner.completed.connect(on_completed)
+    runner.failed.connect(on_failed)
+    if on_cancelled is not None:
+        runner.cancelled.connect(on_cancelled)
+
+    runner.start()
+    return runner
 
 
 def start_real_ingest(
@@ -244,21 +298,59 @@ def start_real_ingest(
     camera_profiles_path: Path = DEFAULT_CAMERA_PROFILES_PATH,
 ) -> IngestRunner:
     """Starts a real ingest in its own OS process and wires the given
-    callbacks to its signals — same injectable-callback shape as
-    `controller.start_dry_run`, so main_window.py can inject a test double
-    the same way it already does for the preview."""
+    callbacks to its signals."""
     runner = IngestRunner(
-        source, client, project, config_path=config_path, camera_profiles_path=camera_profiles_path
+        source,
+        client,
+        project,
+        config_path=config_path,
+        camera_profiles_path=camera_profiles_path,
+        dry_run=False,
     )
-    if on_started is not None:
-        runner.started.connect(on_started)
-    runner.progress.connect(on_progress)
-    if on_asset_processed is not None:
-        runner.asset_processed.connect(on_asset_processed)
-    runner.completed.connect(on_completed)
-    runner.failed.connect(on_failed)
-    if on_cancelled is not None:
-        runner.cancelled.connect(on_cancelled)
+    return _start(
+        runner,
+        on_started=on_started,
+        on_progress=on_progress,
+        on_asset_processed=on_asset_processed,
+        on_completed=on_completed,
+        on_failed=on_failed,
+        on_cancelled=on_cancelled,
+    )
 
-    runner.start()
-    return runner
+
+def start_preview(
+    source: Path,
+    client: str,
+    project: str,
+    *,
+    on_started=None,
+    on_progress,
+    on_asset_processed=None,
+    on_completed,
+    on_failed,
+    on_cancelled=None,
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    camera_profiles_path: Path = DEFAULT_CAMERA_PROFILES_PATH,
+) -> IngestRunner:
+    """Starts a preview/dry-run in its own OS process and wires the given
+    callbacks to its signals — same shape, same runner class, same protocol
+    as `start_real_ingest`, only `dry_run=True` differs. Replaces the old
+    QThread-based `controller.start_dry_run()` (removed this round — see
+    this module's docstring for why)."""
+    runner = IngestRunner(
+        source,
+        client,
+        project,
+        config_path=config_path,
+        camera_profiles_path=camera_profiles_path,
+        dry_run=True,
+    )
+    return _start(
+        runner,
+        on_started=on_started,
+        on_progress=on_progress,
+        on_asset_processed=on_asset_processed,
+        on_completed=on_completed,
+        on_failed=on_failed,
+        on_cancelled=on_cancelled,
+    )

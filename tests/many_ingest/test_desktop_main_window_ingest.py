@@ -1,13 +1,13 @@
 """Fase 3: MainWindow tests for the real Start Ingest flow (see
 desktop/ingest_process.py, many_ingest/ingest_worker.py).
 
-`start_dry_run` and `start_real_ingest` are always injected (same pattern as
+`start_preview` and `start_real_ingest` are always injected (same pattern as
 test_desktop_main_window.py's Fase 2 tests), so most tests here never touch a
-real background QThread or a real QProcess — only that MainWindow renders and
-wires whatever it's handed, correctly. The one exception is
+real background process — only that MainWindow renders and wires whatever
+it's handed, correctly. The one exception is
 `test_closing_the_window_during_a_real_ingest_does_not_crash`, which uses a
-real dry-run and a real QProcess end to end (via a standalone scenario
-script, same pattern as test_desktop_thread_lifecycle.py), because that is
+real preview and a real QProcess end to end (via a standalone scenario
+script, same pattern as test_desktop_preview_process.py), because that is
 precisely the shutdown-while-active-work guarantee that only a real QProcess
 can prove.
 """
@@ -56,18 +56,25 @@ def _volume(name: str, path, *, capacity=500_000_000_000, media_count=10, media_
     )
 
 
-class _FakeWorker:
+class _FakePreviewRunner:
     def __init__(self) -> None:
-        self.cancel_requested = False
+        self.cancel_called = False
+        self._running = True
 
-    def request_cancel(self) -> None:
-        self.cancel_requested = True
+    def is_running(self) -> bool:
+        return self._running
+
+    def cancel(self) -> None:
+        self.cancel_called = True
+
+    def stop_and_wait(self, timeout_ms: int | None = None) -> None:
+        self._running = False
 
 
-class _CapturingStartDryRun:
+class _CapturingStartPreview:
     def __init__(self) -> None:
         self.calls: list[dict] = []
-        self.workers: list[_FakeWorker] = []
+        self.runners: list[_FakePreviewRunner] = []
 
     def __call__(
         self,
@@ -76,9 +83,11 @@ class _CapturingStartDryRun:
         project,
         *,
         on_progress,
-        on_finished,
+        on_completed,
         on_failed,
         on_cancelled=None,
+        on_started=None,
+        on_asset_processed=None,
         config_path,
         camera_profiles_path,
     ):
@@ -88,14 +97,14 @@ class _CapturingStartDryRun:
                 "client": client,
                 "project": project,
                 "on_progress": on_progress,
-                "on_finished": on_finished,
+                "on_completed": on_completed,
                 "on_failed": on_failed,
                 "on_cancelled": on_cancelled,
             }
         )
-        worker = _FakeWorker()
-        self.workers.append(worker)
-        return None, worker
+        runner = _FakePreviewRunner()
+        self.runners.append(runner)
+        return runner
 
 
 class _FakeIngestRunner:
@@ -172,25 +181,25 @@ def _make_summary(**overrides) -> IngestSummary:
 
 
 def _window_with_finished_preview(qapp, tmp_path, **summary_overrides):
-    dry_run_starter = _CapturingStartDryRun()
+    preview_starter = _CapturingStartPreview()
     ingest_starter = _CapturingStartRealIngest()
     window = MainWindow(
         detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)],
-        start_dry_run=dry_run_starter,
+        start_preview=preview_starter,
         start_real_ingest=ingest_starter,
     )
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer Campagne")
     window.choose_button().click()
-    dry_run_starter.calls[0]["on_finished"](_make_summary(dry_run=True, **summary_overrides))
-    return window, dry_run_starter, ingest_starter
+    preview_starter.calls[0]["on_completed"](_make_summary(dry_run=True, **summary_overrides))
+    return window, preview_starter, ingest_starter
 
 
 # -- gating: Start Ingest always uses the exact input of the shown preview ------
 
 
 def test_start_ingest_calls_the_injected_starter_with_the_preview_input(qapp, tmp_path):
-    window, _dry_run_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
 
     start_button = window.choose_button()
     assert start_button.text() == START_INGEST_BUTTON_TEXT
@@ -220,14 +229,14 @@ def test_start_ingest_does_nothing_without_a_confirmed_preview(qapp, tmp_path):
 
 
 def test_start_ingest_uses_the_latest_preview_after_a_repreview_with_different_input(qapp, tmp_path):
-    window, dry_run_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window, preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
 
     # Terug, en een NIEUWE preview met een andere klant/project:
     window.secondary_action_button().click()
     window.client_input().setText("Adidas")
     window.project_input().setText("Winter")
     window.choose_button().click()
-    dry_run_starter.calls[1]["on_finished"](
+    preview_starter.calls[1]["on_completed"](
         _make_summary(dry_run=True, client="Adidas", project="Winter")
     )
 
@@ -239,7 +248,7 @@ def test_start_ingest_uses_the_latest_preview_after_a_repreview_with_different_i
 
 
 def test_a_second_start_ingest_click_while_one_is_running_is_ignored(qapp, tmp_path):
-    window, _dry_run_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
 
     window.choose_button().click()  # start echte ingest
     assert len(ingest_starter.calls) == 1
@@ -253,7 +262,7 @@ def test_a_second_start_ingest_click_while_one_is_running_is_ignored(qapp, tmp_p
 
 
 def test_ingest_progress_updates_the_progress_bar_and_caption(qapp, tmp_path):
-    window, _dry_run_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
     window.choose_button().click()
 
     on_progress = ingest_starter.calls[0]["on_progress"]
@@ -271,7 +280,7 @@ def test_ingest_progress_updates_the_progress_bar_and_caption(qapp, tmp_path):
 
 
 def test_ingest_completed_without_errors_shows_klaar_and_safe_to_delete(qapp, tmp_path):
-    window, _dry_run_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
     window.choose_button().click()
 
     ingest_starter.calls[0]["on_completed"](
@@ -294,7 +303,7 @@ def test_ingest_completed_without_errors_shows_klaar_and_safe_to_delete(qapp, tm
 
 
 def test_ingest_completed_with_errors_shows_bijna_klaar_and_not_safe_to_delete(qapp, tmp_path):
-    window, _dry_run_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
     window.choose_button().click()
 
     ingest_starter.calls[0]["on_completed"](
@@ -316,7 +325,7 @@ def test_ingest_completed_with_errors_shows_bijna_klaar_and_not_safe_to_delete(q
 
 
 def test_ingest_failed_shows_a_friendly_message_never_a_stacktrace(qapp, tmp_path):
-    window, _dry_run_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
     window.choose_button().click()
 
     ingest_starter.calls[0]["on_failed"](
@@ -329,7 +338,7 @@ def test_ingest_failed_shows_a_friendly_message_never_a_stacktrace(qapp, tmp_pat
 
 
 def test_cancel_ingest_button_calls_cancel_on_the_runner(qapp, tmp_path):
-    window, _dry_run_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
     window.choose_button().click()
 
     assert window.current_message() == INGESTING_TEXT
@@ -339,7 +348,7 @@ def test_cancel_ingest_button_calls_cancel_on_the_runner(qapp, tmp_path):
 
 
 def test_ingest_cancelled_returns_to_the_selection_form(qapp, tmp_path):
-    window, _dry_run_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
     window.choose_button().click()
 
     ingest_starter.calls[0]["on_cancelled"]()

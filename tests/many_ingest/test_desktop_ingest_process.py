@@ -1,10 +1,10 @@
-"""Tests for desktop/ingest_process.py — the Fase 3 GUI-facing half of the
-QProcess boundary (see that module's docstring, and test_ingest_worker.py
-for the Qt-free worker half).
+"""Tests for desktop/ingest_process.py — the GUI-facing half of the QProcess
+boundary, for BOTH a real ingest and a preview/dry-run (see that module's
+docstring, and test_ingest_worker.py for the Qt-free worker half).
 
 Runs headless (QT_QPA_PLATFORM=offscreen). Skips cleanly when PySide6 isn't
-installed (optional `[gui]` extra). All real-ingest tests use small, synthetic,
-temporary files — never real production footage, per this round's testing rules.
+installed (optional `[gui]` extra). All tests use small, synthetic, temporary
+files — never real production footage, per this round's testing rules.
 """
 
 from __future__ import annotations
@@ -61,11 +61,11 @@ def _wait_until(predicate, qapp, timeout_s: float = 10.0) -> bool:
 
 class _Collector(QObject):
     """A real QObject receiver, not a bare function — kept consistent with
-    the rest of this test suite's convention (see test_desktop_controller.py's
-    `_ResultCollector`), even though IngestRunner's signals are all emitted on
-    the same (GUI) thread as the receiver here, so the cross-thread-closure
-    pitfall that convention guards against elsewhere does not actually apply
-    to QProcess-backed signals the way it does to QThread-backed ones."""
+    the rest of this test suite's convention, even though IngestRunner's
+    signals are all emitted on the same (GUI) thread as the receiver here,
+    so the cross-thread-closure pitfall that convention guards against
+    elsewhere does not actually apply to QProcess-backed signals the way it
+    used to for the preview's (now-removed) QThread."""
 
     done = Signal()
 
@@ -173,6 +173,82 @@ def test_cancel_stops_a_real_ingest_gracefully(qapp, tmp_path):
     assert not runner.is_running()
 
 
+# -- real, end-to-end preview via IngestRunner (dry_run=True) ---------------------
+
+
+def test_preview_via_runner_reports_progress_and_a_reconstructed_summary(qapp, tmp_path):
+    """The preview used to run on a QThread via desktop/controller.py (see
+    git history) — it now goes through the exact same `IngestRunner` as a
+    real ingest, just with `dry_run=True`. This is the preview's equivalent
+    of `test_real_ingest_via_runner_reports_progress_and_a_reconstructed_summary`
+    above — same runner class, only the outcome (nothing copied) differs."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+    config_path = _write_config(tmp_path)
+
+    collector = _Collector()
+    runner = ingest_process.start_preview(
+        input_dir,
+        "Nike",
+        "Zomer",
+        on_progress=collector.on_progress,
+        on_completed=collector.on_completed,
+        on_failed=collector.on_failed,
+        config_path=config_path,
+        camera_profiles_path=CAMERA_PROFILES_PATH,
+    )
+
+    _run_and_wait(collector, runner)
+
+    assert collector.failed is None
+    assert collector.summary is not None
+    assert collector.summary.dry_run is True
+    assert (collector.summary.client, collector.summary.project) == ("Nike", "Zomer")
+    assert collector.summary.total_files == 1
+    assert collector.progress, "verwacht minstens één voortgangsupdate"
+
+    # Het hele punt van een preview: niets wordt geschreven.
+    assert not (tmp_path / "storage").exists()
+
+
+def test_cancel_stops_a_preview_gracefully(qapp, tmp_path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    for i in range(50):
+        (input_dir / f"C{i:04d}.MP4").write_bytes(b"x" * 2_000_000)
+    config_path = _write_config(tmp_path)
+
+    collector = _Collector()
+    runner_box: list = []
+
+    def _on_progress(update) -> None:
+        collector.on_progress(update)
+        if len(collector.progress) == 1:
+            runner_box[0].cancel()
+
+    runner = ingest_process.start_preview(
+        input_dir,
+        "Nike",
+        "Zomer",
+        on_progress=_on_progress,
+        on_completed=collector.on_completed,
+        on_failed=collector.on_failed,
+        on_cancelled=collector.on_cancelled,
+        config_path=config_path,
+        camera_profiles_path=CAMERA_PROFILES_PATH,
+    )
+    runner_box.append(runner)
+
+    _run_and_wait(collector, runner)
+
+    assert collector.cancelled is True
+    assert collector.failed is None
+    assert collector.summary is None
+    assert not runner.is_running()
+    assert not (tmp_path / "storage").exists()
+
+
 # -- crash handling: the GUI (this process) must never crash or raise -----------
 
 
@@ -196,6 +272,38 @@ def test_worker_crash_emits_failed_and_never_raises(qapp, tmp_path):
     assert _wait_until(lambda: bool(received), qapp), "geen 'failed'-signaal ontvangen na de crash"
     assert "Traceback" not in received[0]
     assert "SIGSEGV" not in received[0]  # nooit een technisch detail tonen
+    assert "kopiëren" in received[0]  # echte-ingest bewoording, niet de preview-variant
+
+
+def test_preview_worker_crash_emits_failed_and_never_raises(qapp, tmp_path):
+    """Zelfde als hierboven, maar voor een preview (`dry_run=True`) — bewijst
+    dat de GUI ook tijdens een preview nooit meecrasht (het hele punt van
+    deze ronde se migratie), én dat de gebruiker de preview-specifieke
+    bewoording ziet, niet de "kopiëren"-variant. Eén enkele, geïsoleerde
+    SIGSEGV in een kind-QProcess — niet herhaald, geen zichtbare crash-popup
+    (zie test_worker_crash_emits_failed_and_never_raises hierboven, hetzelfde
+    patroon)."""
+    runner = ingest_process.IngestRunner(
+        tmp_path,
+        "Nike",
+        "Zomer",
+        config_path=tmp_path / "config.yaml",
+        camera_profiles_path=tmp_path / "profiles.yaml",
+        dry_run=True,
+        _command_override=[
+            sys.executable,
+            "-c",
+            "import os, signal; os.kill(os.getpid(), signal.SIGSEGV)",
+        ],
+    )
+    received: list[str] = []
+    runner.failed.connect(received.append)
+    runner.start()
+
+    assert _wait_until(lambda: bool(received), qapp), "geen 'failed'-signaal ontvangen na de crash"
+    assert "Traceback" not in received[0]
+    assert "SIGSEGV" not in received[0]  # nooit een technisch detail tonen
+    assert "bekijken" in received[0]  # preview-bewoording, niet "kopiëren"
 
 
 def test_worker_that_never_starts_emits_failed(qapp, tmp_path):

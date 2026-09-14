@@ -1,26 +1,33 @@
-"""Fase 2: dry-run preview, layered on the Fase 0/1 shell.
+"""Fase 2: preview, layered on the Fase 0/1 shell.
 
 Architecture (see the Fase 2 build plan and CLAUDE.md — no business logic in
 the GUI, no second ingest implementation):
 
-    GUI (this file) -> Controller (desktop/controller.py) -> IngestService
-    -> Storage -> Manifest -> Report
+    GUI (this file) -> IngestRunner (desktop/ingest_process.py) -> QProcess
+    -> ingest_worker.py -> IngestService -> Storage -> Manifest -> Report
 
 This window never calls IngestService directly and never re-derives anything
 it computes (classification, duplicates, ...) — it only renders the
-IngestSummary the Controller hands back, and reacts to clicks. Volume
+IngestSummary the worker process hands back, and reacts to clicks. Volume
 detection stays in desktop/volumes.py, unchanged from Fase 1.
+
+Both the preview and a real ingest (Fase 3) now run the same way: a
+one-shot `IngestRunner` wrapping a `QProcess` (see desktop/ingest_process.py
+for why — a real, reproduced PySide/Shiboken QThread-lifetime crash, not a
+style preference). There is no QThread anywhere in this window; no
+lifecycle registry, no thread-teardown guard is needed for either path.
 
 Six states, one window (content is swapped, no new dialogs/screens):
 - empty / chooser / selected(-with-form)   [Fase 1, now selected also has
                                              client/project fields + Start]
-- analyzing   [new: progress while the background dry-run runs]
-- preview     [new: the dry-run result, in plain language]
+- analyzing   [new: progress while the preview process runs]
+- preview     [new: the preview result, in plain language]
 - failed      [new: a friendly message, never a stack trace]
 
-`detect_volumes` and `start_dry_run` are both injected (defaulting to the
-real implementations) so tests can drive every state deterministically,
-without a real /Volumes, a real config, or a real background thread.
+`detect_volumes`, `start_preview` and `start_real_ingest` are all injected
+(defaulting to the real implementations) so tests can drive every state
+deterministically, without a real /Volumes, a real config, or a real
+background process.
 """
 
 from __future__ import annotations
@@ -29,7 +36,7 @@ import dataclasses
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import Qt, QThread, QTimer
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -44,7 +51,7 @@ from PySide6.QtWidgets import (
 
 from many_ingest.core.ingest_service import ProgressUpdate
 from many_ingest.core.report import IngestSummary
-from many_ingest.desktop import controller, ingest_process, thread_lifecycle
+from many_ingest.desktop import ingest_process
 from many_ingest.desktop.volumes import (
     VolumeInfo,
     format_size,
@@ -91,7 +98,7 @@ SAFE_TO_DELETE_YES_TEXT = "Veilig om de bron te verwijderen."
 SAFE_TO_DELETE_NO_TEXT = "Nog niet veilig om de bron te verwijderen."
 
 DetectVolumes = Callable[[], list[VolumeInfo]]
-StartDryRun = Callable[..., tuple[QThread | None, object | None]]
+StartPreview = Callable[..., object]
 StartRealIngest = Callable[..., object]
 
 
@@ -108,10 +115,10 @@ class MainWindow(QWidget):
     def __init__(
         self,
         detect_volumes: DetectVolumes | None = None,
-        start_dry_run: StartDryRun | None = None,
+        start_preview: StartPreview | None = None,
         start_real_ingest: StartRealIngest | None = None,
-        config_path: Path = controller.DEFAULT_CONFIG_PATH,
-        camera_profiles_path: Path = controller.DEFAULT_CAMERA_PROFILES_PATH,
+        config_path: Path = ingest_process.DEFAULT_CONFIG_PATH,
+        camera_profiles_path: Path = ingest_process.DEFAULT_CAMERA_PROFILES_PATH,
     ) -> None:
         super().__init__()
         self.setWindowTitle("Many Ingest")
@@ -128,7 +135,7 @@ class MainWindow(QWidget):
         self._detect_volumes: DetectVolumes = detect_volumes or (
             lambda: list_candidate_volumes(storage_root=None)
         )
-        self._start_dry_run: StartDryRun = start_dry_run or controller.start_dry_run
+        self._preview_starter: StartPreview = start_preview or ingest_process.start_preview
         self._start_real_ingest: StartRealIngest = (
             start_real_ingest or ingest_process.start_real_ingest
         )
@@ -137,8 +144,7 @@ class MainWindow(QWidget):
 
         self.selected_source: Path | None = None
         self._selection: _SelectionInfo | None = None
-        self._analysis_thread: QThread | None = None
-        self._analysis_worker: object | None = None
+        self._preview_runner: object | None = None
 
         # Vastgelegd zodra een analyse *start* (zie _start_preview), pas
         # bevestigd zodra hij ook echt succesvol afrondt (zie
@@ -171,95 +177,49 @@ class MainWindow(QWidget):
         self._run_detection()
 
     def closeEvent(self, event) -> None:
-        """Waits for every active QThread (not just this window's own
-        `_analysis_thread`) before letting the window close. See
-        `_wait_for_analysis_to_stop` for why this alone is NOT sufficient —
-        `app.aboutToQuit` (wired in app.py) is the other required half.
+        """Stops any active preview and any active real ingest before
+        letting the window close. Both are `IngestRunner`/`QProcess`
+        instances (see desktop/ingest_process.py) — the same kind of object,
+        stopped the same way — but kept as two independent calls since they
+        track two independent runners (`self._preview_runner`,
+        `self._ingest_runner`), not because they need different logic.
 
-        Also stops a real ingest (a QProcess, Fase 3 — see
-        `_wait_for_ingest_to_stop`) if one is still active. These are two
-        independent guarantees for two different kinds of background work
-        (QThread vs. QProcess), deliberately not merged into one — see
-        ingest_process.py's module docstring for why a real ingest is a
-        separate OS process rather than another QThread.
+        `closeEvent()` alone does not cover every quit path:
+        `QApplication.quit()` called directly — what macOS actually sends
+        for Cmd+Q / the app-menu Quit item — never delivers a `QCloseEvent`
+        to this widget at all, so `closeEvent()` never runs. That's why
+        `app.aboutToQuit` (wired in app.py) calls the same two methods —
+        whichever quit path fires first does the real work; both methods are
+        idempotent (a no-op once their runner is `None`/stopped), so calling
+        them twice for the same shutdown is harmless.
         """
-        self._wait_for_analysis_to_stop()
+        self._wait_for_preview_to_stop()
         self._wait_for_ingest_to_stop()
         super().closeEvent(event)
 
-    def _wait_for_analysis_to_stop(self) -> None:
-        """Blocks until every QThread the desktop app has created has
-        genuinely stopped — delegates to `thread_lifecycle.shutdown()` (see
-        that module's docstring), the single central choke point for this
-        guarantee, rather than checking only `self._analysis_thread` here.
-
-        Fixes a reproducible crash: dropping the last Python reference to a
-        *running* QThread makes Qt's own destructor treat that as fatal
-        ("QThread: Destroyed while thread is still running") and abort the
-        whole process — confirmed against real macOS crash reports. The
-        original version of this method only ever checked
-        `self._analysis_thread`, which is correct for the one thread
-        MainWindow itself tracks, but is a guarantee that has to be
-        re-derived by hand for every future background QThread this app
-        might grow — `thread_lifecycle.shutdown()` covers all of them by
-        construction, this window's analysis thread included, without
-        MainWindow needing to enumerate them.
-
-        `closeEvent()` alone does not cover this: `QApplication.quit()`
-        called directly — which is what macOS actually does for Cmd+Q / the
-        app-menu Quit item, confirmed by reproduction — never sends this
-        widget a `QCloseEvent` at all, so `closeEvent()` never runs, and
-        Python's interpreter shutdown then destroys any still-running thread
-        while it's still running. This method is therefore called from *two*
-        places: here (closeEvent) and from `QApplication.aboutToQuit` (see
-        app.py) — whichever fires first does the real work;
-        `thread_lifecycle.shutdown()` is itself idempotent, so calling it
-        twice for the same run is harmless.
-
-        `thread.quit()` cannot interrupt a synchronous, non-Qt-event-loop
-        call like `IngestService.run()` mid-flight — the thread's event loop
-        can't process the quit request until `run()` returns control to it.
-        The actual safety guarantee is `thread.wait()` blocking until the
-        thread has *actually* finished, however long that takes — not
-        `quit()`, which is a request, not an interruption.
-        """
-        thread_lifecycle.shutdown()
+    def _wait_for_preview_to_stop(self) -> None:
+        """Stops an active preview's `IngestRunner`/`QProcess` before the
+        app is allowed to quit — see `_wait_for_ingest_to_stop` just below,
+        which does the exact same thing for a real ingest. `stop_and_wait()`
+        is a synchronous terminate-then-kill; a preview never writes
+        anything regardless, so there's nothing to leave half-done."""
+        if self._preview_runner is not None:
+            self._preview_runner.stop_and_wait()
 
     def _wait_for_ingest_to_stop(self) -> None:
-        """The Fase 3 equivalent of `_wait_for_analysis_to_stop`, for a real
-        ingest's `IngestRunner`/`QProcess` (see desktop/ingest_process.py)
-        rather than the preview's `QThread`. A `QProcess` object has none of
-        `QThread`'s fatal-abort-on-destroy failure mode — dropping the last
-        Python reference to it while the OS process is still running does
-        not crash this process — but leaving it running unattended after the
-        window/app is gone would silently keep copying files in the
-        background with no UI and no way to see progress or a final report,
-        which is its own kind of unsafe surprise for the editor. This calls
-        `IngestRunner.stop_and_wait()` — a synchronous terminate-then-kill
-        (never removes source files, v0.1 is copy-only) — so the app never
-        actually quits while a real ingest could still be silently running.
-        """
+        """The real-ingest equivalent of `_wait_for_preview_to_stop`. A
+        `QProcess` object has no fatal-abort-on-destroy failure mode —
+        dropping the last Python reference to it while the OS process is
+        still running does not crash this process — but leaving it running
+        unattended after the window/app is gone would silently keep copying
+        files in the background with no UI and no way to see progress or a
+        final report, which is its own kind of unsafe surprise for the
+        editor. This calls `IngestRunner.stop_and_wait()` — a synchronous
+        terminate-then-kill (never removes source files, v0.1 is copy-only)
+        — so the app never actually quits while a real ingest could still be
+        silently running."""
         if self._ingest_runner is not None:
             self._ingest_runner.stop_and_wait()
-
-    def _on_analysis_thread_finished(self) -> None:
-        """The only place references are cleared — connected to
-        `thread.finished`, which Qt emits only once the thread has genuinely
-        stopped (not merely once `quit()` was requested). Never cleared
-        eagerly from `on_finished`/`on_failed`, which fire slightly earlier
-        in the same event-processing pass (see `_start_preview`).
-
-        Guarded with `self.sender()`: this signal is queued, so it can still
-        be delivered *after* a second analysis has already legitimately
-        started (its own `isRunning()` guard in `_start_preview` already
-        passed because the first thread had genuinely stopped). Without this
-        check, a late-arriving `finished` from the *first* thread would wipe
-        out the reference to the *second*, already-running one — found via a
-        real crash while testing several sequential analyses in a row.
-        """
-        if self.sender() is self._analysis_thread:
-            self._analysis_thread = None
-            self._analysis_worker = None
 
     # -- public introspection (used by the app and by tests) ----------------
 
@@ -340,47 +300,34 @@ class MainWindow(QWidget):
     def _start_preview(self, client: str, project: str) -> None:
         if self._selection is None:
             return
-        if self._analysis_thread is not None and self._analysis_thread.isRunning():
-            return  # een analyse loopt al; niet bereikbaar via de UI, extra zekerheid
-        # Een nieuwe analyse maakt elke eerder bevestigde preview-input
-        # ongeldig totdat déze analyse ook echt slaagt (zie
+        if self._preview_runner is not None and self._preview_runner.is_running():
+            return  # een preview loopt al; niet bereikbaar via de UI, extra zekerheid
+        # Een nieuwe preview maakt elke eerder bevestigde preview-input
+        # ongeldig totdat déze preview ook echt slaagt (zie
         # _on_analysis_finished) — Start Ingest mag nooit een combinatie
         # gebruiken die niet exact overeenkomt met de laatst getoonde preview.
         self._confirmed_preview_input = None
         self._pending_preview_input = (self._selection.source_path, client, project)
         self._render_analyzing()
-        self._analysis_thread, self._analysis_worker = self._start_dry_run(
+        self._preview_runner = self._preview_starter(
             self._selection.source_path,
             client,
             project,
             on_progress=self._on_analysis_progress,
-            on_finished=self._on_analysis_finished,
+            on_completed=self._on_analysis_finished,
             on_failed=self._on_analysis_failed,
             on_cancelled=self._on_analysis_cancelled,
             config_path=self._config_path,
             camera_profiles_path=self._camera_profiles_path,
         )
-        if self._analysis_thread is not None:
-            # Registreren bij het startpunt van MainWindow's eigen tracking
-            # — niet alleen in controller.start_dry_run() — zodat elke
-            # thread die MainWindow ooit als `_analysis_thread` bijhoudt
-            # gegarandeerd in de centrale registry zit, ook wanneer een
-            # geïnjecteerde (test-)implementatie van `start_dry_run` zijn
-            # eigen QThread aanmaakt zonder ooit door controller.py te gaan.
-            # Zie thread_lifecycle.py's moduledocstring voor de regressie
-            # die dit dichttimmert. `register()` is idempotent, dus dit is
-            # onschadelijk voor het gewone pad waar controller.start_dry_run()
-            # dezelfde thread al registreerde.
-            thread_lifecycle.register(self._analysis_thread)
-            self._analysis_thread.finished.connect(self._on_analysis_thread_finished)
 
     def _on_cancel_clicked(self) -> None:
         """A single, unconfirmed click — unlike a real ingest, cancelling a
-        dry-run has zero risk (nothing is ever written), so the "only
+        preview has zero risk (nothing is ever written), so the "only
         confirm what's truly consequential" rule (Design Language hoofdstuk
         12) means this deliberately does NOT ask "are you sure?"."""
-        if self._analysis_worker is not None:
-            self._analysis_worker.request_cancel()
+        if self._preview_runner is not None:
+            self._preview_runner.cancel()
 
     def _on_analysis_progress(self, update: ProgressUpdate) -> None:
         bar = self.progress_bar()
@@ -394,6 +341,7 @@ class MainWindow(QWidget):
             detail.setText(f"{update.processed} van {update.total} bestanden bekeken")
 
     def _on_analysis_finished(self, summary: IngestSummary) -> None:
+        self._preview_runner = None
         # Pas hier bevestigen (niet al bij het starten) — dit is het enige
         # moment waarop we weten dat déze exacte (bron, klant, project) ook
         # daadwerkelijk de preview is die de gebruiker nu ziet.
@@ -401,9 +349,11 @@ class MainWindow(QWidget):
         self._render_preview(summary)
 
     def _on_analysis_failed(self, message: str) -> None:
+        self._preview_runner = None
         self._render_analysis_failed(message)
 
     def _on_analysis_cancelled(self) -> None:
+        self._preview_runner = None
         self._return_to_selection()
 
     def _return_to_selection(self) -> None:
@@ -422,24 +372,14 @@ class MainWindow(QWidget):
             return  # niet bereikbaar via de UI (knop staat dan uit), extra zekerheid
         if self._ingest_runner is not None and self._ingest_runner.is_running():
             return  # een ingest loopt al; niet bereikbaar via de UI, extra zekerheid
-        if self._analysis_thread is not None:
-            # De preview die dit scherm liet zien is al klaar (on_finished is
-            # al geweest, anders zou deze knop niet bestaan) — maar de
-            # onderliggende QThread kan een paar milliseconden later pas
-            # aantoonbaar volledig gestopt zijn (zie
-            # _on_analysis_thread_finished, gekoppeld aan thread.finished,
-            # niet aan worker.finished). Een echte klik is hier in de
-            # praktijk altijd ruim op tijd, maar een zeer snel opeenvolgende
-            # klik + venster sluiten kan deze paar milliseconden wél raken —
-            # gereproduceerd als een QThread-teardownrace (SIGSEGV in de
-            # QThread zelf, "faultingThread: QThread") bij het meteen
-            # starten van een echte ingest (nieuwe QProcess-activiteit) vlak
-            # ná een preview. Nooit een tweede zware achtergrondtaak starten
-            # terwijl de vorige QThread nog niet aantoonbaar weg is (zie
-            # thread_lifecycle.py) — een korte retry i.p.v. de klik stil
-            # laten verdwijnen.
-            QTimer.singleShot(10, self._on_start_ingest_clicked)
-            return
+        # Geen teardown-race met de voorafgaande preview meer mogelijk: de
+        # preview is óók een IngestRunner/QProcess (zie desktop/ingest_process.py),
+        # niet meer een QThread — `_on_analysis_finished` heeft `_preview_runner`
+        # al op None gezet zodra `_confirmed_preview_input` gezet werd (zie
+        # hierboven), en er is geen tweede thread die nog los daarvan iets
+        # aan het afbreken kan zijn. Dit venstertje bestond alleen voor het
+        # oude QThread-pad (zie git-historie) en is met dat pad verwijderd,
+        # niet dichtgetimmerd met een extra guard.
 
         source, client, project = self._confirmed_preview_input
         self._render_ingesting()

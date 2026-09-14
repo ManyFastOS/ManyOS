@@ -50,7 +50,7 @@ def main() -> None:
     window = MainWindow(
         detect_volumes=lambda: [], config_path=config_path, camera_profiles_path=camera_profiles_path
     )
-    app.aboutToQuit.connect(window._wait_for_analysis_to_stop)
+    app.aboutToQuit.connect(window._wait_for_preview_to_stop)
     app.aboutToQuit.connect(window._wait_for_ingest_to_stop)
     window._set_manual_source(input_dir)
     window.client_input().setText("Nike")

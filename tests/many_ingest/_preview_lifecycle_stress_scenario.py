@@ -1,19 +1,22 @@
-"""Standalone scenario script combining all three cases from this round's
-investigation in one real app session:
+"""Standalone scenario script combining two cases in one real app session:
 
-1. Start a real dry-run analysis.
+1. Start a real preview (a real `IngestRunner`/`QProcess`, see
+   desktop/ingest_process.py).
 2. Immediately try to start a second one (direct call, bypassing whatever
    the UI would normally allow/disallow — the more adversarial of the two,
-   since a real click can't even reach `_start_preview` twice this fast:
-   the button is gone from the moment the first click renders the
-   "analyzing" state).
-3. Close the window while the (first, still-only) analysis is still
-   running.
+   since a real click can't even reach `_start_preview` twice this fast: the
+   button is gone from the moment the first click renders the "analyzing"
+   state) — must be a no-op, the first runner must stay in place.
+3. Close the window while the (first, still-only) preview is still running.
 
-Run as its own fresh process (see test_desktop_thread_lifecycle.py) so each
-of the 50 repetitions is an independent, faithful `many-ingest-desktop`
-session, and a failure on run N never depends on what runs 1..N-1 left
-behind.
+Until this round, this scenario exercised the preview's QThread lifecycle
+(see git history — `_thread_lifecycle_stress_scenario.py`). The preview now
+runs the same way a real ingest already did: a one-shot `IngestRunner`
+wrapping a `QProcess`, so there is no QThread left to race.
+
+Run as its own fresh process so each repetition is an independent, faithful
+`many-ingest-desktop` session, and a failure on run N never depends on what
+runs 1..N-1 left behind.
 """
 
 from __future__ import annotations
@@ -52,7 +55,8 @@ def main() -> None:
     window = MainWindow(
         detect_volumes=lambda: [], config_path=config_path, camera_profiles_path=camera_profiles_path
     )
-    app.aboutToQuit.connect(window._wait_for_analysis_to_stop)
+    app.aboutToQuit.connect(window._wait_for_preview_to_stop)
+    app.aboutToQuit.connect(window._wait_for_ingest_to_stop)
     window._set_manual_source(input_dir)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer")
@@ -60,26 +64,25 @@ def main() -> None:
     def run_scenario() -> None:
         # 1. start
         window._start_preview("Nike", "Zomer")
-        first_thread = window._analysis_thread
-        assert first_thread is not None and first_thread.isRunning(), (
-            "test-aanname: de eerste analyse moet nog bezig zijn"
+        first_runner = window._preview_runner
+        assert first_runner is not None and first_runner.is_running(), (
+            "test-aanname: de eerste preview moet nog bezig zijn"
         )
 
         # 2. direct een tweede proberen te starten
         window._start_preview("Nike", "Zomer")
-        assert window._analysis_thread is first_thread, (
-            "de eerste, nog actieve thread-referentie mag nooit overschreven worden "
+        assert window._preview_runner is first_runner, (
+            "de eerste, nog actieve runner-referentie mag nooit overschreven worden "
             "door een tweede startpoging"
         )
 
-        # 3. venster sluiten tijdens de (nog lopende) analyse
+        # 3. venster sluiten tijdens de (nog lopende) preview
         window.close()
 
         print("OK")
         # `window.close()` alleen is in headless/offscreen-modus niet altijd
         # genoeg om quitOnLastWindowClosed te laten vuren — expliciet
-        # app.quit() aanroepen zodat dit script zelf niet blijft hangen
-        # (dat was een fout in dit testscript, geen gedrag van de app).
+        # app.quit() aanroepen zodat dit script zelf niet blijft hangen.
         app.quit()
 
     QTimer.singleShot(0, run_scenario)

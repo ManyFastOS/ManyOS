@@ -1,5 +1,5 @@
-"""Tests for many_ingest.ingest_worker — the Fase 3 real-ingest worker
-entrypoint (see that module's docstring).
+"""Tests for many_ingest.ingest_worker — the worker entrypoint for BOTH a
+real ingest and a preview/dry-run (see that module's docstring).
 
 Deliberately Qt-free: this worker must never import PySide6, so these tests
 never do either — the QProcess side of the boundary (launching, cancelling,
@@ -46,9 +46,9 @@ def _write_config(tmp_path: Path) -> Path:
 
 
 def _worker_command(
-    source: Path, client: str, project: str, config_path: Path
+    source: Path, client: str, project: str, config_path: Path, *, dry_run: bool = False
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "-m",
         "many_ingest.ingest_worker",
@@ -65,6 +65,9 @@ def _worker_command(
         "--mode",
         "copy",
     ]
+    if dry_run:
+        command.append("--dry-run")
+    return command
 
 
 def _run_worker(
@@ -74,11 +77,12 @@ def _run_worker(
     client: str = "Nike",
     project: str = "Zomer",
     config_path: Path | None = None,
+    dry_run: bool = False,
     timeout: int = 30,
 ):
     config_path = config_path or _write_config(tmp_path)
     result = subprocess.run(
-        _worker_command(source, client, project, config_path),
+        _worker_command(source, client, project, config_path, dry_run=dry_run),
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -283,3 +287,104 @@ def test_cancel_via_sigterm_stops_gracefully_and_reports_ingest_cancelled(tmp_pa
     assert "Traceback" not in stderr
     assert lines[-1]["event"] == "ingest_cancelled"
     assert process.returncode == 2
+
+
+# -- preview / --dry-run: same worker, same protocol, nothing written -------------
+
+
+def test_dry_run_worker_completes_without_copying_anything(tmp_path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+    result, lines = _run_worker(tmp_path, input_dir, dry_run=True)
+
+    assert result.returncode == 0
+    assert "Traceback" not in result.stderr
+    completed = next(line for line in lines if line["event"] == "ingest_completed")
+    assert completed["dry_run"] is True
+    assert completed["total_files"] == 1
+    # Het hele punt van een preview: niets wordt geschreven.
+    assert not (tmp_path / "storage").exists()
+
+
+def test_dry_run_worker_reports_the_corrected_duplicate_count(tmp_path):
+    """Regression test for the fix moved into `_corrected_summary()` (see
+    ingest_worker.py's docstring, moved unchanged from the old QThread-era
+    desktop/controller.py) — `summarize()` itself always reports 0
+    duplicates for a dry run, because `_process_asset` sets `outcome =
+    PREVIEW` before ever checking `is_duplicate`. This proves the worker's
+    `ingest_completed` event carries the corrected count, not the raw
+    (always-0) one."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+    config_path = _write_config(tmp_path)
+
+    _run_worker(tmp_path, input_dir, config_path=config_path)  # eerste, echte run
+    _, lines = _run_worker(tmp_path, input_dir, config_path=config_path, dry_run=True)
+
+    completed = next(line for line in lines if line["event"] == "ingest_completed")
+    assert completed["duplicates"] == 1
+
+    asset_events = [line for line in lines if line["event"] == "asset_processed"]
+    assert asset_events[0]["is_duplicate"] is True
+
+
+def test_dry_run_unreadable_source_aborts_with_a_friendly_message_not_a_stacktrace(tmp_path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    unreadable = input_dir / "DJI_0002.MP4"
+    unreadable.write_bytes(b"unreadable")
+    unreadable.chmod(0o000)
+    try:
+        result, lines = _run_worker(tmp_path, input_dir, dry_run=True)
+    finally:
+        unreadable.chmod(0o644)
+
+    assert "Traceback" not in result.stdout
+    assert "Traceback" not in result.stderr
+    failed = next(line for line in lines if line["event"] == "ingest_failed")
+    assert failed["message"]
+    assert result.returncode == 1
+    assert not (tmp_path / "storage").exists()
+
+
+def test_dry_run_cancel_via_sigterm_stops_gracefully_and_reports_ingest_cancelled(tmp_path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    for i in range(50):
+        (input_dir / f"C{i:04d}.MP4").write_bytes(b"x" * 2_000_000)
+    config_path = _write_config(tmp_path)
+
+    process = subprocess.Popen(
+        _worker_command(input_dir, "Nike", "Zomer", config_path, dry_run=True),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    lines: list[dict] = []
+    try:
+        lines.append(json.loads(process.stdout.readline()))
+        assert lines[0]["event"] == "ingest_started"
+
+        lines.append(json.loads(process.stdout.readline()))
+        assert lines[1]["event"] == "progress", (
+            "test-aanname: de run moet nog aantoonbaar bezig zijn om te kunnen annuleren"
+        )
+
+        process.send_signal(signal.SIGTERM)
+        remaining_stdout, stderr = process.communicate(timeout=30)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+
+    for line in remaining_stdout.splitlines():
+        if line.strip():
+            lines.append(json.loads(line))
+
+    assert "Traceback" not in stderr
+    assert lines[-1]["event"] == "ingest_cancelled"
+    assert process.returncode == 2
+    assert not (tmp_path / "storage").exists()

@@ -1,12 +1,13 @@
 """Desktop shell tests — Fase 0 (bare window), Fase 1 (volume detection UI)
-and Fase 2 (dry-run preview UI).
+and Fase 2 (preview UI).
 
 Runs headless (QT_QPA_PLATFORM=offscreen). `detect_volumes` and
-`start_dry_run` are always injected so these tests never touch the real
-/Volumes, a real config, or a real background thread — see
-desktop/volumes.py and desktop/controller.py (and
-tests/many_ingest/test_desktop_controller.py) for that OS/engine-integration
-layer, exercised for real elsewhere. Here we only verify MainWindow renders
+`start_preview` are always injected so these tests never touch the real
+/Volumes, a real config, or a real background process — see
+desktop/volumes.py and desktop/ingest_process.py (and
+tests/many_ingest/test_desktop_ingest_process.py /
+test_desktop_preview_process.py) for that OS/engine-integration layer,
+exercised for real elsewhere. Here we only verify MainWindow renders
 whatever it's handed, correctly.
 
 Skips cleanly (not a hard failure) when PySide6 isn't installed, since it's an
@@ -59,26 +60,33 @@ def _volume(name: str, path, *, capacity=500_000_000_000, media_count=10, media_
     )
 
 
-class _FakeWorker:
-    """Stands in for controller.DryRunWorker — only what MainWindow actually
-    touches on it: `request_cancel()`."""
+class _FakeRunner:
+    """Stands in for `ingest_process.IngestRunner` — only what MainWindow
+    actually touches on it: `is_running()`/`cancel()`."""
 
     def __init__(self) -> None:
-        self.cancel_requested = False
+        self.cancel_called = False
+        self._running = True
 
-    def request_cancel(self) -> None:
-        self.cancel_requested = True
+    def is_running(self) -> bool:
+        return self._running
+
+    def cancel(self) -> None:
+        self.cancel_called = True
+
+    def stop_and_wait(self, timeout_ms: int | None = None) -> None:
+        self._running = False
 
 
-class _CapturingStartDryRun:
-    """A fake Controller entry point — records each call's arguments and
-    callbacks instead of touching IngestService or a real thread, so tests
-    can drive on_progress/on_finished/on_failed/on_cancelled at will and
-    inspect exactly what MainWindow asked for."""
+class _CapturingStartPreview:
+    """A fake `ingest_process.start_preview` — records each call's arguments
+    and callbacks instead of touching IngestService or a real process, so
+    tests can drive on_progress/on_completed/on_failed/on_cancelled at will
+    and inspect exactly what MainWindow asked for."""
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
-        self.workers: list[_FakeWorker] = []
+        self.runners: list[_FakeRunner] = []
 
     def __call__(
         self,
@@ -87,9 +95,11 @@ class _CapturingStartDryRun:
         project,
         *,
         on_progress,
-        on_finished,
+        on_completed,
         on_failed,
         on_cancelled=None,
+        on_started=None,
+        on_asset_processed=None,
         config_path,
         camera_profiles_path,
     ):
@@ -99,14 +109,14 @@ class _CapturingStartDryRun:
                 "client": client,
                 "project": project,
                 "on_progress": on_progress,
-                "on_finished": on_finished,
+                "on_completed": on_completed,
                 "on_failed": on_failed,
                 "on_cancelled": on_cancelled,
             }
         )
-        worker = _FakeWorker()
-        self.workers.append(worker)
-        return None, worker
+        runner = _FakeRunner()
+        self.runners.append(runner)
+        return runner
 
 
 def _make_summary(**overrides) -> IngestSummary:
@@ -229,9 +239,9 @@ def test_preview_button_disabled_until_both_fields_are_filled(qapp, tmp_path):
     assert window.choose_button().isEnabled() is False
 
 
-def test_clicking_bekijk_inhoud_calls_the_controller_with_source_client_project(qapp, tmp_path):
-    starter = _CapturingStartDryRun()
-    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+def test_clicking_bekijk_inhoud_starts_a_preview_with_source_client_project(qapp, tmp_path):
+    starter = _CapturingStartPreview()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_preview=starter)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer Campagne")
 
@@ -244,8 +254,8 @@ def test_clicking_bekijk_inhoud_calls_the_controller_with_source_client_project(
 
 
 def test_progress_updates_drive_the_progress_bar_and_status(qapp, tmp_path):
-    starter = _CapturingStartDryRun()
-    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+    starter = _CapturingStartPreview()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_preview=starter)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer Campagne")
     window.choose_button().click()
@@ -262,13 +272,13 @@ def test_progress_updates_drive_the_progress_bar_and_status(qapp, tmp_path):
 
 
 def test_finished_analysis_shows_the_preview_in_plain_language(qapp, tmp_path):
-    starter = _CapturingStartDryRun()
-    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+    starter = _CapturingStartPreview()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_preview=starter)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer Campagne")
     window.choose_button().click()
 
-    starter.calls[0]["on_finished"](
+    starter.calls[0]["on_completed"](
         _make_summary(
             total_files=327,
             camera_profile_counts={"Sony FX6": 188, "Sony FX3": 121, "DJI": 14, "Audio": 18, "Onbekend": 6},
@@ -308,13 +318,13 @@ def test_finished_analysis_shows_the_preview_in_plain_language(qapp, tmp_path):
 
 
 def test_preview_with_an_empty_source_folder(qapp, tmp_path):
-    starter = _CapturingStartDryRun()
-    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+    starter = _CapturingStartPreview()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_preview=starter)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer Campagne")
     window.choose_button().click()
 
-    starter.calls[0]["on_finished"](
+    starter.calls[0]["on_completed"](
         _make_summary(
             total_files=0,
             video_count=0,
@@ -335,13 +345,13 @@ def test_preview_with_an_empty_source_folder(qapp, tmp_path):
 
 
 def test_preview_with_only_audio_files(qapp, tmp_path):
-    starter = _CapturingStartDryRun()
-    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+    starter = _CapturingStartPreview()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_preview=starter)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer Campagne")
     window.choose_button().click()
 
-    starter.calls[0]["on_finished"](
+    starter.calls[0]["on_completed"](
         _make_summary(
             total_files=18,
             video_count=0,
@@ -361,13 +371,13 @@ def test_preview_with_only_audio_files(qapp, tmp_path):
 
 
 def test_preview_with_only_unrecognized_files(qapp, tmp_path):
-    starter = _CapturingStartDryRun()
-    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+    starter = _CapturingStartPreview()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_preview=starter)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer Campagne")
     window.choose_button().click()
 
-    starter.calls[0]["on_finished"](
+    starter.calls[0]["on_completed"](
         _make_summary(
             total_files=6,
             video_count=6,
@@ -386,9 +396,9 @@ def test_preview_with_only_unrecognized_files(qapp, tmp_path):
     assert "6 bestanden konden niet automatisch worden herkend. Ze worden wel meegenomen." in lines
 
 
-def test_cancelling_during_analysis_requests_it_on_the_worker_and_returns_to_the_form(qapp, tmp_path):
-    starter = _CapturingStartDryRun()
-    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+def test_cancelling_during_analysis_requests_it_on_the_runner_and_returns_to_the_form(qapp, tmp_path):
+    starter = _CapturingStartPreview()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_preview=starter)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer Campagne")
     window.choose_button().click()
@@ -398,26 +408,40 @@ def test_cancelling_during_analysis_requests_it_on_the_worker_and_returns_to_the
 
     window.secondary_action_button().click()
 
-    worker = starter.workers[0]
-    assert worker.cancel_requested is True
+    runner = starter.runners[0]
+    assert runner.cancel_called is True
 
-    # Bevestigt wat de echte Controller doet na een geslaagde annulering
-    # (zie controller.DryRunWorker._progress_callback): de on_cancelled-
-    # callback vuurt, en de GUI gaat terug naar het formulier — geen
-    # foutscherm, een annulering is geen fout.
+    # Bevestigt wat de echte worker doet na een geslaagde annulering (zie
+    # ingest_worker.py's `ingest_cancelled`-event): de on_cancelled-callback
+    # vuurt, en de GUI gaat terug naar het formulier — geen foutscherm, een
+    # annulering is geen fout.
     starter.calls[0]["on_cancelled"]()
 
     assert window.current_message() == "SD_CARD_1"
     assert window.client_input() is not None
 
 
+def test_a_second_preview_click_while_one_is_running_is_ignored(qapp, tmp_path):
+    starter = _CapturingStartPreview()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_preview=starter)
+    window.client_input().setText("Nike")
+    window.project_input().setText("Zomer Campagne")
+
+    window._start_preview("Nike", "Zomer Campagne")  # echte start (niet bereikbaar via de UI 2x)
+    assert len(starter.calls) == 1
+
+    window._start_preview("Nike", "Zomer Campagne")
+
+    assert len(starter.calls) == 1
+
+
 def test_back_from_preview_returns_to_the_selection_form(qapp, tmp_path):
-    starter = _CapturingStartDryRun()
-    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+    starter = _CapturingStartPreview()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_preview=starter)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer Campagne")
     window.choose_button().click()
-    starter.calls[0]["on_finished"](_make_summary())
+    starter.calls[0]["on_completed"](_make_summary())
 
     assert window.secondary_action_button().text() == BACK_TEXT
     window.secondary_action_button().click()
@@ -427,8 +451,8 @@ def test_back_from_preview_returns_to_the_selection_form(qapp, tmp_path):
 
 
 def test_failed_analysis_shows_a_friendly_message_never_a_stacktrace(qapp, tmp_path):
-    starter = _CapturingStartDryRun()
-    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_dry_run=starter)
+    starter = _CapturingStartPreview()
+    window = MainWindow(detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)], start_preview=starter)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer Campagne")
     window.choose_button().click()
