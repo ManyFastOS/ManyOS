@@ -64,7 +64,7 @@ QPushButton#linkButton:hover {
     color: #3396ff;
 }
 
-QPushButton#volumeCard {
+QPushButton#volumeCard, QPushButton#destinationCard {
     background-color: #2c2c2e;
     color: #e5e5e7;
     border: 1px solid #3a3a3c;
@@ -74,7 +74,7 @@ QPushButton#volumeCard {
     font-size: 14px;
 }
 
-QPushButton#volumeCard:hover {
+QPushButton#volumeCard:hover, QPushButton#destinationCard:hover {
     background-color: #3a3a3c;
 }
 
@@ -105,6 +105,27 @@ QLineEdit {
 
 QLineEdit:focus {
     border: 1px solid #0a84ff;
+}
+
+QLabel#percentageLabel {
+    font-size: 40px;
+    font-weight: 600;
+    color: #e5e5e7;
+}
+
+QLabel#speedLabel {
+    font-size: 13px;
+    color: #9a9aa0;
+}
+
+QLabel#warningLabel {
+    font-size: 13px;
+    color: #ff9f0a;
+}
+
+QLabel#cancelConfirmationLabel {
+    font-size: 14px;
+    color: #e5e5e7;
 }
 
 QProgressBar {

@@ -176,6 +176,75 @@ def test_progress_callback_reports_every_file_with_running_byte_total(tmp_path, 
     assert updates[1].bytes_processed == 15  # cumulatief: 5 + 10
 
 
+def test_asset_callback_reports_every_file_with_its_outcome(tmp_path, camera_profiles):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"12345")
+    (input_dir / "DJI_0002.MP4").write_bytes(b"1234567890")
+
+    config = _make_config(tmp_path)
+    service = _make_service(config, camera_profiles)
+
+    assets_seen: list = []
+    report = service.run(
+        input_dir,
+        client="Nike",
+        project="Zomer",
+        dry_run=False,
+        asset_callback=assets_seen.append,
+    )
+
+    assert [a.source_path for a in assets_seen] == [a.source_path for a in report.assets]
+    assert [a.outcome for a in assets_seen] == [AssetOutcome.COPIED, AssetOutcome.COPIED]
+
+
+def test_asset_callback_fires_as_each_file_completes_not_after_the_whole_run(tmp_path, camera_profiles):
+    """Proves asset_callback is invoked synchronously per file, interleaved
+    with progress_callback — not collected and fired once at the end."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"a")
+    (input_dir / "DJI_0002.MP4").write_bytes(b"b")
+
+    config = _make_config(tmp_path)
+    service = _make_service(config, camera_profiles)
+
+    call_order: list[str] = []
+    service.run(
+        input_dir,
+        client="Nike",
+        project="Zomer",
+        dry_run=False,
+        progress_callback=lambda update: call_order.append(f"progress:{update.processed}"),
+        asset_callback=lambda asset: call_order.append(f"asset:{asset.source_path.name}"),
+    )
+
+    # Voor elk bestand komt asset_callback vóór progress_callback van datzelfde
+    # bestand — nooit alle asset-callbacks pas na alle progress-callbacks.
+    assert call_order == [
+        "asset:DJI_0001.MP4",
+        "progress:1",
+        "asset:DJI_0002.MP4",
+        "progress:2",
+    ]
+
+
+def test_run_without_asset_callback_behaves_exactly_as_before(tmp_path, camera_profiles):
+    """Backward-compatibility: existing callers (CLI, tests) that never pass
+    asset_callback must see no behavior change at all."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+    config = _make_config(tmp_path)
+    service = _make_service(config, camera_profiles)
+
+    report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+    assert report.assets[0].outcome == AssetOutcome.COPIED
+    assert report.assets[0].destination_path.exists()
+
+
 class TestCollisionProtection:
     def test_identical_content_at_destination_is_treated_as_duplicate_and_never_copied(
         self, tmp_path, camera_profiles

@@ -12,12 +12,14 @@ quick, extension-based estimate for display, not the real ingest scan.
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
 import shutil
 from pathlib import Path
 from typing import Callable
 
 from many_ingest.classification.file_types import AUDIO_EXTENSIONS, VIDEO_EXTENSIONS
+from many_ingest.device_identity import same_physical_device
 
 VOLUMES_ROOT = Path("/Volumes")
 BOOT_PATH = Path("/")
@@ -161,18 +163,83 @@ def format_size(num_bytes: int) -> str:
 
 
 def default_is_boot_volume(path: Path, boot_path: Path = BOOT_PATH) -> bool:
-    device = _device_id(path)
-    return device is not None and device == _device_id(boot_path)
+    return same_physical_device(path, boot_path)
 
 
 def default_is_destination_volume(path: Path, storage_root: Path | None) -> bool:
     if storage_root is None:
         return False
-    ancestor = _existing_ancestor(storage_root)
-    if ancestor is None:
+    return same_physical_device(path, storage_root)
+
+
+def default_is_source_volume(path: Path, source_path: Path | None) -> bool:
+    """Mirror of `default_is_destination_volume`, for the destination-picker
+    side (Fase 3.5): excludes whichever volume the chosen SOURCE lives on
+    from the destination candidates — the hard "source and destination may
+    never be the same physical disk" safety rule, enforced by never
+    offering the choice in the first place (see device_identity.py, and
+    ingest_worker.py's same_physical_device() check for the safety-net that
+    covers non-GUI callers)."""
+    if source_path is None:
         return False
-    device = _device_id(path)
-    return device is not None and device == _device_id(ancestor)
+    return same_physical_device(path, source_path)
+
+
+@dataclasses.dataclass(frozen=True)
+class DestinationInfo:
+    """What the UI needs about one candidate destination volume — name and
+    free space, never a raw filesystem path shown to the editor (Design
+    Language, hoofdstuk 15)."""
+
+    name: str
+    path: Path
+    free_bytes: int
+
+
+def list_destination_volumes(
+    source_path: Path | None,
+    volumes_root: Path = VOLUMES_ROOT,
+    *,
+    is_boot_volume: Callable[[Path], bool] | None = None,
+    is_source_volume: Callable[[Path, Path | None], bool] | None = None,
+) -> list[DestinationInfo]:
+    """Every mounted, writable external volume that could plausibly be
+    chosen as this ingest's destination.
+
+    Always excludes: the boot/system volume, the volume the chosen SOURCE
+    lives on (the hard safety rule — never the same physical disk as the
+    source, see `default_is_source_volume`), volumes that aren't currently
+    writable, and volumes matching a known system/recovery/backup name
+    pattern. An empty result is a legitimate outcome the GUI must show
+    as-is — this function never falls back to suggesting a disallowed disk.
+    """
+    is_boot_volume = is_boot_volume or default_is_boot_volume
+    is_source_volume = is_source_volume or default_is_source_volume
+
+    if not volumes_root.is_dir():
+        return []
+
+    candidates: list[DestinationInfo] = []
+    for entry in sorted(volumes_root.iterdir()):
+        if entry.name.startswith("."):
+            continue
+        if _matches_excluded_name(entry.name):
+            continue
+        if is_boot_volume(entry):
+            continue
+        if is_source_volume(entry, source_path):
+            continue
+        if not os.access(entry, os.W_OK):
+            continue
+
+        try:
+            free_bytes = shutil.disk_usage(entry).free
+        except OSError:
+            continue
+
+        candidates.append(DestinationInfo(name=entry.name, path=entry, free_bytes=free_bytes))
+
+    return candidates
 
 
 def _matches_excluded_name(name: str) -> bool:
@@ -182,19 +249,3 @@ def _matches_excluded_name(name: str) -> bool:
 def _is_ignored(file_path: Path, root: Path) -> bool:
     parts = file_path.relative_to(root).parts
     return any(part in _IGNORED_NAMES or part.startswith(".") for part in parts)
-
-
-def _device_id(path: Path) -> int | None:
-    try:
-        return path.stat().st_dev
-    except OSError:
-        return None
-
-
-def _existing_ancestor(path: Path) -> Path | None:
-    current = path
-    while not current.exists():
-        if current.parent == current:
-            return None
-        current = current.parent
-    return current

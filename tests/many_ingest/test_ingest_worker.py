@@ -129,6 +129,33 @@ def test_progress_events_are_valid_json_with_expected_fields(tmp_path):
         assert event["total"] == 3
 
 
+def test_asset_processed_is_streamed_per_file_not_batched_after_completion(tmp_path):
+    """Regression test for the Fase 3 realtime-streaming change: each
+    asset_processed event must appear on the stream BEFORE ingest_completed
+    (interleaved with progress, per file), not all at once afterwards — and
+    exactly once per file, matching what desktop/main_window.py's
+    safety-stop counter needs to be able to react while the run is still
+    going."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    for i in range(3):
+        (input_dir / f"C{i:04d}.MP4").write_bytes(b"x" * 1000)
+
+    _, lines = _run_worker(tmp_path, input_dir)
+
+    asset_events = [line for line in lines if line["event"] == "asset_processed"]
+    assert len(asset_events) == 3, "elk bestand moet precies één keer streamen"
+    assert {e["source_path"] for e in asset_events} == {
+        str(input_dir / f"C{i:04d}.MP4") for i in range(3)
+    }
+
+    completed_index = next(i for i, line in enumerate(lines) if line["event"] == "ingest_completed")
+    asset_indices = [i for i, line in enumerate(lines) if line["event"] == "asset_processed"]
+    assert all(i < completed_index for i in asset_indices), (
+        "asset_processed moet vóór ingest_completed binnenkomen, niet erna in bulk"
+    )
+
+
 def test_successful_ingest_copies_real_files_and_reports_a_matching_summary(tmp_path):
     input_dir = tmp_path / "input"
     input_dir.mkdir()
@@ -268,10 +295,11 @@ def test_cancel_via_sigterm_stops_gracefully_and_reports_ingest_cancelled(tmp_pa
         lines.append(json.loads(process.stdout.readline()))
         assert lines[0]["event"] == "ingest_started"
 
-        lines.append(json.loads(process.stdout.readline()))
-        assert lines[1]["event"] == "progress", (
-            "test-aanname: de run moet nog aantoonbaar bezig zijn om te kunnen annuleren"
-        )
+        # asset_processed en progress worden nu per bestand geïnterleaved
+        # (zie ingest_worker.py's asset_callback) — lees door tot de eerste
+        # progress-regel, ongeacht of asset_processed er nog vóór staat.
+        while lines[-1]["event"] != "progress":
+            lines.append(json.loads(process.stdout.readline()))
 
         process.send_signal(signal.SIGTERM)
         remaining_stdout, stderr = process.communicate(timeout=30)
@@ -368,10 +396,8 @@ def test_dry_run_cancel_via_sigterm_stops_gracefully_and_reports_ingest_cancelle
         lines.append(json.loads(process.stdout.readline()))
         assert lines[0]["event"] == "ingest_started"
 
-        lines.append(json.loads(process.stdout.readline()))
-        assert lines[1]["event"] == "progress", (
-            "test-aanname: de run moet nog aantoonbaar bezig zijn om te kunnen annuleren"
-        )
+        while lines[-1]["event"] != "progress":
+            lines.append(json.loads(process.stdout.readline()))
 
         process.send_signal(signal.SIGTERM)
         remaining_stdout, stderr = process.communicate(timeout=30)

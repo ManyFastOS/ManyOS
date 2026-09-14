@@ -90,6 +90,7 @@ class IngestRunner(QObject):
         client: str,
         project: str,
         *,
+        destination_root: Path,
         config_path: Path,
         camera_profiles_path: Path,
         dry_run: bool = False,
@@ -122,6 +123,8 @@ class IngestRunner(QObject):
                 client,
                 "--project",
                 project,
+                "--destination",
+                str(destination_root),
                 "--config",
                 str(config_path),
                 "--camera-profiles",
@@ -288,6 +291,7 @@ def start_real_ingest(
     client: str,
     project: str,
     *,
+    destination_root: Path,
     on_started=None,
     on_progress,
     on_asset_processed=None,
@@ -298,11 +302,14 @@ def start_real_ingest(
     camera_profiles_path: Path = DEFAULT_CAMERA_PROFILES_PATH,
 ) -> IngestRunner:
     """Starts a real ingest in its own OS process and wires the given
-    callbacks to its signals."""
+    callbacks to its signals. `destination_root` is the physical disk chosen
+    for this ingest (Fase 3.5) — required, no default: there is no longer a
+    single fixed destination to fall back to."""
     runner = IngestRunner(
         source,
         client,
         project,
+        destination_root=destination_root,
         config_path=config_path,
         camera_profiles_path=camera_profiles_path,
         dry_run=False,
@@ -323,6 +330,7 @@ def start_preview(
     client: str,
     project: str,
     *,
+    destination_root: Path,
     on_started=None,
     on_progress,
     on_asset_processed=None,
@@ -334,13 +342,15 @@ def start_preview(
 ) -> IngestRunner:
     """Starts a preview/dry-run in its own OS process and wires the given
     callbacks to its signals — same shape, same runner class, same protocol
-    as `start_real_ingest`, only `dry_run=True` differs. Replaces the old
-    QThread-based `controller.start_dry_run()` (removed this round — see
-    this module's docstring for why)."""
+    as `start_real_ingest`, only `dry_run=True` differs. `destination_root`
+    must be the exact same value the confirmed preview used when Start
+    Ingest follows (see main_window.py's `_PreviewInput`) — preview and a
+    real ingest must resolve to exactly the same destination."""
     runner = IngestRunner(
         source,
         client,
         project,
+        destination_root=destination_root,
         config_path=config_path,
         camera_profiles_path=camera_profiles_path,
         dry_run=True,

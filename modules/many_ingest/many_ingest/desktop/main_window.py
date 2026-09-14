@@ -33,6 +33,7 @@ background process.
 from __future__ import annotations
 
 import dataclasses
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -53,9 +54,11 @@ from many_ingest.core.ingest_service import ProgressUpdate
 from many_ingest.core.report import IngestSummary
 from many_ingest.desktop import ingest_process
 from many_ingest.desktop.volumes import (
+    DestinationInfo,
     VolumeInfo,
     format_size,
     list_candidate_volumes,
+    list_destination_volumes,
     scan_media_summary,
 )
 
@@ -67,6 +70,13 @@ RETRY_TEXT = "Opnieuw zoeken"
 CHOOSER_TITLE_TEXT = "Welke schijf wil je gebruiken?"
 CLIENT_LABEL_TEXT = "Klant"
 PROJECT_LABEL_TEXT = "Project"
+DESTINATION_LABEL_TEXT = "Bestemmingsschijf"
+NO_DESTINATIONS_TEXT = (
+    "Geen schrijfbare externe schijven gevonden. Sluit de bestemmingsschijf aan "
+    "en klik op Opnieuw zoeken."
+)
+RETRY_DESTINATIONS_TEXT = "Opnieuw zoeken"
+SELECTED_DESTINATION_PREFIX = "Gekozen: "
 PREVIEW_BUTTON_TEXT = "Bekijk inhoud"
 ANALYZING_TEXT = "Bezig met bekijken..."
 CANCEL_BUTTON_TEXT = "Annuleren"
@@ -79,6 +89,35 @@ INGESTING_TEXT = "Bezig met kopiëren..."
 INGEST_DONE_TITLE_TEXT = "Klaar"
 INGEST_PARTIAL_TITLE_TEXT = "Bijna klaar"
 NEW_INGEST_TEXT = "Nieuwe ingest"
+
+DO_NOT_DISCONNECT_TEXT = "Verwijder of koppel geen opslagapparaten los tijdens het kopiëren."
+ETA_PLACEHOLDER_TEXT = "Resterende tijd berekenen…"
+
+CANCEL_INGEST_CONFIRM_MESSAGE = (
+    "Ingest annuleren?\n"
+    "Bestanden die al volledig zijn gekopieerd blijven staan. De huidige "
+    "ingest wordt gestopt."
+)
+CONTINUE_INGEST_TEXT = "Doorgaan met ingest"
+CONFIRM_CANCEL_INGEST_TEXT = "Ingest annuleren"
+
+SAFETY_STOP_MESSAGE = (
+    "Ingest automatisch gestopt nadat meerdere bestanden achter elkaar niet "
+    "konden worden verwerkt. Controleer de verbinding met de bron- en "
+    "bestemmingsschijf en probeer het opnieuw."
+)
+
+# Aantal opeenvolgende failed_verification-uitkomsten waarna de app proactief
+# stopt (zie de safety-stop-analyse: hoog genoeg om niet op een paar losse
+# kapotte bestanden te reageren, laag genoeg om te stoppen ruim vóórdat een
+# kaart van honderden bestanden alsnog helemaal doorgeploegd wordt).
+_SAFETY_STOP_THRESHOLD = 5
+
+# Ondergrens vóór een ETA getoond wordt i.p.v. ETA_PLACEHOLDER_TEXT — te
+# weinig samples/tijd geeft een ruisige, onbetrouwbare extrapolatie (bijv.
+# één ongewoon groot eerste bestand).
+_ETA_MIN_SAMPLES = 2
+_ETA_MIN_ELAPSED_SECONDS = 1.0
 
 # Vaste naam van de organisatie in de bestemmings-breadcrumb (Bestemming →
 # ManyFast → klant → project) — geen configwaarde, geen storage_root: dit is
@@ -98,6 +137,7 @@ SAFE_TO_DELETE_YES_TEXT = "Veilig om de bron te verwijderen."
 SAFE_TO_DELETE_NO_TEXT = "Nog niet veilig om de bron te verwijderen."
 
 DetectVolumes = Callable[[], list[VolumeInfo]]
+DetectDestinations = Callable[[Path], list[DestinationInfo]]
 StartPreview = Callable[..., object]
 StartRealIngest = Callable[..., object]
 
@@ -111,10 +151,26 @@ class _SelectionInfo:
     via_auto_detection: bool
 
 
+@dataclasses.dataclass(frozen=True)
+class _PreviewInput:
+    """Everything a preview needs, and everything Start Ingest reuses
+    unchanged afterwards (Fase 3.5 adds `destination` alongside the existing
+    source/client/project — preview and a real ingest must resolve to
+    exactly the same destination, the same guarantee already proven for
+    source/client/project: this is the one place that tuple/value is
+    captured, never reconstructed)."""
+
+    source: Path
+    client: str
+    project: str
+    destination: DestinationInfo
+
+
 class MainWindow(QWidget):
     def __init__(
         self,
         detect_volumes: DetectVolumes | None = None,
+        detect_destinations: DetectDestinations | None = None,
         start_preview: StartPreview | None = None,
         start_real_ingest: StartRealIngest | None = None,
         config_path: Path = ingest_process.DEFAULT_CONFIG_PATH,
@@ -135,6 +191,9 @@ class MainWindow(QWidget):
         self._detect_volumes: DetectVolumes = detect_volumes or (
             lambda: list_candidate_volumes(storage_root=None)
         )
+        self._detect_destinations: DetectDestinations = (
+            detect_destinations or list_destination_volumes
+        )
         self._preview_starter: StartPreview = start_preview or ingest_process.start_preview
         self._start_real_ingest: StartRealIngest = (
             start_real_ingest or ingest_process.start_real_ingest
@@ -144,18 +203,31 @@ class MainWindow(QWidget):
 
         self.selected_source: Path | None = None
         self._selection: _SelectionInfo | None = None
+        self._destination_volumes: list[DestinationInfo] = []
+        self._selected_destination: DestinationInfo | None = None
         self._preview_runner: object | None = None
 
         # Vastgelegd zodra een analyse *start* (zie _start_preview), pas
         # bevestigd zodra hij ook echt succesvol afrondt (zie
         # _on_analysis_finished) — "Start Ingest" mag alleen de exacte
-        # (bron, klant, project) gebruiken van de laatst getoonde, geslaagde
-        # preview, nooit een combinatie die ondertussen gewijzigd is zonder
-        # nieuwe preview. Ongeldig gemaakt zodra de gebruiker teruggaat naar
-        # het formulier (_return_to_selection) of een nieuwe analyse start.
-        self._pending_preview_input: tuple[Path, str, str] | None = None
-        self._confirmed_preview_input: tuple[Path, str, str] | None = None
+        # (bron, klant, project, bestemming) gebruiken van de laatst getoonde,
+        # geslaagde preview, nooit een combinatie die ondertussen gewijzigd is
+        # zonder nieuwe preview. Ongeldig gemaakt zodra de gebruiker teruggaat
+        # naar het formulier (_return_to_selection) of een nieuwe analyse start.
+        self._pending_preview_input: _PreviewInput | None = None
+        self._confirmed_preview_input: _PreviewInput | None = None
         self._ingest_runner: object | None = None
+
+        # Fase 3: voortgangs-/veiligheidsstop-state, uitsluitend voor een
+        # echte ingest (nooit voor preview — zie _on_start_ingest_clicked en
+        # _reset_ingest_progress_state). Altijd samen gereset bij het starten
+        # van een nieuwe ingest en bij elke terminale uitkomst (voltooid,
+        # mislukt, geannuleerd).
+        self._ingest_start_time: float | None = None
+        self._last_ingest_progress: ProgressUpdate | None = None
+        self._consecutive_ingest_failures = 0
+        self._safety_stop_triggered = False
+        self._cancel_confirmation_pending = False
 
         self._outer_layout = QVBoxLayout(self)
 
@@ -240,6 +312,13 @@ class MainWindow(QWidget):
     def volume_cards(self) -> list[QPushButton]:
         return self._content.findChildren(QPushButton, "volumeCard") if self._content else []
 
+    def destination_cards(self) -> list[QPushButton]:
+        return self._content.findChildren(QPushButton, "destinationCard") if self._content else []
+
+    def selected_destination_text(self) -> str:
+        label = self._content.findChild(QLabel, "selectedDestinationLabel") if self._content else None
+        return label.text() if label else ""
+
     def client_input(self) -> QLineEdit | None:
         return self._content.findChild(QLineEdit, "clientInput") if self._content else None
 
@@ -253,6 +332,22 @@ class MainWindow(QWidget):
         if self._content is None:
             return []
         return [label.text() for label in self._content.findChildren(QLabel, "previewLine")]
+
+    def percentage_label_text(self) -> str:
+        label = self._content.findChild(QLabel, "percentageLabel") if self._content else None
+        return label.text() if label else ""
+
+    def speed_label_text(self) -> str:
+        label = self._content.findChild(QLabel, "speedLabel") if self._content else None
+        return label.text() if label else ""
+
+    def do_not_disconnect_warning_visible(self) -> bool:
+        label = self._content.findChild(QLabel, "warningLabel") if self._content else None
+        return label is not None and label.text() == DO_NOT_DISCONNECT_TEXT
+
+    def cancel_confirmation_message(self) -> str:
+        label = self._content.findChild(QLabel, "cancelConfirmationLabel") if self._content else None
+        return label.text() if label else ""
 
     # -- detection ------------------------------------------------------------
 
@@ -274,6 +369,11 @@ class MainWindow(QWidget):
             media_total_bytes=volume.media_total_bytes,
             via_auto_detection=True,
         )
+        # Een nieuwe bron maakt een eerder gekozen bestemming ongeldig — de
+        # kandidatenlijst hangt af van de bron (dezelfde fysieke schijf mag
+        # nooit allebei zijn, zie desktop/volumes.py's default_is_source_volume),
+        # dus een oude keuze kan na een bronwissel onterecht (nog) geldig lijken.
+        self._selected_destination = None
         self._render_selected()
 
     # -- manual folder picking (native dialog) --------------------------------
@@ -293,13 +393,14 @@ class MainWindow(QWidget):
             media_total_bytes=media_total_bytes,
             via_auto_detection=False,
         )
+        self._selected_destination = None  # zie _select_volume's toelichting
         self._render_selected()
 
     # -- dry-run analysis (via the Controller, never IngestService directly) --
 
     def _start_preview(self, client: str, project: str) -> None:
-        if self._selection is None:
-            return
+        if self._selection is None or self._selected_destination is None:
+            return  # niet bereikbaar via de UI (knop staat dan uit), extra zekerheid
         if self._preview_runner is not None and self._preview_runner.is_running():
             return  # een preview loopt al; niet bereikbaar via de UI, extra zekerheid
         # Een nieuwe preview maakt elke eerder bevestigde preview-input
@@ -307,12 +408,18 @@ class MainWindow(QWidget):
         # _on_analysis_finished) — Start Ingest mag nooit een combinatie
         # gebruiken die niet exact overeenkomt met de laatst getoonde preview.
         self._confirmed_preview_input = None
-        self._pending_preview_input = (self._selection.source_path, client, project)
+        self._pending_preview_input = _PreviewInput(
+            source=self._selection.source_path,
+            client=client,
+            project=project,
+            destination=self._selected_destination,
+        )
         self._render_analyzing()
         self._preview_runner = self._preview_starter(
             self._selection.source_path,
             client,
             project,
+            destination_root=self._selected_destination.path,
             on_progress=self._on_analysis_progress,
             on_completed=self._on_analysis_finished,
             on_failed=self._on_analysis_failed,
@@ -381,36 +488,71 @@ class MainWindow(QWidget):
         # oude QThread-pad (zie git-historie) en is met dat pad verwijderd,
         # niet dichtgetimmerd met een extra guard.
 
-        source, client, project = self._confirmed_preview_input
+        preview_input = self._confirmed_preview_input
+        self._reset_ingest_progress_state()
+        self._ingest_start_time = time.monotonic()
         self._render_ingesting()
         self._ingest_runner = self._start_real_ingest(
-            source,
-            client,
-            project,
+            preview_input.source,
+            preview_input.client,
+            preview_input.project,
+            destination_root=preview_input.destination.path,
             on_progress=self._on_ingest_progress,
             on_completed=self._on_ingest_completed,
             on_failed=self._on_ingest_failed,
             on_cancelled=self._on_ingest_cancelled,
+            on_asset_processed=self._on_ingest_asset_processed,
             config_path=self._config_path,
             camera_profiles_path=self._camera_profiles_path,
         )
 
+    def _reset_ingest_progress_state(self) -> None:
+        """De enige plek die alle voortgangs-/snelheids-/veiligheidsstop-
+        state voor een echte ingest terugzet — aangeroepen vlak vóór een
+        nieuwe ingest start én na elke terminale uitkomst (voltooid, mislukt,
+        geannuleerd), zodat niets van run N blijft doorlopen in run N+1."""
+        self._ingest_start_time = None
+        self._last_ingest_progress = None
+        self._consecutive_ingest_failures = 0
+        self._safety_stop_triggered = False
+        self._cancel_confirmation_pending = False
+
     def _on_cancel_ingest_clicked(self) -> None:
-        """Zoals bij annuleren van een preview: een enkele klik. In
-        tegenstelling tot de preview annuleert dit een actie die al wél
-        bestanden heeft weggeschreven — de precieze bevestigingsvraag
-        daarvoor (Design Language hoofdstuk 12, UX-blauwdruk hoofdstuk 6) is
-        bewust niet in deze fase gebouwd (niet in de Fase 3-opdracht), maar
-        blijft een expliciete, latere toevoeging, geen vergeten stap."""
+        """Eerste klik op "Annuleren": toont een korte inline bevestiging
+        (Design Language hoofdstuk 12 — annuleren tijdens een lopende actie
+        is een van de expliciete uitzonderingen op "nooit bevestigen"), roept
+        nog GEEN cancel() aan. Zie _on_confirm_cancel_ingest_clicked voor de
+        daadwerkelijke annulering, pas na expliciete bevestiging."""
+        self._cancel_confirmation_pending = True
+        self._render_ingesting()
+
+    def _on_continue_ingest_clicked(self) -> None:
+        """"Doorgaan met ingest" — de primaire, veilige actie: sluit de
+        bevestiging, verandert verder niets, de ingest liep onveranderd
+        door."""
+        self._cancel_confirmation_pending = False
+        self._render_ingesting()
+
+    def _on_confirm_cancel_ingest_clicked(self) -> None:
+        """Pas hier wordt runner.cancel() echt aangeroepen — na expliciete
+        bevestiging, nooit direct vanuit de eerste klik."""
+        self._cancel_confirmation_pending = False
         if self._ingest_runner is not None:
             self._ingest_runner.cancel()
 
     def _on_ingest_progress(self, update: ProgressUpdate) -> None:
+        self._last_ingest_progress = update
+
         bar = self.progress_bar()
         if bar is not None:
             if bar.maximum() == 0 and update.total:
                 bar.setRange(0, update.total)
             bar.setValue(update.processed)
+
+        percentage_label = self._content.findChild(QLabel, "percentageLabel") if self._content else None
+        if percentage_label is not None:
+            percentage = int(update.processed / update.total * 100) if update.total else 0
+            percentage_label.setText(f"{percentage}%")
 
         detail = self._content.findChild(QLabel, "captionLabel") if self._content else None
         if detail is not None:
@@ -419,22 +561,100 @@ class MainWindow(QWidget):
                 f"{format_size(update.bytes_processed)} verwerkt"
             )
 
+        speed_label = self._content.findChild(QLabel, "speedLabel") if self._content else None
+        if speed_label is not None:
+            speed_label.setText(self._speed_and_eta_text(update))
+
+    def _speed_and_eta_text(self, update: ProgressUpdate) -> str:
+        """Snelheid en resterende tijd, uitsluitend berekend in deze app-laag
+        (geen engine-wijziging) uit `time.monotonic()` en de al beschikbare
+        `bytes_processed`/`processed`/`total` van dit progress-event. Geeft
+        nooit een deling door nul, een negatieve waarde of NaN/oneindig terug
+        — elke berekening is expliciet geguard."""
+        if self._ingest_start_time is None:
+            return ""
+        elapsed = time.monotonic() - self._ingest_start_time
+        if elapsed <= 0:
+            return ""
+
+        speed_text = _format_speed(update.bytes_processed / elapsed) if update.bytes_processed > 0 else ""
+
+        remaining_files = max(update.total - update.processed, 0)
+        if remaining_files == 0:
+            eta_text = ""
+        elif update.processed < _ETA_MIN_SAMPLES or elapsed < _ETA_MIN_ELAPSED_SECONDS:
+            # Te weinig data voor een betrouwbare extrapolatie — nooit een
+            # nep-ETA tonen, wel een nette placeholder.
+            eta_text = ETA_PLACEHOLDER_TEXT
+        else:
+            # Gemiddelde tijd per bestand tot nu toe × resterende bestanden —
+            # vereist geen vooraf bekende totale bytes-hoeveelheid (die de
+            # engine niet realtime doorgeeft), alleen wat dit event al draagt.
+            eta_seconds = elapsed * remaining_files / update.processed
+            eta_text = _format_eta(eta_seconds)
+
+        return " · ".join(text for text in (speed_text, eta_text) if text)
+
+    def _on_ingest_asset_processed(self, payload: dict) -> None:
+        """De safety-stop-teller (Fase 3) — uitsluitend voor een echte
+        ingest, nooit voor preview (deze callback wordt alleen doorgegeven
+        aan `_start_real_ingest` hierboven, niet aan `_preview_starter`).
+        `failed_verification` telt op, `copied` reset naar 0,
+        `duplicate_skipped` is neutraal (zie de safety-stop-analyse voor de
+        onderbouwing: een duplicaat-skip bewijst niets over of de
+        bestemmingsschijf nog bereikbaar is)."""
+        outcome = payload.get("outcome")
+        if outcome == "failed_verification":
+            self._consecutive_ingest_failures += 1
+        elif outcome == "copied":
+            self._consecutive_ingest_failures = 0
+        # duplicate_skipped (en elke andere/toekomstige uitkomst): neutraal,
+        # teller blijft ongewijzigd.
+
+        if (
+            not self._safety_stop_triggered
+            and self._consecutive_ingest_failures >= _SAFETY_STOP_THRESHOLD
+            and self._ingest_runner is not None
+        ):
+            # Triggert precies één keer: zodra de vlag gezet is, blijft deze
+            # tak hierna altijd overgeslagen, ook als er nog late
+            # asset_processed-events binnenkomen vóórdat het workerproces
+            # daadwerkelijk stopt. Hergebruikt het bestaande cancel()-pad
+            # (SIGTERM → grace → SIGKILL, zie ingest_process.py) — geen apart
+            # stopmechanisme.
+            self._safety_stop_triggered = True
+            self._ingest_runner.cancel()
+
     def _on_ingest_completed(self, summary: IngestSummary) -> None:
         self._ingest_runner = None
+        self._reset_ingest_progress_state()
+        # Gerenderd vóórdat _confirmed_preview_input hieronder geleegd wordt —
+        # _render_ingest_report toont via _destination_breadcrumb_lines() nog
+        # de bestemming van déze run.
+        self._render_ingest_report(summary)
         # Een voltooide ingest maakt de preview die hem startte ongeldig —
         # nogmaals op "Start Ingest" klikken zonder nieuwe preview mag nooit
         # dezelfde run herhalen.
         self._confirmed_preview_input = None
-        self._render_ingest_report(summary)
 
     def _on_ingest_failed(self, message: str) -> None:
         self._ingest_runner = None
+        self._reset_ingest_progress_state()
         self._render_analysis_failed(message)
 
     def _on_ingest_cancelled(self) -> None:
         self._ingest_runner = None
         self._confirmed_preview_input = None
-        self._return_to_selection()
+        # De vlag moet gelezen worden vóórdat _reset_ingest_progress_state()
+        # hem terugzet — dit is het enige moment waarop we nog weten of déze
+        # annulering van de safety-stop kwam of van een bevestigde,
+        # handmatige klik.
+        was_safety_stop = self._safety_stop_triggered
+        self._reset_ingest_progress_state()
+        if was_safety_stop:
+            self._render_analysis_failed(SAFETY_STOP_MESSAGE)
+        else:
+            self._return_to_selection()
 
     # -- rendering --------------------------------------------------------------
 
@@ -540,7 +760,9 @@ class MainWindow(QWidget):
 
         def _update_enabled() -> None:
             preview_button.setEnabled(
-                bool(client_input.text().strip()) and bool(project_input.text().strip())
+                bool(client_input.text().strip())
+                and bool(project_input.text().strip())
+                and self._selected_destination is not None
             )
 
         client_input.textChanged.connect(_update_enabled)
@@ -548,6 +770,10 @@ class MainWindow(QWidget):
         preview_button.clicked.connect(
             lambda: self._start_preview(client_input.text().strip(), project_input.text().strip())
         )
+
+        self._render_destination_picker(layout, on_change=_update_enabled)
+        _update_enabled()  # herstelt een al gekozen bestemming (bv. na terug/opnieuw zoeken)
+
         layout.addWidget(preview_button, alignment=Qt.AlignmentFlag.AlignCenter)
         layout.addSpacing(12)
 
@@ -558,6 +784,73 @@ class MainWindow(QWidget):
 
         layout.addStretch()
         self._set_content(content)
+
+    def _render_destination_picker(self, layout: QVBoxLayout, *, on_change: Callable[[], None]) -> None:
+        """Fase 3.5: bestemmingsschijf-keuze, ingebed in hetzelfde scherm als
+        Klant/Project (niet een apart scherm/klik) — zodat "Bekijk inhoud" in
+        één blik toont wat er nog ontbreekt. Klikken op een kaart update
+        alleen `self._selected_destination` en een label in-place; het
+        her-rendert nooit het hele scherm, anders zou dat de tekst die de
+        gebruiker al in Klant/Project typte, wissen."""
+        assert self._selection is not None
+        self._destination_volumes = self._detect_destinations(self._selection.source_path)
+
+        destination_label = QLabel(DESTINATION_LABEL_TEXT)
+        destination_label.setObjectName("fieldLabel")
+        layout.addWidget(destination_label)
+
+        selected_label = QLabel("")
+        selected_label.setObjectName("selectedDestinationLabel")
+        selected_label.setWordWrap(True)
+        selected_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        if not self._destination_volumes:
+            empty_label = QLabel(NO_DESTINATIONS_TEXT)
+            empty_label.setObjectName("captionLabel")
+            empty_label.setWordWrap(True)
+            layout.addWidget(empty_label)
+            layout.addSpacing(8)
+
+            retry_button = QPushButton(RETRY_DESTINATIONS_TEXT)
+            retry_button.setObjectName("linkButton")
+            retry_button.clicked.connect(lambda: self._render_selected())
+            layout.addWidget(retry_button, alignment=Qt.AlignmentFlag.AlignCenter)
+            layout.addSpacing(16)
+            layout.addWidget(selected_label)
+            layout.addSpacing(16)
+            return
+
+        # Blijft geldig als de eerder gekozen bestemming nog in de nieuwe
+        # kandidatenlijst voorkomt (bijv. een her-render die niets aan de
+        # bron veranderde) — anders (schijf verdwenen, of net gewisseld van
+        # bron) is er bewust geen automatische vervangende keuze.
+        if self._selected_destination is not None and self._selected_destination.path not in {
+            d.path for d in self._destination_volumes
+        }:
+            self._selected_destination = None
+
+        def _select(destination: DestinationInfo) -> None:
+            self._selected_destination = destination
+            selected_label.setText(
+                f"{SELECTED_DESTINATION_PREFIX}{destination.name} · "
+                f"{format_size(destination.free_bytes)} vrij"
+            )
+            on_change()
+
+        for destination in self._destination_volumes:
+            card = QPushButton(f"{destination.name}\n{format_size(destination.free_bytes)} vrij")
+            card.setObjectName("destinationCard")
+            card.clicked.connect(lambda checked=False, d=destination: _select(d))
+            layout.addWidget(card)
+            layout.addSpacing(8)
+
+        if self._selected_destination is not None:
+            selected_label.setText(
+                f"{SELECTED_DESTINATION_PREFIX}{self._selected_destination.name} · "
+                f"{format_size(self._selected_destination.free_bytes)} vrij"
+            )
+        layout.addWidget(selected_label)
+        layout.addSpacing(16)
 
     def _render_analyzing(self) -> None:
         content = QWidget()
@@ -599,7 +892,13 @@ class MainWindow(QWidget):
         label.setObjectName("statusLabel")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(label)
-        layout.addSpacing(16)
+        layout.addSpacing(8)
+
+        percentage_label = QLabel("")
+        percentage_label.setObjectName("percentageLabel")
+        percentage_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(percentage_label)
+        layout.addSpacing(8)
 
         progress = QProgressBar()
         progress.setObjectName("analysisProgress")
@@ -611,15 +910,60 @@ class MainWindow(QWidget):
         detail_label.setObjectName("captionLabel")
         detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(detail_label)
+        layout.addSpacing(4)
+
+        speed_label = QLabel("")
+        speed_label.setObjectName("speedLabel")
+        speed_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(speed_label)
         layout.addSpacing(16)
 
-        cancel_button = QPushButton(CANCEL_BUTTON_TEXT)
-        cancel_button.setObjectName("linkButton")
-        cancel_button.clicked.connect(self._on_cancel_ingest_clicked)
-        layout.addWidget(cancel_button, alignment=Qt.AlignmentFlag.AlignCenter)
+        warning_label = QLabel(DO_NOT_DISCONNECT_TEXT)
+        warning_label.setObjectName("warningLabel")
+        warning_label.setWordWrap(True)
+        warning_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(warning_label)
+        layout.addSpacing(16)
+
+        if self._cancel_confirmation_pending:
+            self._add_cancel_confirmation(layout)
+        else:
+            cancel_button = QPushButton(CANCEL_BUTTON_TEXT)
+            cancel_button.setObjectName("linkButton")
+            cancel_button.clicked.connect(self._on_cancel_ingest_clicked)
+            layout.addWidget(cancel_button, alignment=Qt.AlignmentFlag.AlignCenter)
 
         layout.addStretch()
         self._set_content(content)
+
+        # Een re-render (bijv. door de annuleer-bevestiging te openen/sluiten)
+        # mag de al zichtbare voortgang nooit laten terugspringen naar
+        # "onbepaald" — herstel de laatst bekende stand meteen.
+        if self._last_ingest_progress is not None:
+            self._on_ingest_progress(self._last_ingest_progress)
+
+    def _add_cancel_confirmation(self, layout: QVBoxLayout) -> None:
+        """De inline annuleer-bevestiging (Design Language hoofdstuk 12) —
+        geen apart scherm/dialoog, gewoon een ander onderste blok binnen
+        dezelfde voortgangsweergave, zodat de voortgang zelf zichtbaar en
+        actueel blijft terwijl de gebruiker beslist."""
+        confirm_label = QLabel(CANCEL_INGEST_CONFIRM_MESSAGE)
+        confirm_label.setObjectName("cancelConfirmationLabel")
+        confirm_label.setWordWrap(True)
+        confirm_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(confirm_label)
+        layout.addSpacing(12)
+
+        continue_button = QPushButton(CONTINUE_INGEST_TEXT)
+        continue_button.setObjectName("primaryButton")
+        continue_button.clicked.connect(self._on_continue_ingest_clicked)
+        layout.addWidget(continue_button, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addSpacing(8)
+
+        confirm_cancel_button = QPushButton(CONFIRM_CANCEL_INGEST_TEXT)
+        confirm_cancel_button.setObjectName("linkButton")
+        confirm_cancel_button.clicked.connect(self._on_confirm_cancel_ingest_clicked)
+        layout.addWidget(confirm_cancel_button, alignment=Qt.AlignmentFlag.AlignCenter)
 
     def _add_preview_section(self, layout: QVBoxLayout, header_text: str, value_lines: list[str]) -> None:
         header = QLabel(header_text)
@@ -633,6 +977,26 @@ class MainWindow(QWidget):
             line_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(line_label)
         layout.addSpacing(14)
+
+    def _destination_breadcrumb_lines(self, summary: IngestSummary) -> list[str]:
+        """Bestemming in mensentaal (Fase 3.5, requirement 8): welke schijf,
+        de vaste ManyFast/klant/project-structuur, en de vrije ruimte op die
+        schijf — nooit een technisch bestandspad (Design Language hoofdstuk
+        15). Werkt voor zowel de preview als het eindrapport: beide roepen
+        dit aan terwijl `self._confirmed_preview_input` nog de bestemming
+        van déze run draagt (zie _on_ingest_completed's volgorde)."""
+        lines: list[str] = []
+        destination = (
+            self._confirmed_preview_input.destination
+            if self._confirmed_preview_input is not None
+            else None
+        )
+        if destination is not None:
+            lines.append(destination.name)
+        lines += [DESTINATION_ORG_LABEL, summary.client, summary.project]
+        if destination is not None:
+            lines.append(f"{format_size(destination.free_bytes)} vrij")
+        return lines
 
     def _camera_breakdown_lines(self, summary: IngestSummary) -> list[str]:
         counts = summary.camera_profile_counts
@@ -667,9 +1031,7 @@ class MainWindow(QWidget):
         source_name = self._selection.name if self._selection is not None else ""
         self._add_preview_section(layout, SECTION_SOURCE, [source_name])
         self._add_preview_section(
-            layout,
-            SECTION_DESTINATION,
-            [DESTINATION_ORG_LABEL, summary.client, summary.project],
+            layout, SECTION_DESTINATION, self._destination_breadcrumb_lines(summary)
         )
         self._add_preview_section(
             layout,
@@ -722,9 +1084,7 @@ class MainWindow(QWidget):
         layout.addSpacing(20)
 
         self._add_preview_section(
-            layout,
-            SECTION_DESTINATION,
-            [DESTINATION_ORG_LABEL, summary.client, summary.project],
+            layout, SECTION_DESTINATION, self._destination_breadcrumb_lines(summary)
         )
         self._add_preview_section(
             layout,
@@ -785,3 +1145,24 @@ def _pluralize_files(count: int) -> str:
 def _unrecognized_files_note(count: int) -> str:
     subject = "bestand kon" if count == 1 else "bestanden konden"
     return f"{count} {subject} niet automatisch worden herkend. Ze worden wel meegenomen."
+
+
+def _format_speed(bytes_per_second: float) -> str:
+    """MB/s onder 1 GB/s, GB/s vanaf 1 GB/s — zelfde 1024-gebaseerde
+    eenheden en decimaalnotatie als desktop/volumes.py's format_size(), voor
+    een consistente stijl door de hele app."""
+    mb_per_second = bytes_per_second / (1024 * 1024)
+    if mb_per_second < 1024:
+        return f"{mb_per_second:.1f} MB/s"
+    return f"{mb_per_second / 1024:.1f} GB/s"
+
+
+def _format_eta(seconds: float) -> str:
+    """Geen secondeprecisie, zelfs niet bij lange runs — "± 4 min resterend"
+    of "± 1u 12m resterend". Nooit 0 of negatief: een run met nog resterende
+    bestanden toont minimaal "± 1 min resterend"."""
+    total_minutes = max(round(seconds / 60), 1)
+    hours, minutes = divmod(total_minutes, 60)
+    if hours == 0:
+        return f"± {minutes} min resterend"
+    return f"± {hours}u {minutes}m resterend"

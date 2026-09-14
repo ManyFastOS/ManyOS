@@ -25,16 +25,25 @@ import pytest
 
 pytest.importorskip("PySide6")
 
+from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtWidgets import QApplication
 
 from many_ingest.core.ingest_service import ProgressUpdate
 from many_ingest.core.report import IngestSummary
+from many_ingest.desktop import main_window as main_window_module
 from many_ingest.desktop.main_window import (
+    CANCEL_BUTTON_TEXT,
+    CANCEL_INGEST_CONFIRM_MESSAGE,
+    CONFIRM_CANCEL_INGEST_TEXT,
+    CONTINUE_INGEST_TEXT,
+    DO_NOT_DISCONNECT_TEXT,
+    ETA_PLACEHOLDER_TEXT,
     INGEST_DONE_TITLE_TEXT,
     INGEST_PARTIAL_TITLE_TEXT,
     INGESTING_TEXT,
     SAFE_TO_DELETE_NO_TEXT,
     SAFE_TO_DELETE_YES_TEXT,
+    SAFETY_STOP_MESSAGE,
     START_INGEST_BUTTON_TEXT,
     MainWindow,
 )
@@ -100,6 +109,7 @@ class _CapturingStartPreview:
                 "on_completed": on_completed,
                 "on_failed": on_failed,
                 "on_cancelled": on_cancelled,
+                "on_asset_processed": on_asset_processed,
             }
         )
         runner = _FakePreviewRunner()
@@ -151,6 +161,7 @@ class _CapturingStartRealIngest:
                 "on_completed": on_completed,
                 "on_failed": on_failed,
                 "on_cancelled": on_cancelled,
+                "on_asset_processed": on_asset_processed,
             }
         )
         runner = _FakeIngestRunner()
@@ -276,6 +287,71 @@ def test_ingest_progress_updates_the_progress_bar_and_caption(qapp, tmp_path):
     assert "GB" in window.current_detail()
 
 
+def test_prominent_percentage_reflects_the_same_progress_as_the_bar(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+
+    on_progress = ingest_starter.calls[0]["on_progress"]
+    on_progress(ProgressUpdate(processed=2, total=5, current_file="a.mp4", bytes_processed=100))
+    assert window.percentage_label_text() == "40%"
+    assert window.progress_bar().value() == 2
+
+    on_progress(ProgressUpdate(processed=5, total=5, current_file="e.mp4", bytes_processed=500))
+    assert window.percentage_label_text() == "100%"
+    assert window.progress_bar().value() == 5
+
+
+def test_speed_is_calculated_from_elapsed_time_and_bytes_processed(qapp, tmp_path, monkeypatch):
+    times = iter([100.0, 102.0])  # start, dan één progress-event 2s later
+    monkeypatch.setattr(main_window_module.time, "monotonic", lambda: next(times))
+
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()  # zet _ingest_start_time = 100.0
+
+    on_progress = ingest_starter.calls[0]["on_progress"]
+    on_progress(
+        ProgressUpdate(
+            processed=1, total=10, current_file="a.mp4", bytes_processed=20 * 1024 * 1024
+        )
+    )  # 20 MiB / 2s = 10 MB/s
+
+    assert "10.0 MB/s" in window.speed_label_text()
+
+
+def test_eta_shows_placeholder_with_insufficient_data(qapp, tmp_path, monkeypatch):
+    times = iter([100.0, 100.5])  # 0.5s verstreken, onder _ETA_MIN_ELAPSED_SECONDS
+    monkeypatch.setattr(main_window_module.time, "monotonic", lambda: next(times))
+
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+
+    on_progress = ingest_starter.calls[0]["on_progress"]
+    on_progress(ProgressUpdate(processed=1, total=10, current_file="a.mp4", bytes_processed=1000))
+
+    assert ETA_PLACEHOLDER_TEXT in window.speed_label_text()
+
+
+def test_eta_shows_a_usable_value_once_enough_data_is_available(qapp, tmp_path, monkeypatch):
+    times = iter([100.0, 160.0])  # 60s verstreken, 2 van de 10 bestanden klaar
+    monkeypatch.setattr(main_window_module.time, "monotonic", lambda: next(times))
+
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+
+    on_progress = ingest_starter.calls[0]["on_progress"]
+    on_progress(ProgressUpdate(processed=2, total=10, current_file="b.mp4", bytes_processed=2000))
+    # eta = 60s * (10-2)/2 = 240s = 4 min
+    assert "± 4 min resterend" in window.speed_label_text()
+    assert ETA_PLACEHOLDER_TEXT not in window.speed_label_text()
+
+
+def test_do_not_disconnect_warning_is_visible_during_ingest(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+
+    assert window.do_not_disconnect_warning_visible() is True
+
+
 # -- completion, both variants ----------------------------------------------------
 
 
@@ -337,14 +413,51 @@ def test_ingest_failed_shows_a_friendly_message_never_a_stacktrace(qapp, tmp_pat
     assert window.secondary_action_button() is not None  # "Terug" blijft bereikbaar
 
 
-def test_cancel_ingest_button_calls_cancel_on_the_runner(qapp, tmp_path):
+def test_cancel_click_shows_a_confirmation_instead_of_cancelling_immediately(qapp, tmp_path):
     window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
     window.choose_button().click()
 
     assert window.current_message() == INGESTING_TEXT
-    window.secondary_action_button().click()  # Annuleren
+    window.secondary_action_button().click()  # Annuleren -> toont bevestiging, cancelt nog niet
+
+    assert ingest_starter.runners[0].cancel_called is False
+    assert window.cancel_confirmation_message() == CANCEL_INGEST_CONFIRM_MESSAGE
+    assert window.choose_button().text() == CONTINUE_INGEST_TEXT
+    assert window.secondary_action_button().text() == CONFIRM_CANCEL_INGEST_TEXT
+
+
+def test_continue_ingest_dismisses_the_confirmation_without_cancelling(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+    window.secondary_action_button().click()  # Annuleren -> bevestiging
+
+    window.choose_button().click()  # "Doorgaan met ingest"
+
+    assert ingest_starter.runners[0].cancel_called is False
+    assert window.current_message() == INGESTING_TEXT
+    assert window.secondary_action_button().text() == CANCEL_BUTTON_TEXT  # weer normaal
+    assert window.cancel_confirmation_message() == ""
+
+
+def test_confirming_cancel_calls_cancel_on_the_runner(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+    window.secondary_action_button().click()  # Annuleren -> bevestiging
+    window.secondary_action_button().click()  # "Ingest annuleren" (nu de bevestig-knop)
 
     assert ingest_starter.runners[0].cancel_called is True
+
+
+def test_progress_is_preserved_when_the_cancel_confirmation_is_shown(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+    ingest_starter.calls[0]["on_progress"](
+        ProgressUpdate(processed=3, total=10, current_file="c.mp4", bytes_processed=300)
+    )
+
+    window.secondary_action_button().click()  # her-rendert het scherm
+
+    assert window.percentage_label_text() == "30%"
 
 
 def test_ingest_cancelled_returns_to_the_selection_form(qapp, tmp_path):
@@ -355,6 +468,153 @@ def test_ingest_cancelled_returns_to_the_selection_form(qapp, tmp_path):
 
     assert window.current_message() == "SD_CARD_1"
     assert window.client_input() is not None
+
+
+# -- safety-stop: te veel opeenvolgende mislukkingen tijdens een echte ingest -----
+
+
+def _fail(source_path: str = "x.mp4") -> dict:
+    return {"outcome": "failed_verification", "source_path": source_path}
+
+
+def _copied(source_path: str = "x.mp4") -> dict:
+    return {"outcome": "copied", "source_path": source_path}
+
+
+def _duplicate(source_path: str = "x.mp4") -> dict:
+    return {"outcome": "duplicate_skipped", "source_path": source_path}
+
+
+def test_four_consecutive_failures_do_not_trigger_the_safety_stop(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+    on_asset_processed = ingest_starter.calls[0]["on_asset_processed"]
+
+    for _ in range(4):
+        on_asset_processed(_fail())
+
+    assert ingest_starter.runners[0].cancel_called is False
+
+
+def test_five_consecutive_failures_trigger_the_safety_stop(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+    on_asset_processed = ingest_starter.calls[0]["on_asset_processed"]
+
+    for _ in range(5):
+        on_asset_processed(_fail())
+
+    assert ingest_starter.runners[0].cancel_called is True
+
+
+def test_a_copied_outcome_resets_the_failure_counter(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+    on_asset_processed = ingest_starter.calls[0]["on_asset_processed"]
+
+    for _ in range(4):
+        on_asset_processed(_fail())
+    on_asset_processed(_copied())  # reset naar 0
+    for _ in range(4):
+        on_asset_processed(_fail())
+
+    assert ingest_starter.runners[0].cancel_called is False
+
+
+def test_a_duplicate_skipped_outcome_is_neutral_and_does_not_reset_the_counter(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+    on_asset_processed = ingest_starter.calls[0]["on_asset_processed"]
+
+    for _ in range(4):
+        on_asset_processed(_fail())
+    on_asset_processed(_duplicate())  # neutraal, teller blijft op 4
+    on_asset_processed(_fail())  # de 5e mislukking op rij
+
+    assert ingest_starter.runners[0].cancel_called is True
+
+
+def test_safety_stop_triggers_cancel_only_once(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+    on_asset_processed = ingest_starter.calls[0]["on_asset_processed"]
+
+    for _ in range(5):
+        on_asset_processed(_fail())
+    runner = ingest_starter.runners[0]
+    runner.cancel_called = False  # reset om een eventuele tweede aanroep te kunnen zien
+    for _ in range(3):
+        on_asset_processed(_fail())  # late events ná de trigger
+
+    assert runner.cancel_called is False, "cancel() mag na de trigger niet nogmaals aangeroepen worden"
+
+
+def test_safety_stop_cancellation_shows_a_different_message_than_manual_cancellation(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+    on_asset_processed = ingest_starter.calls[0]["on_asset_processed"]
+
+    for _ in range(5):
+        on_asset_processed(_fail())
+    ingest_starter.calls[0]["on_cancelled"]()  # de worker bevestigt de annulering
+
+    assert window.current_message() == SAFETY_STOP_MESSAGE
+    assert "Traceback" not in window.current_message()
+    # Geen stille terugkeer naar het formulier zoals bij een handmatige annulering:
+    assert window.client_input() is None
+
+
+def test_manual_cancellation_still_returns_to_the_selection_form(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+    on_asset_processed = ingest_starter.calls[0]["on_asset_processed"]
+
+    on_asset_processed(_fail())  # slechts 1 mislukking, geen safety-stop
+    ingest_starter.calls[0]["on_cancelled"]()  # gebruiker annuleerde zelf
+
+    assert window.current_message() == "SD_CARD_1"
+    assert window.client_input() is not None
+
+
+def test_preview_never_triggers_the_safety_stop(qapp, tmp_path):
+    """De preview-starter krijgt nooit een on_asset_processed-callback van
+    MainWindow (zie _start_preview) — er is dus structureel geen pad waarop
+    preview-activiteit de echte-ingest-teller kan raken."""
+    preview_starter = _CapturingStartPreview()
+    ingest_starter = _CapturingStartRealIngest()
+    window = MainWindow(
+        detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)],
+        start_preview=preview_starter,
+        start_real_ingest=ingest_starter,
+    )
+    window.client_input().setText("Nike")
+    window.project_input().setText("Zomer Campagne")
+    window.choose_button().click()
+
+    assert preview_starter.calls[0]["on_asset_processed"] is None
+
+
+def test_a_new_ingest_resets_the_failure_counter_and_safety_stop_state(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+    on_asset_processed = ingest_starter.calls[0]["on_asset_processed"]
+    for _ in range(5):
+        on_asset_processed(_fail())
+    ingest_starter.calls[0]["on_cancelled"]()  # safety-stop-melding getoond
+
+    # Terug naar het formulier is hier niet bereikbaar (safety-stop toont een
+    # foutscherm, geen "Terug"-pad naar dezelfde preview) — een verse sessie
+    # met een nieuwe, geslaagde preview simuleert "nieuwe ingest":
+    window2, _preview_starter2, ingest_starter2 = _window_with_finished_preview(qapp, tmp_path)
+    window2.choose_button().click()
+
+    assert ingest_starter2.runners[0].cancel_called is False
+    on_asset_processed2 = ingest_starter2.calls[0]["on_asset_processed"]
+    for _ in range(4):
+        on_asset_processed2(_fail())
+    assert ingest_starter2.runners[0].cancel_called is False, (
+        "een nieuwe ingest-sessie mag geen teller van een eerdere sessie erven"
+    )
 
 
 # -- real QProcess, real crash-regression shutdown scenario ------------------------
@@ -384,3 +644,79 @@ def test_closing_the_window_during_a_real_ingest_does_not_crash(tmp_path):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
         assert "OK" in result.stdout, f"run {i}: geen 'OK' in stdout:\n{result.stdout}"
+
+
+# -- real QProcess, real safety-stop end-to-end -------------------------------------
+
+CAMERA_PROFILES_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "modules"
+    / "many_ingest"
+    / "config"
+    / "camera_profiles.yaml"
+)
+
+
+def test_safety_stop_fires_over_a_real_worker_process(qapp, tmp_path):
+    """End-to-end met een echte worker (geen fakes): forceert 6 échte
+    failed_verification-uitkomsten door de bestemming onbeschrijfbaar te
+    maken, en bewijst dat de veiligheidsstop ook door de echte JSON-lines-
+    events (niet alleen via geïnjecteerde fakes) getriggerd wordt — de
+    string-matching op payload["outcome"] in _on_ingest_asset_processed werkt
+    dus ook tegen de echte worker-output, niet alleen tegen testdata."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    for i in range(6):
+        (input_dir / f"C{i:04d}.MP4").write_bytes(b"x" * 1000)
+    storage_root = tmp_path / "storage"
+    storage_root.mkdir()
+    storage_root.chmod(0o555)  # elke copy() faalt -> failed_verification
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"storage_root: {storage_root}\n"
+        f"manifest_path: {tmp_path / 'asset_schema.json'}\n"
+        f"log_dir: {tmp_path / 'logs'}\n"
+    )
+
+    window = MainWindow(
+        detect_volumes=lambda: [], config_path=config_path, camera_profiles_path=CAMERA_PROFILES_PATH
+    )
+    try:
+        window._set_manual_source(input_dir)
+        window.client_input().setText("Nike")
+        window.project_input().setText("Zomer")
+        window.choose_button().click()  # echte preview
+
+        loop = QEventLoop()
+        timeout_timer = QTimer()
+        timeout_timer.setSingleShot(True)
+        timeout_timer.timeout.connect(loop.quit)
+        poll_timer = QTimer()
+        poll_timer.timeout.connect(
+            lambda: window.current_message() == "Wat we hebben gevonden" and loop.quit()
+        )
+        poll_timer.start(20)
+        timeout_timer.start(15_000)
+        loop.exec()
+        assert window.current_message() == "Wat we hebben gevonden", "preview kwam niet op tijd"
+
+        window.choose_button().click()  # Start Ingest — echte QProcess
+
+        loop2 = QEventLoop()
+        timeout_timer2 = QTimer()
+        timeout_timer2.setSingleShot(True)
+        timeout_timer2.timeout.connect(loop2.quit)
+        poll_timer2 = QTimer()
+        poll_timer2.timeout.connect(
+            lambda: window.current_message() == SAFETY_STOP_MESSAGE and loop2.quit()
+        )
+        poll_timer2.start(20)
+        timeout_timer2.start(30_000)
+        loop2.exec()
+
+        assert window.current_message() == SAFETY_STOP_MESSAGE, (
+            "de veiligheidsstop-melding verscheen niet op tijd via de echte worker"
+        )
+    finally:
+        storage_root.chmod(0o755)
+        window._wait_for_ingest_to_stop()

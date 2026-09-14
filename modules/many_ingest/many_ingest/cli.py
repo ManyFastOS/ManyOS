@@ -6,17 +6,16 @@ from pathlib import Path
 
 import click
 
-from many_ingest.adapters.json_manifest import JSONManifest
-from many_ingest.adapters.local_fs_storage import LocalFilesystemStorage
-from many_ingest.config import load_camera_profiles, load_ingest_config
 from many_ingest.core.ingest_service import (
     AssetOutcome,
+    DestinationUnavailableError,
     IngestReport,
-    IngestService,
     ProgressUpdate,
 )
 from many_ingest.core.report import render_report, summarize
+from many_ingest.device_identity import same_physical_device
 from many_ingest.metadata_extractor import FfprobeNotFoundError
+from many_ingest.service_factory import build_ingest_service
 
 DEFAULT_CONFIG_PATH = Path("~/.many-ingest/config.yaml").expanduser()
 DEFAULT_CAMERA_PROFILES_PATH = Path("~/.many-ingest/camera_profiles.yaml").expanduser()
@@ -38,6 +37,18 @@ def main() -> None:
 )
 @click.option("--client", required=True)
 @click.option("--project", required=True)
+# Verplicht, geen fallback (Fase 3.5 — Dynamic Destination Selection):
+# ManyFast gebruikt meerdere externe bestemmingsschijven, niet één vaste, dus
+# config.yaml bevat sinds deze ronde alleen nog de relatieve laag-structuur
+# (zie config.py) — de fysieke schijf wordt altijd expliciet meegegeven, ook
+# via de CLI. Bewust geen legacy-pad dat terugvalt op een oude, absolute
+# storage_root-sleutel in config.yaml: één architectuur, geen twee.
+@click.option(
+    "--destination",
+    "destination_root",
+    required=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+)
 @click.option("--dry-run", is_flag=True, default=False)
 @click.option(
     "--config", "config_path", type=click.Path(path_type=Path), default=DEFAULT_CONFIG_PATH
@@ -52,20 +63,25 @@ def run(
     source: Path,
     client: str,
     project: str,
+    destination_root: Path,
     dry_run: bool,
     config_path: Path,
     camera_profiles_path: Path,
 ) -> None:
-    """Scan SOURCE and organize its video files into the Project Workspace."""
-    ingest_config = load_ingest_config(config_path)
-    camera_profiles = load_camera_profiles(camera_profiles_path)
+    """Scan SOURCE and organize its video files into the Project Workspace
+    on DESTINATION."""
+    # Harde safety rule: bron en bestemming mogen nooit dezelfde fysieke
+    # schijf zijn (zie device_identity.py — hetzelfde safety-net als de GUI
+    # en de worker gebruiken, niet een aparte CLI-eigen implementatie).
+    if same_physical_device(source, destination_root):
+        click.echo(
+            "De bron en de gekozen bestemmingsschijf zijn dezelfde fysieke schijf. "
+            "Kies een andere bestemmingsschijf.",
+            err=True,
+        )
+        raise SystemExit(1)
 
-    service = IngestService(
-        storage=LocalFilesystemStorage(),
-        manifest=JSONManifest(ingest_config.manifest_path),
-        config=ingest_config,
-        camera_profiles=camera_profiles,
-    )
+    service = build_ingest_service(config_path, camera_profiles_path, destination_root)
 
     try:
         report = service.run(
@@ -78,6 +94,9 @@ def run(
     except FfprobeNotFoundError as exc:
         click.echo(f"\n{exc}", err=True)
         raise SystemExit(1) from exc
+    except DestinationUnavailableError as exc:
+        click.echo(f"\n{exc}", err=True)
+        raise SystemExit(1) from exc
 
     click.echo()  # sluit de laatste voortgangsregel af met een newline
     _print_report(report)
@@ -87,6 +106,10 @@ def run(
     click.echo("\n" + report_text)
 
     report_path = report.log_path.with_name(f"{report.run_id}_report.txt")
+    # CLI schrijft dit leesbare rapport altijd, ook bij --dry-run — ActionLogger
+    # maakt log_dir sinds deze ronde alleen nog aan voor een echte run (zie
+    # logger.py), dus deze eigen write moet zijn eigen map kunnen aanmaken.
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report_text, encoding="utf-8")
 
 
@@ -129,7 +152,7 @@ def _print_report(report: IngestReport) -> None:
 
     if report.dry_run:
         cmd = (
-            f'many-ingest run --source {report.source} '
+            f'many-ingest run --source {report.source} --destination <schijf> '
             f'--client "{report.client}" --project "{report.project}"'
         )
         click.echo(f"\nOm dit daadwerkelijk uit te voeren: {cmd}")

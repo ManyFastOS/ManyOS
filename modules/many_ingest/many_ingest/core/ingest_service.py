@@ -11,8 +11,19 @@ Safety-first additions (see docs/MANY_INGEST_V0.1_READINESS_ASSESSMENT.md):
 - Collision protection: a destination file is never silently overwritten.
 - An ffprobe pre-flight check aborts the whole run rather than silently degrading
   every asset to "Onbekend".
+- A destination pre-flight check (`DestinationUnavailableError`, Fase 3.5) aborts a
+  REAL run before touching anything if `config.storage_root` isn't reachable/
+  writable — e.g. the chosen destination disk was unmounted after a preview. Never
+  raised for `dry_run=True`: a preview only reads, it never needs the destination to
+  exist yet (see logger.py's docstring for the matching, earlier decision about
+  `log_dir` specifically — this is the same principle applied consistently to the
+  destination as a whole).
 - An optional `progress_callback` reports per-file progress — a plain callback, not
   printing directly, so a future GUI can reuse `IngestService` unchanged.
+- An optional `asset_callback` reports each file's outcome (`AssetResult`) the
+  moment it's known — additive, defaults to `None`, no change for existing
+  callers. Lets a caller stream per-asset results live instead of only seeing
+  them in the final `IngestReport.assets` list (see ingest_worker.py).
 """
 
 from __future__ import annotations
@@ -42,6 +53,17 @@ from many_ingest.ports.manifest import AssetRecord, Manifest
 from many_ingest.ports.storage import Storage
 
 _MAX_COLLISION_ATTEMPTS = 999
+
+
+class DestinationUnavailableError(Exception):
+    """Raised at the start of a REAL run when the destination (resolved from
+    a chosen `destination_root`, see config.py) isn't reachable/writable —
+    e.g. the destination disk was unmounted after a preview. Never raised
+    for a dry-run. Distinct from a bare `OSError` on purpose: a caller
+    (ingest_worker.py, cli.py) can catch this separately and show a message
+    that actually names the destination, instead of the destination's
+    failure being caught by a generic `except OSError` and misattributed to
+    the source (a real bug found in manual testing before this existed)."""
 
 
 class AssetOutcome(enum.Enum):
@@ -86,6 +108,9 @@ class AssetResult:
     error: str | None = None
 
 
+AssetCallback = Callable[[AssetResult], None]
+
+
 @dataclasses.dataclass
 class IngestReport:
     source: Path
@@ -123,11 +148,15 @@ class IngestService:
         project: str,
         dry_run: bool,
         progress_callback: ProgressCallback | None = None,
+        asset_callback: AssetCallback | None = None,
     ) -> IngestReport:
         if not is_ffprobe_available():
             # Never proceed without metadata capability — a run without ffprobe would
             # silently degrade every asset to "Onbekend" instead of failing loudly.
             raise FfprobeNotFoundError(FFPROBE_INSTALL_MESSAGE)
+
+        if not dry_run:
+            _ensure_destination_is_writable(self._config.storage_root)
 
         start = time.monotonic()
         scan_result = self.scan(source)
@@ -150,6 +179,15 @@ class IngestService:
         for index, path in enumerate(scan_result.files, start=1):
             asset = self._process_asset(path, client, project, run_id, dry_run, logger)
             assets.append(asset)
+
+            if asset_callback is not None:
+                # Aangeroepen zodra het outcome van dít bestand bekend is — vóór
+                # progress_callback hieronder, dat alleen aggregaatvoortgang draagt
+                # (processed/total/bytes), nooit per-bestand-uitkomst. Zie
+                # ingest_worker.py voor de enige huidige consument: streamt
+                # hiermee hetzelfde `asset_processed`-event per bestand i.p.v. pas
+                # na afloop in bulk.
+                asset_callback(asset)
 
             try:
                 bytes_processed += path.stat().st_size
@@ -310,6 +348,20 @@ class IngestService:
                 )
             candidate = _with_suffix(destination, index)
         return candidate, False
+
+
+def _ensure_destination_is_writable(storage_root: Path) -> None:
+    """Fails fast, before scanning/logging/anything else, if the destination
+    isn't reachable — same `mkdir(parents=True, exist_ok=True)` technique
+    already used elsewhere in this codebase (ActionLogger, LocalFilesystemStorage.copy)
+    to prove writability, just done explicitly and early instead of being
+    discovered accidentally deep in some other step."""
+    try:
+        storage_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DestinationUnavailableError(
+            f"Kan niet schrijven naar de bestemming ({storage_root}): {exc}"
+        ) from exc
 
 
 def _with_suffix(path: Path, index: int) -> Path:
