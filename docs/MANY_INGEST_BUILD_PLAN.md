@@ -287,16 +287,22 @@ entry in `camera_profiles.yaml`. Geen codewijziging, geen redeploy van logica.
   (`brew install python ffmpeg`).
 - **Installatie:** lokaal Python-project (bijv. via `pipx install` of een virtualenv) —
   geen server, geen achtergrondproces.
-- **Gebruik na een shoot:**
+- **Gebruik na een shoot (bijgewerkt voor Fase 3.5 — `--destination` is sinds
+  2026-09-14 verplicht, zie `CLAUDE.md` en `MANY_INGEST_STORAGE_LAYOUT.md`):**
   1. Inputmap aankoppelen (SD-kaart/externe schijf via Finder, of een lokale map).
-  2. Eerst een preview: `many-ingest run --source /Volumes/SD_CARD_1 --client "Nike" --project "Zomer Campagne" --dry-run`.
+  2. Eerst een preview: `many-ingest run --source /Volumes/SD_CARD_1 --client "Nike" --project "Zomer Campagne" --destination /Volumes/Chris --dry-run`.
   3. Als de preview klopt, dezelfde opdracht zonder `--dry-run` om daadwerkelijk te
      kopiëren.
 - **Configuratie:** lokaal, bijv. `~/.many-ingest/config.yaml` en
-  `~/.many-ingest/camera_profiles.yaml`.
-- **ManyFast Asset Schema:** lokaal JSON-bestand, bijv.
-  `~/.many-ingest/asset_schema.json`.
-- **Actielogs:** lokaal weggeschreven, bijv. `~/.many-ingest/logs/`.
+  `~/.many-ingest/camera_profiles.yaml` — bevat sinds Fase 3.5 alleen nog de
+  *relatieve* mapstructuur (`footage_subpath`/`manifest_subpath`/`log_subpath`), geen
+  schijf/pad meer (zie `MANY_INGEST_STORAGE_LAYOUT.md` sectie 2).
+- **ManyFast Asset Schema:** sinds Fase 3.5 niet meer lokaal, maar op de gekozen
+  bestemmingsschijf zelf (bijv. `/Volumes/Chris/ManyFast/ManyOS/AssetSchema/asset_schema.json`)
+  — dezelfde schijf als de gekopieerde footage, zodat schema en materiaal nooit uit
+  elkaar kunnen lopen.
+- **Actielogs:** eveneens sinds Fase 3.5 op de gekozen bestemmingsschijf (bijv.
+  `/Volumes/Chris/ManyFast/ManyOS/Logs/`), niet meer lokaal op de Mac.
 - **Geen netwerkafhankelijkheid.** Werkt volledig offline.
 
 ---

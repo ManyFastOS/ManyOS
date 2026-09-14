@@ -19,9 +19,11 @@ from pathlib import Path
 from many_ingest.desktop.volumes import (
     default_is_boot_volume,
     default_is_destination_volume,
+    default_is_source_volume,
     describe_volume,
     format_size,
     list_candidate_volumes,
+    list_destination_volumes,
     scan_media_summary,
 )
 
@@ -167,3 +169,79 @@ def test_default_is_destination_volume_is_true_when_on_the_same_device(tmp_path)
     # ancestor" walk-up and the positive match, without needing a real,
     # separate physical volume (see module docstring).
     assert default_is_destination_volume(tmp_path, storage_root=storage_root) is True
+
+
+# -- Fase 3.5: destination-picker -------------------------------------------------
+
+
+def test_default_is_source_volume_is_false_without_a_selected_source(tmp_path):
+    assert default_is_source_volume(tmp_path, source_path=None) is False
+
+
+def test_default_is_source_volume_is_true_when_on_the_same_device(tmp_path):
+    source_path = tmp_path / "input"
+    assert default_is_source_volume(tmp_path, source_path=source_path) is True
+
+
+def test_list_destination_volumes_excludes_boot_source_and_unwritable_and_named_system_volumes(
+    tmp_path,
+):
+    volumes_root = tmp_path / "Volumes"
+    volumes_root.mkdir()
+    _make_volume(volumes_root, "Chris", {"x": b"x"})
+    _make_volume(volumes_root, "Macintosh HD", {"System": b"x"})
+    boot = _make_volume(volumes_root, "SomeBootLookalike", {"x": b"x"})
+    source = _make_volume(volumes_root, "SD_CARD_1", {"x": b"x"})
+    unwritable = _make_volume(volumes_root, "ReadOnlyDisk", {"x": b"x"})
+    unwritable.chmod(0o555)
+
+    try:
+        candidates = list_destination_volumes(
+            source_path=Path("/irrelevant/because/injected"),
+            volumes_root=volumes_root,
+            is_boot_volume=lambda path: path == boot,
+            is_source_volume=lambda path, source_path: path == source,
+        )
+    finally:
+        unwritable.chmod(0o755)
+
+    assert [c.name for c in candidates] == ["Chris"]
+
+
+def test_list_destination_volumes_reports_free_space_not_total_capacity(tmp_path):
+    volumes_root = tmp_path / "Volumes"
+    volumes_root.mkdir()
+    _make_volume(volumes_root, "Chris", {"x": b"x"})
+
+    candidates = list_destination_volumes(
+        source_path=None,
+        volumes_root=volumes_root,
+        is_boot_volume=lambda path: False,
+        is_source_volume=lambda path, source_path: False,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].name == "Chris"
+    assert candidates[0].free_bytes > 0
+
+
+def test_list_destination_volumes_returns_empty_list_when_volumes_root_missing(tmp_path):
+    assert list_destination_volumes(source_path=None, volumes_root=tmp_path / "no_such_dir") == []
+
+
+def test_list_destination_volumes_never_falls_back_to_an_excluded_disk(tmp_path):
+    """Geen automatische fallback (Fase 3.5-requirement): als de enige
+    aangesloten schijf ook de bron is, is de lijst leeg — nooit een andere,
+    minder geschikte schijf die 'toch maar' wordt aangeboden."""
+    volumes_root = tmp_path / "Volumes"
+    volumes_root.mkdir()
+    source = _make_volume(volumes_root, "SD_CARD_1", {"x": b"x"})
+
+    candidates = list_destination_volumes(
+        source_path=Path("/irrelevant/because/injected"),
+        volumes_root=volumes_root,
+        is_boot_volume=lambda path: False,
+        is_source_volume=lambda path, source_path: path == source,
+    )
+
+    assert candidates == []

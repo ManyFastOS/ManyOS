@@ -54,6 +54,16 @@ from many_ingest.ports.storage import Storage
 
 _MAX_COLLISION_ATTEMPTS = 999
 
+# De vaste map tussen storage_root (config.py's footage_subpath, resolved
+# against a chosen destination_root) en {client}/{project} — part of the
+# Project Workspace convention, not something config.yaml controls (unlike
+# footage_subpath/manifest_subpath/log_subpath). A single named constant, not
+# a literal repeated elsewhere: the desktop app's destination breadcrumb
+# (main_window.py) imports this rather than re-hardcoding "Klanten" itself,
+# so the GUI's presentation can never drift from what this function actually
+# builds on disk.
+CLIENT_FOLDER_NAME = "Klanten"
+
 
 class DestinationUnavailableError(Exception):
     """Raised at the start of a REAL run when the destination (resolved from
@@ -106,6 +116,11 @@ class AssetResult:
     outcome: AssetOutcome
     name_conflict_resolved: bool = False
     error: str | None = None
+    # Set only when content copied and verified successfully (outcome stays
+    # COPIED) but Storage.copy() couldn't fully replicate metadata (timestamps/
+    # mode/xattrs/BSD flags) — non-critical, never a reason to fail the asset.
+    # See Storage.copy()'s docstring for the failure-severity split this is from.
+    metadata_warning: str | None = None
 
 
 AssetCallback = Callable[[AssetResult], None]
@@ -251,6 +266,7 @@ class IngestService:
         destination = naive_destination
         name_conflict_resolved = False
         error: str | None = None
+        metadata_warning: str | None = None
 
         if not is_duplicate:
             # Collision check runs in dry-run too (read-only: exists + checksum of
@@ -270,7 +286,11 @@ class IngestService:
             outcome = AssetOutcome.DUPLICATE_SKIPPED
         else:
             try:
-                self._storage.copy(path, destination)
+                # Storage.copy() raises OSError only for a genuine content-copy
+                # failure; a non-critical metadata-only failure (timestamps/
+                # mode/xattrs/BSD flags) comes back as a returned warning
+                # string instead, never as an exception — see its docstring.
+                metadata_warning = self._storage.copy(path, destination)
                 destination_checksum = self._storage.checksum(destination)
             except OSError as exc:
                 outcome = AssetOutcome.FAILED_VERIFICATION
@@ -311,6 +331,7 @@ class IngestService:
             name_conflict_resolved=name_conflict_resolved,
             outcome=outcome.value,
             error=error,
+            metadata_warning=metadata_warning,
         )
 
         return AssetResult(
@@ -325,6 +346,7 @@ class IngestService:
             outcome=outcome,
             name_conflict_resolved=name_conflict_resolved,
             error=error,
+            metadata_warning=metadata_warning,
         )
 
     def _resolve_destination(self, source_checksum: str, destination: Path) -> tuple[Path, bool]:
@@ -389,7 +411,7 @@ def _build_workspace_path(
 ) -> Path:
     return (
         storage_root
-        / "Klanten"
+        / CLIENT_FOLDER_NAME
         / client
         / project
         / f"{recording_date.isoformat()}_Raw"

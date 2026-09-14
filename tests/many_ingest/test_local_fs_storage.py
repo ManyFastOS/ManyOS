@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shutil
+
 import pytest
 
 from many_ingest.adapters.local_fs_storage import LocalFilesystemStorage
@@ -46,6 +48,66 @@ def test_copy_creates_destination_dirs_and_preserves_content_and_source(tmp_path
 
     assert destination.read_bytes() == b"payload"
     assert source.exists()  # copy-only in v0.1 — bron blijft altijd onaangeroerd
+
+
+def test_copy_returns_none_when_metadata_replication_succeeds(tmp_path):
+    """Normal case — content and metadata both replicate fine, no warning."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    destination = tmp_path / "destination.bin"
+
+    storage = LocalFilesystemStorage()
+    warning = storage.copy(source, destination)
+
+    assert warning is None
+    assert destination.read_bytes() == b"payload"
+
+
+def test_copy_raises_when_the_content_copy_itself_fails(tmp_path, monkeypatch):
+    """A genuine content-copy failure (shutil.copyfile) must still propagate
+    as OSError — it is never downgraded to a warning, only a metadata-only
+    failure (shutil.copystat, see below) is."""
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"payload")
+    destination = tmp_path / "destination.bin"
+
+    def _broken_copyfile(src, dst):
+        raise OSError("disk vol (gesimuleerd)")
+
+    monkeypatch.setattr(shutil, "copyfile", _broken_copyfile)
+    storage = LocalFilesystemStorage()
+
+    with pytest.raises(OSError, match="disk vol"):
+        storage.copy(source, destination)
+    assert not destination.exists()
+
+
+def test_copy_returns_a_warning_and_keeps_the_content_when_metadata_replication_fails(
+    tmp_path, monkeypatch
+):
+    """Regression test for the false-negative found on a real Sony camera
+    card (SONYCARD.IND — exFAT `uchg`/immutable flag): shutil.copystat()'s
+    final os.chflags() step can raise EPERM even though the byte content was
+    already copied successfully just before it. Reproduced here via a
+    monkeypatched shutil.copystat instead of depending on real exFAT
+    hardware, so this is deterministic and portable."""
+    source = tmp_path / "input" / "SONYCARD.IND"
+    source.parent.mkdir()
+    source.write_bytes(b"")
+    destination = tmp_path / "output" / "SONYCARD.IND"
+
+    def _broken_copystat(src, dst, *, follow_symlinks=True):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(shutil, "copystat", _broken_copystat)
+    storage = LocalFilesystemStorage()
+
+    warning = storage.copy(source, destination)
+
+    assert warning is not None
+    assert "metadata" in warning.lower()
+    assert destination.exists()
+    assert destination.read_bytes() == b""  # content gekopieerd ondanks de metadata-fout
 
 
 def test_exists_reflects_real_filesystem_state(tmp_path):

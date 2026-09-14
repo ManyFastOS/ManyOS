@@ -28,6 +28,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from many_ingest.desktop.main_window import MainWindow
+from many_ingest.desktop.volumes import DestinationInfo
 
 
 def main() -> None:
@@ -38,11 +39,11 @@ def main() -> None:
     input_dir.mkdir(exist_ok=True)
     for i in range(20):
         (input_dir / f"C{i:04d}.MP4").write_bytes(b"x" * 2_000_000)
+    destination_root = tmp_dir / "destination"
+    destination_root.mkdir(exist_ok=True)
     config_path = tmp_dir / "config.yaml"
     config_path.write_text(
-        f"storage_root: {tmp_dir / 'storage'}\n"
-        f"manifest_path: {tmp_dir / 'asset_schema.json'}\n"
-        f"log_dir: {tmp_dir / 'logs'}\n"
+        "footage_subpath: storage\nmanifest_subpath: asset_schema.json\nlog_subpath: logs\n"
     )
     camera_profiles_path = (
         Path(__file__).resolve().parents[2]
@@ -53,13 +54,19 @@ def main() -> None:
     )
 
     window = MainWindow(
-        detect_volumes=lambda: [], config_path=config_path, camera_profiles_path=camera_profiles_path
+        detect_volumes=lambda: [],
+        detect_destinations=lambda source_path: [DestinationInfo(
+            name="TestDisk", path=destination_root, free_bytes=1_000_000_000
+        )],
+        config_path=config_path,
+        camera_profiles_path=camera_profiles_path,
     )
     app.aboutToQuit.connect(window._wait_for_preview_to_stop)
     app.aboutToQuit.connect(window._wait_for_ingest_to_stop)
     window._set_manual_source(input_dir)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer")
+    window.destination_cards()[0].click()  # nodig: _start_preview() vereist een gekozen bestemming
 
     def run_scenario() -> None:
         # 1. start

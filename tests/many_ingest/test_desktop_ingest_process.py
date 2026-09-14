@@ -15,6 +15,13 @@ import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# Fase 3.5's same-physical-device safety rule is real (see
+# device_identity.py) — but every test here necessarily uses one tmp_path
+# for both source and destination (no portable way to fake a second real
+# device, see ingest_worker.py's module comment). QProcess inherits this
+# process's environment by default, so setting it here propagates to every
+# worker subprocess these tests spawn.
+os.environ.setdefault("MANY_INGEST_ALLOW_SAME_DEVICE_FOR_TESTS", "1")
 
 import pytest
 
@@ -42,9 +49,7 @@ def qapp():
 def _write_config(tmp_path: Path) -> Path:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        f"storage_root: {tmp_path / 'storage'}\n"
-        f"manifest_path: {tmp_path / 'asset_schema.json'}\n"
-        f"log_dir: {tmp_path / 'logs'}\n"
+        "footage_subpath: storage\nmanifest_subpath: asset_schema.json\nlog_subpath: logs\n"
     )
     return config_path
 
@@ -117,6 +122,7 @@ def test_real_ingest_via_runner_reports_progress_and_a_reconstructed_summary(qap
         input_dir,
         "Nike",
         "Zomer",
+        destination_root=tmp_path,
         on_progress=collector.on_progress,
         on_completed=collector.on_completed,
         on_failed=collector.on_failed,
@@ -156,6 +162,7 @@ def test_cancel_stops_a_real_ingest_gracefully(qapp, tmp_path):
         input_dir,
         "Nike",
         "Zomer",
+        destination_root=tmp_path,
         on_progress=_on_progress,
         on_completed=collector.on_completed,
         on_failed=collector.on_failed,
@@ -192,6 +199,7 @@ def test_preview_via_runner_reports_progress_and_a_reconstructed_summary(qapp, t
         input_dir,
         "Nike",
         "Zomer",
+        destination_root=tmp_path,
         on_progress=collector.on_progress,
         on_completed=collector.on_completed,
         on_failed=collector.on_failed,
@@ -231,6 +239,7 @@ def test_cancel_stops_a_preview_gracefully(qapp, tmp_path):
         input_dir,
         "Nike",
         "Zomer",
+        destination_root=tmp_path,
         on_progress=_on_progress,
         on_completed=collector.on_completed,
         on_failed=collector.on_failed,
@@ -257,6 +266,7 @@ def test_worker_crash_emits_failed_and_never_raises(qapp, tmp_path):
         tmp_path,
         "Nike",
         "Zomer",
+        destination_root=tmp_path,
         config_path=tmp_path / "config.yaml",
         camera_profiles_path=tmp_path / "profiles.yaml",
         _command_override=[
@@ -287,6 +297,7 @@ def test_preview_worker_crash_emits_failed_and_never_raises(qapp, tmp_path):
         tmp_path,
         "Nike",
         "Zomer",
+        destination_root=tmp_path,
         config_path=tmp_path / "config.yaml",
         camera_profiles_path=tmp_path / "profiles.yaml",
         dry_run=True,
@@ -311,6 +322,7 @@ def test_worker_that_never_starts_emits_failed(qapp, tmp_path):
         tmp_path,
         "Nike",
         "Zomer",
+        destination_root=tmp_path,
         config_path=tmp_path / "config.yaml",
         camera_profiles_path=tmp_path / "profiles.yaml",
         _command_override=["/pad/dat/gegarandeerd/niet/bestaat/many-ingest-worker"],
@@ -329,6 +341,7 @@ def test_cancel_escalates_to_kill_when_sigterm_is_ignored(qapp, monkeypatch, tmp
         tmp_path,
         "Nike",
         "Zomer",
+        destination_root=tmp_path,
         config_path=tmp_path / "config.yaml",
         camera_profiles_path=tmp_path / "profiles.yaml",
         _command_override=[
@@ -354,6 +367,7 @@ def test_a_json_line_split_across_two_reads_is_parsed_correctly(qapp, tmp_path):
         tmp_path,
         "Nike",
         "Zomer",
+        destination_root=tmp_path,
         config_path=tmp_path / "config.yaml",
         camera_profiles_path=tmp_path / "profiles.yaml",
         _command_override=[sys.executable, "--version"],  # nooit echt aangesproken in deze test
@@ -378,6 +392,7 @@ def test_two_complete_events_in_one_read_are_both_parsed(qapp, tmp_path):
         tmp_path,
         "Nike",
         "Zomer",
+        destination_root=tmp_path,
         config_path=tmp_path / "config.yaml",
         camera_profiles_path=tmp_path / "profiles.yaml",
         _command_override=[sys.executable, "--version"],
@@ -403,6 +418,7 @@ def test_an_unparsable_line_is_ignored_not_a_crash(qapp, tmp_path):
         tmp_path,
         "Nike",
         "Zomer",
+        destination_root=tmp_path,
         config_path=tmp_path / "config.yaml",
         camera_profiles_path=tmp_path / "profiles.yaml",
         _command_override=[sys.executable, "--version"],

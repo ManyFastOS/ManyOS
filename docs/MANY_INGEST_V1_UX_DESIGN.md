@@ -130,8 +130,14 @@ ManyFast Asset Schema.
 
 **"Geschikte schijf"-heuristiek (beschrijvend, geen code):** een aangesloten,
 externe (niet-systeem-)schijf die niet leeg is en niet al herkend is als iets anders
-(bijv. een Time Machine-back-updisk) — en nooit de schijf die zelf de bestemming
-(`storage_root`) is, want die kan per ongeluk ook aangesloten zijn.
+(bijv. een Time Machine-back-updisk).
+
+**Bijgewerkt voor Fase 3.5 (2026-09-14):** er is geen vaste `storage_root` meer om
+hier op voorhand uit te sluiten — ManyFast gebruikt meerdere, per ingest wisselende
+bestemmingsschijven (zie `CLAUDE.md`). De uitsluiting werkt sindsdien andersom en pas
+één stap later: ná het kiezen van de bronschijf, sluit de bestemmingskeuzelijst (zie
+10.2/10.3) juist de gekozen bronschijf uit — nooit omgekeerd, en altijd op
+fysieke-apparaatidentiteit (`device_identity.py`, `st_dev`), niet op naam.
 
 **Gedrag:**
 - **Eén geschikte schijf gevonden** → de app opent direct op het Ready-scherm, met
@@ -359,6 +365,12 @@ zie de kanttekening in hoofdstuk 4) — nergens anders.
 ```
 
 ### 10.2 Eén geschikte schijf gevonden → direct door naar Ready
+
+**Bijgewerkt voor Fase 3.5:** dit wireframe toont de brondetectie; het kiezen van de
+*bestemmingsschijf* is sindsdien altijd een eigen, expliciete stap ná dit scherm (de
+GUI heeft nooit een vaste bestemming om automatisch aan te nemen) — zie
+`docs/MANY_INGEST_STORAGE_LAYOUT.md` sectie 2 voor hoe die keuze runtime tot stand
+komt.
 ```
 ┌─────────────────────────────────────┐
 │  [icoon: schijf] SD_CARD_1  Andere schijf →│
@@ -535,6 +547,17 @@ autocomplete en dedupe-bevestiging (10.4), laatst-gebruikt-voorstel.
 Start-knop (geen modal, zie hoofdstuk 5), voortgangsscherm met snelheid/resterende
 tijd (10.6), annuleren met bevestiging, de "veel fouten op rij"-veiligheidsstop.
 
+**Fase 3.5 — Dynamic Destination Selection** (2026-09-14, ingevoegd ná praktijkbugs)
+Een expliciete bestemmingsschijf-kiezer tussen Klant/Project en Preview (ManyFast
+bleek meerdere, per ingest wisselende bestemmingsschijven te gebruiken, niet één
+vaste `storage_root`); config wordt relatief (`footage_subpath`/`manifest_subpath`/
+`log_subpath`, geen schijf erin); `--destination` wordt verplicht op de CLI, geen
+legacy-fallback; en de harde safety rule dat bron en bestemming nooit dezelfde
+fysieke schijf mogen zijn (`device_identity.py`, vergeleken via `st_dev`, als
+gedeelde safety-net in GUI/CLI/worker). Zie `CLAUDE.md`'s "Architectural decisions
+already locked in" voor de volledige beslissing en `MANY_INGEST_STORAGE_LAYOUT.md`
+voor de nieuwe configvorm.
+
 **Fase 4 — Rapportage**
 Klaar-scherm in beide varianten (10.7/10.8), veilig-verwijderen-knop gekoppeld aan
 `safe_to_delete_source`, rapport-detailweergave.
@@ -551,11 +574,15 @@ editorniveau (10.9) en geavanceerd/beheerderniveau (10.10).
 **Bewust niet gepland, apart te beslissen:**
 - Automatische app-launch bij het aansluiten van een schijf (vereist een
   achtergronddienst — botst met de vastgelegde "geen daemon"-regel).
-- **In-app bewerkbare opslaglocatie.** Voor v1 is dit veld in de app altijd
-  alleen-lezen (zie 10.10) — er is vandaag geen schrijffunctie voor configuratie,
-  alleen een leesfunctie (hoofdstuk 12). Een editeerbare versie is een bewuste,
-  latere fase, met een eigen afweging over hoe dat veilig moet, niet iets dat er
-  terloops bij komt.
+- **In-app bewerkbare configuratie (de relatieve mapstructuur zelf).** Sinds
+  Fase 3.5 kiest de editor per ingest wél welke fysieke schijf de bestemming is (dat
+  is geen configuratie-wijziging, maar een runtime-keuze, zie Fase 3.5 hierboven) —
+  maar de *relatieve* structuur daaronder (`footage_subpath`/`manifest_subpath`/
+  `log_subpath` in `ingest_config.yaml`) blijft in v1 alleen-lezen in de app, precies
+  zoals hier al was vastgelegd. Er is nog steeds geen schrijffunctie voor die
+  configuratie (hoofdstuk 12). Een editeerbare versie daarvan is een bewuste, latere
+  fase, met een eigen afweging over hoe dat veilig moet, niet iets dat er terloops bij
+  komt.
 - Alle AI-uitbreidingen (clip-thumbnails, tagging, transcriptie) — horen bij een
   latere Asset Intelligence-module, niet bij Many Ingest Desktop v1.0.
 
@@ -563,17 +590,21 @@ editorniveau (10.9) en geavanceerd/beheerderniveau (10.10).
 
 ## 12. Wat aan de engine ongewijzigd blijft
 
-Ter bevestiging, niet ter herhaling van eerdere analyse: `IngestService.run()`,
-classificatie, `Storage`/`Manifest`-adapters, `IngestSummary`/`render_report()`,
+Ter bevestiging, niet ter herhaling van eerdere analyse: classificatie,
+`Storage`/`Manifest`-adapters, `IngestSummary`/`render_report()`,
 `ProgressUpdate`/`progress_callback` en de JSON-lines-log blijven exact zoals ze zijn.
 De enige additieve uitbreiding die dit ontwerp vereist, is een leesmethode op de
 `Manifest`-interface om bekende klant/project-combinaties op te vragen (hoofdstuk 2)
 — een kleine, additieve interface-uitbreiding, geen herontwerp, in lijn met hoe
 `Storage`/`Manifest` in dit project al eerder zijn uitgebreid.
 
-Ook `config.py` blijft ongewijzigd: het bevat vandaag alleen functies om configuratie
-te *lezen* (`load_ingest_config`, `load_camera_profiles`), geen functie om
-configuratie te *schrijven*. Dat is de reden dat de opslaglocatie in Instellingen
-(10.10) in v1 alleen-lezen is — een in-app "Wijzigen"-knop zou een nieuwe
-schrijffunctie vereisen die nu nog niet bestaat, en die bewust geen deel uitmaakt van
-dit ontwerp (zie hoofdstuk 11).
+**Bijgewerkt voor Fase 3.5:** `IngestService.run()` kreeg wél één kleine, gerichte
+toevoeging — een preflight-check die faalt met een duidelijke `DestinationUnavailableError`
+als de gekozen bestemmingsschijf niet beschrijfbaar is — geen herontwerp van de
+run-methode zelf. En `config.py` is niet langer ongewijzigd: naast de bestaande
+leesfuncties (`load_camera_profiles`) bevat het sinds Fase 3.5 ook
+`load_storage_layout`/`resolve_ingest_config`, die de relatieve configstructuur
+combineren met de per ingest gekozen `destination_root` tot een `IngestConfig` — nog
+steeds puur lezend (geen schrijffunctie), dus de kern van deze paragraaf (de
+opslaglocatie is in Instellingen (10.10) alleen-lezen, precies zoals hierboven in
+hoofdstuk 11 toegelicht) blijft overeind.

@@ -15,16 +15,31 @@ Python logic.
 All tests use small, synthetic, temporary files (a few bytes/KB of fake
 "video" data) — never real production footage, per this round's testing
 rules.
+
+Fase 3.5 (Dynamic Destination Selection): `tmp_path` itself is used as the
+`--destination` for every test here — config.yaml only holds the relative
+layout (`footage_subpath`/`manifest_subpath`/`log_subpath`, see config.py),
+resolved against that destination_root. This keeps every existing path
+assertion below unchanged (`tmp_path / "storage" / ...` etc.) — only the
+config's own content and the worker command changed shape.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import signal
 import subprocess
 import sys
 from pathlib import Path
+
+# Test-only: pytest's tmp_path is always one physical device (no portable way
+# to fake a second one without real external hardware — see
+# ingest_worker.py). Every test here uses tmp_path for both source and
+# destination, so this must be set for every test EXCEPT the ones that
+# specifically prove the same-device rejection itself.
+_ALLOW_SAME_DEVICE_ENV = {"MANY_INGEST_ALLOW_SAME_DEVICE_FOR_TESTS": "1"}
 
 CAMERA_PROFILES_PATH = (
     Path(__file__).resolve().parents[2]
@@ -38,15 +53,19 @@ CAMERA_PROFILES_PATH = (
 def _write_config(tmp_path: Path) -> Path:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        f"storage_root: {tmp_path / 'storage'}\n"
-        f"manifest_path: {tmp_path / 'asset_schema.json'}\n"
-        f"log_dir: {tmp_path / 'logs'}\n"
+        "footage_subpath: storage\nmanifest_subpath: asset_schema.json\nlog_subpath: logs\n"
     )
     return config_path
 
 
 def _worker_command(
-    source: Path, client: str, project: str, config_path: Path, *, dry_run: bool = False
+    source: Path,
+    client: str,
+    project: str,
+    config_path: Path,
+    *,
+    destination_root: Path,
+    dry_run: bool = False,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -58,6 +77,8 @@ def _worker_command(
         client,
         "--project",
         project,
+        "--destination",
+        str(destination_root),
         "--config",
         str(config_path),
         "--camera-profiles",
@@ -77,15 +98,31 @@ def _run_worker(
     client: str = "Nike",
     project: str = "Zomer",
     config_path: Path | None = None,
+    destination_root: Path | None = None,
     dry_run: bool = False,
     timeout: int = 30,
+    allow_same_device: bool = True,
 ):
     config_path = config_path or _write_config(tmp_path)
+    destination_root = destination_root or tmp_path
+    # Expliciet verwijderen, niet alleen "niet toevoegen": andere testmodules
+    # in dezelfde pytest-sessie kunnen dit via os.environ.setdefault(...) al
+    # in het GEDEELDE procesomgeving hebben gezet (env-vars zijn proces-breed,
+    # niet per testmodule) — alleen weglaten uit een nieuw dict zou die
+    # eerder gezette waarde niet ongedaan maken.
+    env = dict(os.environ)
+    if allow_same_device:
+        env.update(_ALLOW_SAME_DEVICE_ENV)
+    else:
+        env.pop("MANY_INGEST_ALLOW_SAME_DEVICE_FOR_TESTS", None)
     result = subprocess.run(
-        _worker_command(source, client, project, config_path, dry_run=dry_run),
+        _worker_command(
+            source, client, project, config_path, destination_root=destination_root, dry_run=dry_run
+        ),
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
     lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     return result, lines
@@ -285,10 +322,11 @@ def test_cancel_via_sigterm_stops_gracefully_and_reports_ingest_cancelled(tmp_pa
     config_path = _write_config(tmp_path)
 
     process = subprocess.Popen(
-        _worker_command(input_dir, "Nike", "Zomer", config_path),
+        _worker_command(input_dir, "Nike", "Zomer", config_path, destination_root=tmp_path),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=dict(os.environ, **_ALLOW_SAME_DEVICE_ENV),
     )
     lines: list[dict] = []
     try:
@@ -317,6 +355,110 @@ def test_cancel_via_sigterm_stops_gracefully_and_reports_ingest_cancelled(tmp_pa
     assert process.returncode == 2
 
 
+# -- Fase 3.5: destination-schijf --------------------------------------------------
+
+
+def test_worker_rejects_source_and_destination_on_the_same_physical_device(tmp_path):
+    """De harde safety rule (device_identity.py): bron en bestemming mogen
+    nooit dezelfde fysieke schijf zijn. `tmp_path` is hier bewust zowel de
+    ouder van de bron als de --destination — op één lokaal filesystem dus
+    hetzelfde st_dev, wat exact is wat dit moet blokkeren."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+    config_path = _write_config(tmp_path)
+
+    result, lines = _run_worker(
+        tmp_path,
+        input_dir,
+        config_path=config_path,
+        destination_root=tmp_path,
+        allow_same_device=False,
+    )
+
+    assert result.returncode == 1
+    failed = next(line for line in lines if line["event"] == "ingest_failed")
+    assert "dezelfde fysieke schijf" in failed["message"]
+    assert not (tmp_path / "storage").exists()
+
+
+def test_worker_rejects_same_device_for_dry_run_too(tmp_path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+    config_path = _write_config(tmp_path)
+
+    result, lines = _run_worker(
+        tmp_path,
+        input_dir,
+        config_path=config_path,
+        destination_root=tmp_path,
+        dry_run=True,
+        allow_same_device=False,
+    )
+
+    assert result.returncode == 1
+    failed = next(line for line in lines if line["event"] == "ingest_failed")
+    assert "dezelfde fysieke schijf" in failed["message"]
+
+
+def test_destination_unavailable_gives_a_destination_specific_message_for_a_real_run(tmp_path):
+    """Fase 3.5's DestinationUnavailableError moet een melding geven die de
+    BESTEMMING noemt, niet de bron — het exacte, eerder gevonden mislabeling-
+    probleem, nu structureel gefixt via een aparte except-tak in
+    ingest_worker.py."""
+    real_source_parent = tmp_path / "source_disk"
+    real_source_parent.mkdir()
+    input_dir = real_source_parent / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+    destination_root = tmp_path / "destination_disk"
+    destination_root.mkdir()
+    destination_root.chmod(0o555)  # onbereikbaar voor schrijven
+    config_path = _write_config(tmp_path)
+    try:
+        result, lines = _run_worker(
+            tmp_path, input_dir, config_path=config_path, destination_root=destination_root
+        )
+    finally:
+        destination_root.chmod(0o755)
+
+    assert "Traceback" not in result.stdout
+    assert "Traceback" not in result.stderr
+    failed = next(line for line in lines if line["event"] == "ingest_failed")
+    assert "bestemmingsschijf" in failed["message"]
+    assert result.returncode == 1
+
+
+def test_destination_unavailable_does_not_block_a_preview(tmp_path):
+    real_source_parent = tmp_path / "source_disk"
+    real_source_parent.mkdir()
+    input_dir = real_source_parent / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+    destination_root = tmp_path / "destination_disk"
+    destination_root.mkdir()
+    destination_root.chmod(0o555)
+    config_path = _write_config(tmp_path)
+    try:
+        result, lines = _run_worker(
+            tmp_path,
+            input_dir,
+            config_path=config_path,
+            destination_root=destination_root,
+            dry_run=True,
+        )
+    finally:
+        destination_root.chmod(0o755)
+
+    assert result.returncode == 0, result.stderr
+    completed = next(line for line in lines if line["event"] == "ingest_completed")
+    assert completed["dry_run"] is True
+    assert completed["total_files"] == 1
+
+
 # -- preview / --dry-run: same worker, same protocol, nothing written -------------
 
 
@@ -334,6 +476,71 @@ def test_dry_run_worker_completes_without_copying_anything(tmp_path):
     assert completed["total_files"] == 1
     # Het hele punt van een preview: niets wordt geschreven.
     assert not (tmp_path / "storage").exists()
+
+
+def test_dry_run_succeeds_over_the_real_worker_when_log_dir_is_unreachable(tmp_path):
+    """End-to-end regression test (real subprocess, real JSON-lines) for the
+    manual-testing bug: a readable source must produce a successful preview
+    even when the destination's log_dir can't be reached — see
+    test_ingest_service.py's equivalent for the engine-level proof; this
+    proves the same thing through the actual worker boundary. Here
+    `storage_subpath`/`manifest_subpath` stay reachable but `log_subpath`
+    resolves into a directory whose parent is read-only."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+    unreachable_parent = tmp_path / "unreachable"
+    unreachable_parent.mkdir()
+    unreachable_parent.chmod(0o555)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "footage_subpath: storage\n"
+        "manifest_subpath: asset_schema.json\n"
+        "log_subpath: unreachable/logs\n"
+    )
+    try:
+        result, lines = _run_worker(tmp_path, input_dir, config_path=config_path, dry_run=True)
+    finally:
+        unreachable_parent.chmod(0o755)
+
+    assert result.returncode == 0, result.stderr
+    assert "Traceback" not in result.stdout
+    completed = next(line for line in lines if line["event"] == "ingest_completed")
+    assert completed["dry_run"] is True
+    assert completed["total_files"] == 1
+    assert not (unreachable_parent / "logs").exists()  # dry-run schreef niets naar log_dir
+
+
+def test_real_ingest_shows_a_friendly_message_not_a_crash_when_log_dir_is_unreachable(tmp_path):
+    """A real ingest still genuinely needs to write to log_dir, so it must
+    still fail — cleanly, never a crash or a raw stacktrace — when the
+    destination isn't reachable. Only the dry-run/preview path was fixed.
+    (storage_subpath is reachable here — this exercises ActionLogger's own
+    mkdir specifically, not the new destination-root pre-flight check.)"""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+    unreachable_parent = tmp_path / "unreachable"
+    unreachable_parent.mkdir()
+    unreachable_parent.chmod(0o555)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "footage_subpath: storage\n"
+        "manifest_subpath: asset_schema.json\n"
+        "log_subpath: unreachable/logs\n"
+    )
+    try:
+        result, lines = _run_worker(tmp_path, input_dir, config_path=config_path)  # dry_run=False
+    finally:
+        unreachable_parent.chmod(0o755)
+
+    assert "Traceback" not in result.stdout
+    assert "Traceback" not in result.stderr
+    failed = next(line for line in lines if line["event"] == "ingest_failed")
+    assert failed["message"]
+    assert result.returncode == 1
 
 
 def test_dry_run_worker_reports_the_corrected_duplicate_count(tmp_path):
@@ -386,10 +593,13 @@ def test_dry_run_cancel_via_sigterm_stops_gracefully_and_reports_ingest_cancelle
     config_path = _write_config(tmp_path)
 
     process = subprocess.Popen(
-        _worker_command(input_dir, "Nike", "Zomer", config_path, dry_run=True),
+        _worker_command(
+            input_dir, "Nike", "Zomer", config_path, destination_root=tmp_path, dry_run=True
+        ),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=dict(os.environ, **_ALLOW_SAME_DEVICE_ENV),
     )
     lines: list[dict] = []
     try:

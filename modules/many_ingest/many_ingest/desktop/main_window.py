@@ -50,7 +50,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from many_ingest.core.ingest_service import ProgressUpdate
+from many_ingest.config import load_storage_layout
+from many_ingest.core.ingest_service import CLIENT_FOLDER_NAME, ProgressUpdate
 from many_ingest.core.report import IngestSummary
 from many_ingest.desktop import ingest_process
 from many_ingest.desktop.volumes import (
@@ -119,9 +120,14 @@ _SAFETY_STOP_THRESHOLD = 5
 _ETA_MIN_SAMPLES = 2
 _ETA_MIN_ELAPSED_SECONDS = 1.0
 
-# Vaste naam van de organisatie in de bestemmings-breadcrumb (Bestemming →
-# ManyFast → klant → project) — geen configwaarde, geen storage_root: dit is
-# altijd hetzelfde omdat dit ManyFast's eigen tool is (zie CLAUDE.md).
+# Fallback voor de bestemmings-breadcrumb, alleen gebruikt als config.yaml
+# (net als voor een echte ingest) niet gelezen kan worden — nooit de
+# primaire bron. De normale breadcrumb-niveaus tussen de gekozen schijf en
+# klant/project komen uit StorageLayout's footage_subpath (config.py) plus
+# CLIENT_FOLDER_NAME (core/ingest_service.py), zie
+# _footage_subpath_labels()/_destination_breadcrumb_lines() hieronder — nooit
+# hier opnieuw hardcoded, zodat de breadcrumb niet kan afwijken van de
+# werkelijke, door de engine aangemaakte structuur (zie CLAUDE.md).
 DESTINATION_ORG_LABEL = "ManyFast"
 
 SECTION_SOURCE = "Bron"
@@ -978,13 +984,37 @@ class MainWindow(QWidget):
             layout.addWidget(line_label)
         layout.addSpacing(14)
 
+    def _footage_subpath_labels(self) -> tuple[str, ...]:
+        """The fixed breadcrumb levels between the chosen destination disk
+        and the client — sourced from StorageLayout's `footage_subpath`
+        (config.yaml, see config.py's `load_storage_layout`), never
+        hardcoded here. Found via a real user report (2026-09-14): the
+        breadcrumb used to show only `ManyFast`, skipping the real
+        `Footage`/`Klanten` levels the engine actually creates
+        (`resolve_ingest_config`/`_build_workspace_path`), so a manually
+        browsing user couldn't find the project folder where the GUI implied
+        it would be. Reading config.yaml here is presentation-only — it
+        changes nothing about how the engine resolves the real destination;
+        the worker process still does that independently. A read failure
+        (missing/invalid config.yaml) falls back to the single legacy label
+        rather than breaking the preview/report screen over it — this is a
+        cosmetic breadcrumb, not the safety-critical path (that's the
+        worker's own config validation, unchanged)."""
+        try:
+            layout = load_storage_layout(self._config_path)
+        except (OSError, ValueError):
+            return (DESTINATION_ORG_LABEL,)
+        return layout.footage_subpath.parts
+
     def _destination_breadcrumb_lines(self, summary: IngestSummary) -> list[str]:
         """Bestemming in mensentaal (Fase 3.5, requirement 8): welke schijf,
-        de vaste ManyFast/klant/project-structuur, en de vrije ruimte op die
-        schijf — nooit een technisch bestandspad (Design Language hoofdstuk
-        15). Werkt voor zowel de preview als het eindrapport: beide roepen
-        dit aan terwijl `self._confirmed_preview_input` nog de bestemming
-        van déze run draagt (zie _on_ingest_completed's volgorde)."""
+        de werkelijke folderstructuur tot aan klant/project (StorageLayout's
+        footage_subpath + CLIENT_FOLDER_NAME, zie _footage_subpath_labels()
+        hierboven), en de vrije ruimte op die schijf — nooit een technisch
+        bestandspad (Design Language hoofdstuk 15). Werkt voor zowel de
+        preview als het eindrapport: beide roepen dit aan terwijl
+        `self._confirmed_preview_input` nog de bestemming van déze run
+        draagt (zie _on_ingest_completed's volgorde)."""
         lines: list[str] = []
         destination = (
             self._confirmed_preview_input.destination
@@ -993,7 +1023,8 @@ class MainWindow(QWidget):
         )
         if destination is not None:
             lines.append(destination.name)
-        lines += [DESTINATION_ORG_LABEL, summary.client, summary.project]
+        lines += list(self._footage_subpath_labels())
+        lines += [CLIENT_FOLDER_NAME, summary.client, summary.project]
         if destination is not None:
             lines.append(f"{format_size(destination.free_bytes)} vrij")
         return lines

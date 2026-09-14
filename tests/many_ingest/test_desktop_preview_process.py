@@ -22,6 +22,12 @@ import sys
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# Fase 3.5's same-physical-device safety rule is real (see
+# device_identity.py) — but every test here necessarily uses one tmp_path
+# for both source and destination (no portable way to fake a second real
+# device). QProcess inherits this process's environment by default, so
+# setting it here propagates to every worker subprocess these tests spawn.
+os.environ.setdefault("MANY_INGEST_ALLOW_SAME_DEVICE_FOR_TESTS", "1")
 
 import pytest
 
@@ -31,6 +37,7 @@ from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtWidgets import QApplication
 
 from many_ingest.desktop.main_window import PREVIEW_TITLE_TEXT, START_INGEST_BUTTON_TEXT, MainWindow
+from many_ingest.desktop.volumes import DestinationInfo
 
 CAMERA_PROFILES_PATH = (
     Path(__file__).resolve().parents[2]
@@ -49,11 +56,13 @@ def qapp():
 def _write_config(tmp_path: Path) -> Path:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        f"storage_root: {tmp_path / 'storage'}\n"
-        f"manifest_path: {tmp_path / 'asset_schema.json'}\n"
-        f"log_dir: {tmp_path / 'logs'}\n"
+        "footage_subpath: storage\nmanifest_subpath: asset_schema.json\nlog_subpath: logs\n"
     )
     return config_path
+
+
+def _detect_destinations(tmp_path):
+    return lambda source_path: [DestinationInfo(name="TestDisk", path=tmp_path, free_bytes=1_000_000_000)]
 
 
 def _run_preview_and_wait(window: MainWindow, timeout_ms: int = 15_000) -> None:
@@ -85,9 +94,13 @@ def test_repeated_real_previews_in_a_row_do_not_crash(qapp, tmp_path):
     config_path = _write_config(tmp_path)
 
     window = MainWindow(
-        detect_volumes=lambda: [], config_path=config_path, camera_profiles_path=CAMERA_PROFILES_PATH
+        detect_volumes=lambda: [],
+        detect_destinations=_detect_destinations(tmp_path / "destination"),
+        config_path=config_path,
+        camera_profiles_path=CAMERA_PROFILES_PATH,
     )
     window._set_manual_source(input_dir)
+    window.destination_cards()[0].click()
 
     for i in range(10):
         window.client_input().setText("Nike")
@@ -115,11 +128,15 @@ def test_real_preview_followed_by_a_real_start_ingest_completes_both(qapp, tmp_p
     config_path = _write_config(tmp_path)
 
     window = MainWindow(
-        detect_volumes=lambda: [], config_path=config_path, camera_profiles_path=CAMERA_PROFILES_PATH
+        detect_volumes=lambda: [],
+        detect_destinations=_detect_destinations(tmp_path / "destination"),
+        config_path=config_path,
+        camera_profiles_path=CAMERA_PROFILES_PATH,
     )
     window._set_manual_source(input_dir)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer")
+    window.destination_cards()[0].click()
     window.choose_button().click()
 
     _run_preview_and_wait(window)
@@ -139,7 +156,7 @@ def test_real_preview_followed_by_a_real_start_ingest_completes_both(qapp, tmp_p
     loop.exec()
 
     assert window._ingest_runner is None, "de echte ingest is niet op tijd afgerond"
-    copied = list((tmp_path / "storage").rglob("DJI_0001.MP4"))
+    copied = list((tmp_path / "destination" / "storage").rglob("DJI_0001.MP4"))
     assert len(copied) == 1
 
     window.close()

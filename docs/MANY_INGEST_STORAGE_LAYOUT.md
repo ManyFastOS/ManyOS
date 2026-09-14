@@ -1,22 +1,30 @@
 # Many Ingest — Opslagstructuur voor externe SSD/NAS
 
-**Status:** Ontwerpvoorstel — nog geen code/config aangepast
+**Status:** Geïmplementeerd (Fase 3.5 — Dynamic Destination Selection, 2026-09-14)
 **Rol:** CTO ManyFast
-**Datum:** 2026-08-03
-**Aanleiding:** de huidige `config/ingest_config.example.yaml` wijst naar
-`~/ManyFast/Ingest` — lokale Mac-opslag. Dat is expliciet niet wat ManyFast wil.
+**Datum:** 2026-08-03, bijgewerkt 2026-09-14
+**Aanleiding (bijgewerkt):** ManyFast bleek in de praktijk niet één vaste
+bestemmingsschijf te gebruiken, maar meerdere externe schijven, per ingest
+verschillend. Een vaste `storage_root: "/Volumes/<naam>/..."` in config.yaml (het
+oorspronkelijke voorstel hieronder) veroorzaakte een echte bug: een ingest faalde
+omdat config.yaml naar een specifieke schijf wees die die dag niet aangesloten was.
+**De mapstructuur hieronder is ongewijzigd gebleven — alleen wélke fysieke schijf de
+root van die structuur is, is sinds Fase 3.5 een runtime-keuze per ingest (GUI-
+kiezer of CLI's verplichte `--destination`), niet meer een vaste config-waarde.**
 
-Dit document beschrijft, vóórdat we ooit een niet-dry-run doen: (1) een aanbevolen
-folderstructuur op externe SSD/NAS, (2) een aangepaste `ingest_config.yaml`, en
-(3) waarom deze structuur schaalbaar is naar meerdere klanten/projecten en naar een
-toekomstige cloudmigratie.
+Dit document beschrijft: (1) de folderstructuur op elke externe SSD/NAS die als
+bestemming wordt gekozen, (2) hoe die structuur runtime tot stand komt (sectie 2), en
+(3) waarom deze schaalbaar is naar meerdere klanten/projecten, meerdere
+bestemmingsschijven, en een toekomstige cloudmigratie.
 
 ---
 
 ## 1. Aanbevolen folderstructuur
 
 ```
-{EXTERNE_ROOT}/                              bijv. /Volumes/Extreme SSD/ManyFast
+{EXTERNE_ROOT}/                              een per ingest gekozen bestemmingsschijf,
+│                                             bijv. /Volumes/Chris/ManyFast — verschilt
+│                                             per keer, staat niet in config.yaml
 ├── Footage/                                 <- klantmateriaal (storage_root)
 │   └── Klanten/
 │       ├── Nike/
@@ -57,24 +65,45 @@ de externe SSD/NAS. Niets persistents blijft op de Mac achter.
 
 ---
 
-## 2. Aangepaste `ingest_config.yaml`
+## 2. `ingest_config.yaml` — alleen de relatieve structuur, nooit een schijf
 
 ```yaml
-# ManyOS Many Ingest — lokale configuratie (v0.1)
+# ManyOS Many Ingest — lokale configuratie (v0.1, Fase 3.5)
 #
-# Alles staat op de externe SSD/NAS, bewust niets op de Mac zelf. Pas het volumepad
-# aan naar de daadwerkelijke schijfnaam/NAS-mount op de machine die dit draait —
-# die naam kan per Mac verschillen.
+# Geen schijfnaam hier — ManyFast gebruikt meerdere externe bestemmingsschijven,
+# niet één vaste. Welke fysieke schijf gebruikt wordt, kies je per ingest (GUI-
+# kiezer of --destination op de CLI). Dit bestand legt alleen de vaste, relatieve
+# mapstructuur vast die onder ELKE gekozen bestemmingsschijf wordt aangemaakt.
 
-storage_root: "/Volumes/Extreme SSD/ManyFast/Footage"
-manifest_path: "/Volumes/Extreme SSD/ManyFast/ManyOS/AssetSchema/asset_schema.json"
-log_dir: "/Volumes/Extreme SSD/ManyFast/ManyOS/Logs"
+footage_subpath: "ManyFast/Footage"
+manifest_subpath: "ManyFast/ManyOS/AssetSchema/asset_schema.json"
+log_subpath: "ManyFast/ManyOS/Logs"
 ```
 
-Geen enkel veld hoeft te veranderen in `config.py` of elders in de code — dit is
-uitsluitend een andere invulling van dezelfde drie bestaande configuratiewaarden.
-Precies zoals bedoeld: "extern zonder lokale Mac-opslag" is een config-keuze, geen
-architectuurwijziging.
+**Hoe dit runtime tot stand komt** (`config.py`, `service_factory.py`):
+`load_storage_layout(config_path)` leest deze drie relatieve subpaden (en weigert
+expliciet een absolute waarde — een leftover van het oude formaat zou anders stil
+verkeerd geïnterpreteerd worden). `resolve_ingest_config(layout, destination_root)`
+plakt ze aan de per ingest gekozen `destination_root` (het mount-pad van de fysieke
+schijf, bijv. `/Volumes/Chris`) tot precies dezelfde `IngestConfig`-vorm die
+`IngestService` al sinds v0.1 aanneemt. **`IngestService` zelf, `ActionLogger`,
+`JSONManifest` en alle adapters zijn door deze verandering niet aangeraakt** — ze
+krijgen nog steeds gewoon een kant-en-klare, absolute `IngestConfig`; alleen hoe die
+wordt samengesteld, veranderde.
+
+`destination_root` komt binnen via, en moet in beide gevallen precies hetzelfde zijn
+voor preview én de echte ingest:
+- **GUI:** een expliciete stap in de flow (Bron → Klant → Project →
+  **Bestemmingsschijf kiezen** → Preview → Start Ingest) — `desktop/volumes.py`'s
+  `list_destination_volumes()` toont aangesloten, schrijfbare externe schijven (naam
+  + vrije ruimte), met de gekozen bronschijf al uitgesloten.
+- **CLI:** een verplichte `--destination`-optie, geen terugval op een oude
+  `storage_root`-config-sleutel — één architectuur.
+
+**Harde safety rule, overal hetzelfde gecontroleerd (`device_identity.py`):** bron
+en bestemming mogen nooit dezelfde fysieke schijf zijn — vergeleken via `st_dev`,
+nooit via padstrings of volumenamen. De GUI biedt de bronschijf domweg nooit aan als
+bestemmingskeuze; CLI en worker controleren dit daarnaast zelf, als vangnet.
 
 **Kanttekening om nu al te noemen, niet later te ontdekken:** de JSON-based ManyFast
 Asset Schema heeft in v0.1 geen schrijf-locking. Zolang maar één Mac tegelijk
@@ -120,11 +149,19 @@ niet "structuur herontwerpen."
 
 ---
 
-## Openstaand vóór dit wordt toegepast
+## Historisch: wat hier openstond, en hoe het is opgelost
 
-1. Akkoord op de tweedeling `Footage/` vs `ManyOS/` en de exacte namen.
-2. Bevestigen: welke externe schijf/NAS is de daadwerkelijke primaire opslag (nu
-   getest op `/Volumes/Extreme SSD/ManyFast` — is dat ook de bedoelde definitieve
-   locatie, of komt er een NAS bij?).
-3. Pas dan: `config/ingest_config.example.yaml` daadwerkelijk aanpassen en een echte
-   (niet-dry-run) test draaien.
+De oorspronkelijke versie van dit document (2026-08-03) ging nog uit van **één**
+vaste primaire opslaglocatie, met als open vraag welke schijf/NAS dat zou worden.
+Die aanname bleek niet te kloppen met de echte ManyFast-workflow (meerdere
+bestemmingsschijven, wisselend per ingest) en is losgelaten met Fase 3.5 (2026-09-14,
+zie `CLAUDE.md`'s "Architectural decisions already locked in"): de fysieke
+bestemming is sinds dan altijd een runtime-keuze, nooit een vaste config-waarde. De
+tweedeling `Footage/` vs `ManyOS/` uit sectie 1 hierboven staat wél nog steeds vast,
+onder elke gekozen bestemmingsschijf, ongewijzigd sinds het oorspronkelijke voorstel.
+
+Elke bestaande lokale `~/.many-ingest/config.yaml` die nog een absoluut
+`storage_root`/`manifest_path`/`log_dir` bevat, moet handmatig gemigreerd worden naar
+het relatieve formaat in sectie 2 — `load_storage_layout()` geeft een duidelijke
+foutmelding (i.p.v. de oude waarde stil verkeerd te interpreteren) als dat nog niet
+gebeurd is.

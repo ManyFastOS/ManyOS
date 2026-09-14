@@ -143,6 +143,9 @@ approach when implementing this module:
   lets a future HTTP API or worker process call the same `IngestService` unchanged.
 - **Configuration is externalized** (YAML file locally) rather than hardcoded, so the
   same structure can later be backed by environment variables/a secrets manager.
+  **As of Fase 3.5, config.yaml holds only the relative storage layout**
+  (`footage_subpath`/`manifest_subpath`/`log_subpath`), never a physical disk — see
+  the Fase 3.5 entry near the end of this list.
 - **Structured (JSON-lines) logging of ingest events**, not free-text logs — this is
   meant to seed a future event bus, so log statements should be structured from the
   start rather than retrofitted.
@@ -196,3 +199,27 @@ approach when implementing this module:
   `summarize()` are the structured summary, with `render_report()` as one particular
   plain-text rendering of it. A future GUI reuses the callback and `IngestSummary`
   directly; it does not need to parse CLI output.
+- **The physical destination disk is chosen per ingest, at runtime — never a fixed
+  path in config.yaml (Fase 3.5 — Dynamic Destination Selection, decided
+  2026-09-14).** ManyFast uses several external destination disks (source media is
+  camera/SD cards, always separate from the archive disk), not one fixed one, so the
+  earlier design (a static `storage_root` in config.yaml) didn't match the real
+  workflow — confirmed by a real bug: a preview/ingest failed because config.yaml
+  still pointed at a specific disk that happened not to be the one connected that
+  day. `config.py`'s `StorageLayout` now holds only the relative
+  Footage/ManyOS/AssetSchema/Logs convention (unchanged, see
+  `docs/MANY_INGEST_STORAGE_LAYOUT.md`); `resolve_ingest_config(layout,
+  destination_root)` joins it with a `destination_root` supplied by the caller —
+  the GUI's destination picker (`desktop/volumes.py`'s `list_destination_volumes`,
+  excluding the chosen source's disk) or the CLI's required `--destination` (no
+  legacy fallback to an old absolute `storage_root` key — one architecture, not
+  two). `IngestService`/`IngestConfig` themselves are unchanged: they still just
+  receive a fully-resolved `IngestConfig` with absolute paths, exactly as before.
+  **Hard safety rule:** source and destination may never be the same physical disk
+  (`st_dev`, not a path string or volume name — see `device_identity.py`'s
+  `same_physical_device()`), enforced identically in the GUI (never offered as a
+  choice), the CLI, and the worker (defense-in-depth) — one shared implementation,
+  not three. Manifest and action log are derived from `destination_root` the same
+  way as the footage path, so each physical destination disk has its own
+  independent duplicate-detection history — a deliberate property (a "duplicate" is
+  only meaningful within one physical archive), not an accidental limitation.

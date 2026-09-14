@@ -20,6 +20,7 @@ def _asset(
     file_type: FileType = FileType.VIDEO,
     camera_profile: str = "Sony FX6",
     name_conflict_resolved: bool = False,
+    metadata_warning: str | None = None,
 ) -> AssetResult:
     return AssetResult(
         source_path=Path("/in/clip.mp4"),
@@ -32,6 +33,7 @@ def _asset(
         is_duplicate=(outcome == AssetOutcome.DUPLICATE_SKIPPED),
         outcome=outcome,
         name_conflict_resolved=name_conflict_resolved,
+        metadata_warning=metadata_warning,
     )
 
 
@@ -73,6 +75,22 @@ def test_summarize_counts_by_type_profile_and_outcome():
     assert summary.duplicates == 1
     assert summary.name_conflicts_resolved == 1
     assert summary.errors == 1
+    assert summary.metadata_warnings == 0
+
+
+def test_summarize_counts_metadata_warnings_separately_from_errors():
+    """A metadata-only warning (outcome COPIED, see ingest_service.py's
+    false-negative fix) must never be counted as an error, and must never
+    affect safe_to_delete_source — only a real failed_verification does."""
+    assets = [
+        _asset(AssetOutcome.COPIED, metadata_warning="tijden/rechten/vlaggen niet overgenomen"),
+        _asset(AssetOutcome.COPIED),
+    ]
+    summary = summarize(_report(assets, dry_run=False))
+
+    assert summary.metadata_warnings == 1
+    assert summary.errors == 0
+    assert summary.safe_to_delete_source is True
 
 
 def test_safe_to_delete_is_false_when_there_are_errors():
@@ -120,3 +138,23 @@ def test_render_report_marks_dry_run_as_not_applicable():
     assert "PREVIEW VOLTOOID" in text
     assert "N.V.T." in text
     assert "JA" not in text.split("Veilig om bronmedia te verwijderen:")[1]
+
+
+def test_render_report_shows_metadata_warnings_and_still_reports_ja_when_safe():
+    """A metadata-only warning must be visible/traceable in the report, but
+    must not turn the header into an error header or flip safe-to-delete."""
+    assets = [
+        _asset(AssetOutcome.COPIED, metadata_warning="tijden/rechten/vlaggen niet overgenomen")
+    ]
+    text = render_report(summarize(_report(assets, dry_run=False)))
+
+    assert "✅ INGEST VOLTOOID" in text
+    assert "Metadata-waarschuwingen:\n1" in text
+    assert "Veilig om bronmedia te verwijderen:\nJA" in text
+
+
+def test_render_report_omits_metadata_warnings_line_when_there_are_none():
+    assets = [_asset(AssetOutcome.COPIED)]
+    text = render_report(summarize(_report(assets, dry_run=False)))
+
+    assert "Metadata-waarschuwingen" not in text

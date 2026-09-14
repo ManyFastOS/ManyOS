@@ -20,6 +20,12 @@ import sys
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+# Fase 3.5's same-physical-device safety rule is real (see
+# device_identity.py) — but the real-QProcess tests near the bottom of this
+# file necessarily use one tmp_path for both source and destination (no
+# portable way to fake a second real device). QProcess inherits this
+# process's environment by default, so setting it here propagates down.
+os.environ.setdefault("MANY_INGEST_ALLOW_SAME_DEVICE_FOR_TESTS", "1")
 
 import pytest
 
@@ -28,7 +34,7 @@ pytest.importorskip("PySide6")
 from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtWidgets import QApplication
 
-from many_ingest.core.ingest_service import ProgressUpdate
+from many_ingest.core.ingest_service import CLIENT_FOLDER_NAME, ProgressUpdate
 from many_ingest.core.report import IngestSummary
 from many_ingest.desktop import main_window as main_window_module
 from many_ingest.desktop.main_window import (
@@ -47,7 +53,7 @@ from many_ingest.desktop.main_window import (
     START_INGEST_BUTTON_TEXT,
     MainWindow,
 )
-from many_ingest.desktop.volumes import VolumeInfo
+from many_ingest.desktop.volumes import DestinationInfo, VolumeInfo
 
 
 @pytest.fixture(scope="module")
@@ -63,6 +69,10 @@ def _volume(name: str, path, *, capacity=500_000_000_000, media_count=10, media_
         media_file_count=media_count,
         media_total_bytes=media_bytes,
     )
+
+
+def _destination(name: str, path, *, free_bytes=1_500_000_000_000) -> DestinationInfo:
+    return DestinationInfo(name=name, path=path, free_bytes=free_bytes)
 
 
 class _FakePreviewRunner:
@@ -91,6 +101,7 @@ class _CapturingStartPreview:
         client,
         project,
         *,
+        destination_root,
         on_progress,
         on_completed,
         on_failed,
@@ -105,6 +116,7 @@ class _CapturingStartPreview:
                 "source": source,
                 "client": client,
                 "project": project,
+                "destination_root": destination_root,
                 "on_progress": on_progress,
                 "on_completed": on_completed,
                 "on_failed": on_failed,
@@ -143,6 +155,7 @@ class _CapturingStartRealIngest:
         client,
         project,
         *,
+        destination_root,
         on_progress,
         on_completed,
         on_failed,
@@ -157,6 +170,7 @@ class _CapturingStartRealIngest:
                 "source": source,
                 "client": client,
                 "project": project,
+                "destination_root": destination_root,
                 "on_progress": on_progress,
                 "on_completed": on_completed,
                 "on_failed": on_failed,
@@ -196,11 +210,13 @@ def _window_with_finished_preview(qapp, tmp_path, **summary_overrides):
     ingest_starter = _CapturingStartRealIngest()
     window = MainWindow(
         detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)],
+        detect_destinations=lambda source_path: [_destination("Chris", tmp_path / "Chris")],
         start_preview=preview_starter,
         start_real_ingest=ingest_starter,
     )
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer Campagne")
+    window.destination_cards()[0].click()
     window.choose_button().click()
     preview_starter.calls[0]["on_completed"](_make_summary(dry_run=True, **summary_overrides))
     return window, preview_starter, ingest_starter
@@ -224,6 +240,8 @@ def test_start_ingest_calls_the_injected_starter_with_the_preview_input(qapp, tm
         "Nike",
         "Zomer Campagne",
     )
+    # Fase 3.5: real ingest gebruikt exact dezelfde bestemming als de preview:
+    assert call["destination_root"] == tmp_path / "Chris"
     assert window.current_message() == INGESTING_TEXT
 
 
@@ -395,6 +413,67 @@ def test_ingest_completed_with_errors_shows_bijna_klaar_and_not_safe_to_delete(q
     lines = window.preview_lines()
     assert "4" in lines
     assert SAFE_TO_DELETE_NO_TEXT in lines
+
+
+def test_ingest_report_shows_the_same_real_storage_layout_breadcrumb_as_the_preview(
+    qapp, tmp_path
+):
+    """Fase 3.5 UX fix requirement: the eindscherm (ingest report) must show
+    the exact same real-storage-layout breadcrumb as the preview — both
+    call the same _destination_breadcrumb_lines(), this proves it end to
+    end through the actual preview -> Start Ingest -> completed flow, not
+    just by reading the shared implementation."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "footage_subpath: ManyFast/Footage\n"
+        "manifest_subpath: ManyFast/ManyOS/AssetSchema/asset_schema.json\n"
+        "log_subpath: ManyFast/ManyOS/Logs\n"
+    )
+    preview_starter = _CapturingStartPreview()
+    ingest_starter = _CapturingStartRealIngest()
+    window = MainWindow(
+        detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)],
+        detect_destinations=lambda source_path: [_destination("Chris", tmp_path / "Chris")],
+        start_preview=preview_starter,
+        start_real_ingest=ingest_starter,
+        config_path=config_path,
+    )
+    window.client_input().setText("ManyOS Test")
+    window.project_input().setText("Sony Metadata Test")
+    window.destination_cards()[0].click()
+    window.choose_button().click()
+    preview_starter.calls[0]["on_completed"](
+        _make_summary(dry_run=True, client="ManyOS Test", project="Sony Metadata Test")
+    )
+
+    preview_lines = window.preview_lines()
+    assert (
+        preview_lines.index("Chris")
+        < preview_lines.index("ManyFast")
+        < preview_lines.index("Footage")
+        < preview_lines.index(CLIENT_FOLDER_NAME)
+        < preview_lines.index("ManyOS Test")
+    )
+
+    window.choose_button().click()  # Start Ingest
+    ingest_starter.calls[0]["on_completed"](
+        _make_summary(
+            dry_run=False,
+            client="ManyOS Test",
+            project="Sony Metadata Test",
+            errors=0,
+            safe_to_delete_source=True,
+        )
+    )
+
+    report_lines = window.preview_lines()
+    assert (
+        report_lines.index("Chris")
+        < report_lines.index("ManyFast")
+        < report_lines.index("Footage")
+        < report_lines.index(CLIENT_FOLDER_NAME)
+        < report_lines.index("ManyOS Test")
+    )
 
 
 # -- failure and cancellation ------------------------------------------------------
@@ -584,11 +663,13 @@ def test_preview_never_triggers_the_safety_stop(qapp, tmp_path):
     ingest_starter = _CapturingStartRealIngest()
     window = MainWindow(
         detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)],
+        detect_destinations=lambda source_path: [_destination("Chris", tmp_path / "Chris")],
         start_preview=preview_starter,
         start_real_ingest=ingest_starter,
     )
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer Campagne")
+    window.destination_cards()[0].click()
     window.choose_button().click()
 
     assert preview_starter.calls[0]["on_asset_processed"] is None
@@ -668,23 +749,27 @@ def test_safety_stop_fires_over_a_real_worker_process(qapp, tmp_path):
     input_dir.mkdir()
     for i in range(6):
         (input_dir / f"C{i:04d}.MP4").write_bytes(b"x" * 1000)
-    storage_root = tmp_path / "storage"
+    destination_root = tmp_path / "destination"
+    destination_root.mkdir()
+    storage_root = destination_root / "storage"
     storage_root.mkdir()
     storage_root.chmod(0o555)  # elke copy() faalt -> failed_verification
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        f"storage_root: {storage_root}\n"
-        f"manifest_path: {tmp_path / 'asset_schema.json'}\n"
-        f"log_dir: {tmp_path / 'logs'}\n"
+        "footage_subpath: storage\nmanifest_subpath: asset_schema.json\nlog_subpath: logs\n"
     )
 
     window = MainWindow(
-        detect_volumes=lambda: [], config_path=config_path, camera_profiles_path=CAMERA_PROFILES_PATH
+        detect_volumes=lambda: [],
+        detect_destinations=lambda source_path: [_destination("TestDisk", destination_root)],
+        config_path=config_path,
+        camera_profiles_path=CAMERA_PROFILES_PATH,
     )
     try:
         window._set_manual_source(input_dir)
         window.client_input().setText("Nike")
         window.project_input().setText("Zomer")
+        window.destination_cards()[0].click()
         window.choose_button().click()  # echte preview
 
         loop = QEventLoop()

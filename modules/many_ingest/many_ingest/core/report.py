@@ -34,6 +34,7 @@ class IngestSummary:
     duration_seconds: float
     log_path: str
     safe_to_delete_source: bool
+    metadata_warnings: int = 0
 
 
 def summarize(report: IngestReport) -> IngestSummary:
@@ -58,6 +59,11 @@ def summarize(report: IngestReport) -> IngestSummary:
         # Nooit "JA" bij een dry-run (er is niets gekopieerd) of als er fouten waren
         # (dan is de bron de enige gegarandeerd goede kopie) — safety first.
         safe_to_delete_source=(not report.dry_run) and errors == 0,
+        # Bestanden waarvan de inhoud correct gekopieerd én geverifieerd is
+        # (outcome blijft COPIED) maar waarvoor niet-kritieke metadata
+        # (tijden/rechten/vlaggen) niet volledig kon worden overgenomen — nooit
+        # een reden om safe_to_delete_source te beïnvloeden, wel traceerbaar.
+        metadata_warnings=sum(1 for a in report.assets if a.metadata_warning is not None),
     )
 
 
@@ -80,6 +86,8 @@ def render_report(summary: IngestSummary) -> str:
     lines += ["", "Duplicaten:", str(summary.duplicates)]
     lines += ["", "Naamconflicten opgelost:", str(summary.name_conflicts_resolved)]
     lines += ["", "Fouten:", str(summary.errors)]
+    if summary.metadata_warnings:
+        lines += ["", "Metadata-waarschuwingen:", str(summary.metadata_warnings)]
     lines += ["", "Totale grootte:", _format_size(summary.total_bytes)]
     lines += ["", "Duur:", _format_duration(summary.duration_seconds)]
     lines += ["", "Logbestand:", summary.log_path]
