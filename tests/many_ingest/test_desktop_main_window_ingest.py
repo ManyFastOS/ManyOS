@@ -43,10 +43,15 @@ from many_ingest.desktop.main_window import (
     CONFIRM_CANCEL_INGEST_TEXT,
     CONTINUE_INGEST_TEXT,
     DO_NOT_DISCONNECT_TEXT,
+    EJECT_BUTTON_TEXT,
+    EJECT_SUCCESS_TEXT,
     ETA_PLACEHOLDER_TEXT,
     INGEST_DONE_TITLE_TEXT,
     INGEST_PARTIAL_TITLE_TEXT,
     INGESTING_TEXT,
+    METADATA_WARNINGS_NOTE_TEXT,
+    OPEN_IN_FINDER_BUTTON_TEXT,
+    VERIFIED_SAFE_TEXT,
     SAFE_TO_DELETE_NO_TEXT,
     SAFE_TO_DELETE_YES_TEXT,
     SAFETY_STOP_MESSAGE,
@@ -183,6 +188,33 @@ class _CapturingStartRealIngest:
         return runner
 
 
+class _FakeEjectRunner:
+    def __init__(self) -> None:
+        self.wait_called = False
+
+    def wait(self, timeout_ms: int | None = None) -> None:
+        self.wait_called = True
+
+
+class _CapturingStartEject:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self.runners: list[_FakeEjectRunner] = []
+
+    def __call__(self, source, destination, *, on_succeeded, on_failed, **kwargs):
+        self.calls.append(
+            {
+                "source": source,
+                "destination": destination,
+                "on_succeeded": on_succeeded,
+                "on_failed": on_failed,
+            }
+        )
+        runner = _FakeEjectRunner()
+        self.runners.append(runner)
+        return runner
+
+
 def _make_summary(**overrides) -> IngestSummary:
     defaults = dict(
         project="Zomer Campagne",
@@ -220,6 +252,29 @@ def _window_with_finished_preview(qapp, tmp_path, **summary_overrides):
     window.choose_button().click()
     preview_starter.calls[0]["on_completed"](_make_summary(dry_run=True, **summary_overrides))
     return window, preview_starter, ingest_starter
+
+
+def _window_with_finished_preview_and_eject(qapp, tmp_path, **summary_overrides):
+    """Same as `_window_with_finished_preview`, plus an injected
+    `_CapturingStartEject` — kept as a separate helper (rather than changing
+    `_window_with_finished_preview`'s return arity) so every existing
+    3-tuple-unpacking call site above stays untouched."""
+    preview_starter = _CapturingStartPreview()
+    ingest_starter = _CapturingStartRealIngest()
+    eject_starter = _CapturingStartEject()
+    window = MainWindow(
+        detect_volumes=lambda: [_volume("SD_CARD_1", tmp_path)],
+        detect_destinations=lambda source_path: [_destination("Chris", tmp_path / "Chris")],
+        start_preview=preview_starter,
+        start_real_ingest=ingest_starter,
+        start_eject=eject_starter,
+    )
+    window.client_input().setText("Nike")
+    window.project_input().setText("Zomer Campagne")
+    window.destination_cards()[0].click()
+    window.choose_button().click()
+    preview_starter.calls[0]["on_completed"](_make_summary(dry_run=True, **summary_overrides))
+    return window, preview_starter, ingest_starter, eject_starter
 
 
 # -- gating: Start Ingest always uses the exact input of the shown preview ------
@@ -474,6 +529,375 @@ def test_ingest_report_shows_the_same_real_storage_layout_breadcrumb_as_the_prev
         < report_lines.index(CLIENT_FOLDER_NAME)
         < report_lines.index("ManyOS Test")
     )
+
+
+# -- Fase 4: completion screen detail (metadata warnings, duration, errors) -------
+
+
+def test_ingest_completed_shows_metadata_warning_count_without_affecting_safety(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+
+    ingest_starter.calls[0]["on_completed"](
+        _make_summary(dry_run=False, errors=0, metadata_warnings=2, safe_to_delete_source=True)
+    )
+
+    lines = window.preview_lines()
+    assert "2" in lines
+    assert METADATA_WARNINGS_NOTE_TEXT in lines
+    assert VERIFIED_SAFE_TEXT in lines
+    assert SAFE_TO_DELETE_YES_TEXT in lines
+
+
+def test_ingest_completed_shows_the_ingest_duration(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+
+    ingest_starter.calls[0]["on_completed"](
+        _make_summary(dry_run=False, errors=0, safe_to_delete_source=True, duration_seconds=761.0)
+    )
+
+    assert "12m 41s" in window.preview_lines()
+
+
+def test_ingest_errors_are_shown_with_per_file_context(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+
+    on_asset_processed = ingest_starter.calls[0]["on_asset_processed"]
+    on_asset_processed(
+        {
+            "source_path": "/Volumes/SD_CARD_1/DJI_0001.MP4",
+            "outcome": "failed_verification",
+            "error": "Checksum van de kopie komt niet overeen met het origineel.",
+        }
+    )
+    on_asset_processed(
+        {
+            "source_path": "/Volumes/SD_CARD_1/DJI_0002.MP4",
+            "outcome": "failed_verification",
+            "error": "Kon doelmap niet controleren op naamconflicten.",
+        }
+    )
+
+    ingest_starter.calls[0]["on_completed"](
+        _make_summary(dry_run=False, errors=2, safe_to_delete_source=False)
+    )
+
+    lines = window.preview_lines()
+    assert "2" in lines  # bestaande, ongewijzigde aggregaat-regel
+    assert "DJI_0001.MP4 — Checksum van de kopie komt niet overeen met het origineel." in lines
+    assert "DJI_0002.MP4 — Kon doelmap niet controleren op naamconflicten." in lines
+    assert SAFE_TO_DELETE_NO_TEXT in lines
+
+
+def test_error_detail_list_is_bounded_with_a_more_indicator(qapp, tmp_path):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+
+    on_asset_processed = ingest_starter.calls[0]["on_asset_processed"]
+    for i in range(14):
+        on_asset_processed(
+            {
+                "source_path": f"/Volumes/SD_CARD_1/C{i:04d}.MP4",
+                "outcome": "failed_verification",
+                "error": "Checksum-fout.",
+            }
+        )
+
+    ingest_starter.calls[0]["on_completed"](
+        _make_summary(dry_run=False, errors=14, safe_to_delete_source=False)
+    )
+
+    lines = window.preview_lines()
+    detail_lines = [line for line in lines if " — " in line]
+    assert len(detail_lines) == 10
+    assert "+ 4 meer" in lines
+
+
+def test_a_new_ingest_starts_with_an_empty_error_detail_list(qapp, tmp_path):
+    """`_ingest_failed_assets` must never leak from one real ingest into the
+    next — proven by a failing first run followed by a clean second run."""
+    window, preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+    ingest_starter.calls[0]["on_asset_processed"](
+        {"source_path": "/Volumes/SD_CARD_1/BAD.MP4", "outcome": "failed_verification", "error": "Kapot."}
+    )
+    ingest_starter.calls[0]["on_completed"](
+        _make_summary(dry_run=False, errors=1, safe_to_delete_source=False)
+    )
+
+    window.secondary_action_button().click()  # "Nieuwe ingest"
+    window.destination_cards()[0].click()
+    window.choose_button().click()  # opnieuw "Bekijk inhoud"
+    preview_starter.calls[-1]["on_completed"](_make_summary(dry_run=True))
+    window.choose_button().click()  # opnieuw "Start Ingest"
+    ingest_starter.calls[-1]["on_completed"](
+        _make_summary(dry_run=False, errors=0, safe_to_delete_source=True)
+    )
+
+    lines = window.preview_lines()
+    assert "BAD.MP4" not in " ".join(lines)
+
+
+# -- Fase 4: resolved destination path & "Open in Finder" -------------------------
+
+
+def test_open_in_finder_button_appears_and_opens_the_engine_resolved_path(qapp, tmp_path, monkeypatch):
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+
+    resolved_dir = tmp_path / "Klanten" / "Nike" / "Zomer Campagne"
+    resolved_dir.mkdir(parents=True)
+
+    opened_urls = []
+    monkeypatch.setattr(
+        main_window_module.QDesktopServices, "openUrl", lambda url: opened_urls.append(url)
+    )
+
+    ingest_starter.calls[0]["on_completed"](
+        _make_summary(
+            dry_run=False,
+            errors=0,
+            safe_to_delete_source=True,
+            destination_path=str(resolved_dir),
+        )
+    )
+
+    button = window.open_in_finder_button()
+    assert button is not None
+    button.click()
+
+    assert len(opened_urls) == 1
+    assert opened_urls[0].toLocalFile() == str(resolved_dir)
+
+
+def test_open_in_finder_button_is_absent_when_the_resolved_path_does_not_exist(qapp, tmp_path):
+    """Also proves the GUI never reconstructs this path itself — it only
+    ever trusts (or, here, rejects) the exact string the engine handed back
+    via `summary.destination_path`."""
+    window, _preview_starter, ingest_starter = _window_with_finished_preview(qapp, tmp_path)
+    window.choose_button().click()
+
+    ingest_starter.calls[0]["on_completed"](
+        _make_summary(
+            dry_run=False,
+            errors=0,
+            safe_to_delete_source=True,
+            destination_path=str(tmp_path / "never-created"),
+        )
+    )
+
+    assert window.open_in_finder_button() is None
+    window._on_open_in_finder_clicked()  # nooit een crash, ook niet als dit toch wordt aangeroepen
+
+
+# -- Fase 4: safe eject -------------------------------------------------------------
+
+
+def _complete_safe_real_ingest(ingest_starter, **overrides):
+    ingest_starter.calls[0]["on_completed"](
+        _make_summary(dry_run=False, errors=0, safe_to_delete_source=True, **overrides)
+    )
+
+
+def _patch_eject_gating(monkeypatch, *, can_eject_result: bool = True, resolved_root=None) -> None:
+    """Patches both `eject.resolve_volume_root` and `eject.can_eject` so
+    these MainWindow-level tests can control eject gating deterministically,
+    without depending on this machine's real `/Volumes` contents (see
+    test_desktop_eject.py for `resolve_volume_root`'s own, real-path-shape
+    correctness). By default `resolve_volume_root` is an identity
+    passthrough (pretends the given source is already the resolved
+    volume-root); pass `resolved_root` to prove MainWindow actually uses
+    the RESOLVED path — not the originally chosen source — once they
+    differ (see test_eject_uses_the_resolved_volume_root_not_the_chosen_submap)."""
+    monkeypatch.setattr(
+        main_window_module.eject,
+        "resolve_volume_root",
+        lambda source, *a, **k: (resolved_root if resolved_root is not None else source),
+    )
+    monkeypatch.setattr(main_window_module.eject, "can_eject", lambda *a, **k: can_eject_result)
+
+
+def test_eject_button_shown_when_safe_and_ejectable(qapp, tmp_path, monkeypatch):
+    _patch_eject_gating(monkeypatch)
+    window, _preview, ingest_starter, _eject = _window_with_finished_preview_and_eject(qapp, tmp_path)
+    window.choose_button().click()
+    _complete_safe_real_ingest(ingest_starter)
+
+    button = window.eject_button()
+    assert button is not None
+    assert button.text() == EJECT_BUTTON_TEXT
+    assert button.isEnabled()
+
+
+def test_eject_button_hidden_when_there_were_errors(qapp, tmp_path, monkeypatch):
+    """Never offered even if `can_eject` would allow it — errors gate the
+    button before device/volume checks are ever consulted."""
+    _patch_eject_gating(monkeypatch)
+    window, _preview, ingest_starter, _eject = _window_with_finished_preview_and_eject(qapp, tmp_path)
+    window.choose_button().click()
+    ingest_starter.calls[0]["on_completed"](
+        _make_summary(dry_run=False, errors=3, safe_to_delete_source=False)
+    )
+
+    assert window.eject_button() is None
+
+
+def test_eject_button_hidden_for_a_dry_run_preview_screen(qapp, tmp_path, monkeypatch):
+    _patch_eject_gating(monkeypatch)
+    window, _preview, _ingest, _eject = _window_with_finished_preview_and_eject(qapp, tmp_path)
+
+    assert window.eject_button() is None
+
+
+def test_eject_button_hidden_when_can_eject_refuses(qapp, tmp_path, monkeypatch):
+    """E.g. the resolved volume-root is the destination/boot device —
+    eject.can_eject()'s own correctness is covered by test_desktop_eject.py;
+    this only proves MainWindow actually consults it and hides the button
+    when it refuses."""
+    _patch_eject_gating(monkeypatch, can_eject_result=False)
+    window, _preview, ingest_starter, _eject = _window_with_finished_preview_and_eject(qapp, tmp_path)
+    window.choose_button().click()
+    _complete_safe_real_ingest(ingest_starter)
+
+    assert window.eject_button() is None
+
+
+def test_eject_button_hidden_when_no_volume_root_can_be_resolved(qapp, tmp_path, monkeypatch):
+    """E.g. the source was unmounted between the ingest completing and this
+    render — `resolve_volume_root()` returning `None` must hide the button,
+    exactly like `can_eject()` refusing, and must never even reach
+    `can_eject()` (see 2026-09-15 follow-up audit)."""
+    monkeypatch.setattr(main_window_module.eject, "resolve_volume_root", lambda *a, **k: None)
+    can_eject_calls: list = []
+    monkeypatch.setattr(
+        main_window_module.eject,
+        "can_eject",
+        lambda *a, **k: can_eject_calls.append(1) or True,
+    )
+    window, _preview, ingest_starter, _eject = _window_with_finished_preview_and_eject(qapp, tmp_path)
+    window.choose_button().click()
+    _complete_safe_real_ingest(ingest_starter)
+
+    assert window.eject_button() is None
+    assert can_eject_calls == []  # nooit bereikt zonder een resolved root
+
+
+def test_eject_uses_the_resolved_volume_root_not_the_originally_chosen_submap(
+    qapp, tmp_path, monkeypatch
+):
+    """The exact regression this round fixes (2026-09-15 follow-up audit): a
+    manually chosen source submap (e.g. /Volumes/Sharpwaves/Test) must never
+    itself be what's handed to diskutil — only the resolved volume-root."""
+    resolved_root = tmp_path / "ResolvedVolumeRoot"
+    _patch_eject_gating(monkeypatch, resolved_root=resolved_root)
+    window, _preview, ingest_starter, eject_starter = _window_with_finished_preview_and_eject(
+        qapp, tmp_path
+    )
+    window.choose_button().click()
+    _complete_safe_real_ingest(ingest_starter)
+
+    window.eject_button().click()
+
+    assert eject_starter.calls[0]["source"] == resolved_root
+    assert eject_starter.calls[0]["source"] != tmp_path  # de oorspronkelijk gekozen (sub)map
+
+
+def test_eject_click_calls_start_eject_with_the_validated_source_and_destination(
+    qapp, tmp_path, monkeypatch
+):
+    _patch_eject_gating(monkeypatch)
+    window, _preview, ingest_starter, eject_starter = _window_with_finished_preview_and_eject(
+        qapp, tmp_path
+    )
+    window.choose_button().click()
+    _complete_safe_real_ingest(ingest_starter)
+
+    window.eject_button().click()
+
+    assert len(eject_starter.calls) == 1
+    assert eject_starter.calls[0]["source"] == tmp_path
+    assert eject_starter.calls[0]["destination"] == tmp_path / "Chris"
+    # Terwijl het uitwerpen loopt: knop uitgeschakeld, geen dubbele klik mogelijk
+    button = window.eject_button()
+    assert button is not None
+    assert not button.isEnabled()
+    assert button.text() != EJECT_BUTTON_TEXT
+
+
+def test_eject_success_shows_bron_veilig_verwijderd_and_hides_the_button(qapp, tmp_path, monkeypatch):
+    _patch_eject_gating(monkeypatch)
+    window, _preview, ingest_starter, eject_starter = _window_with_finished_preview_and_eject(
+        qapp, tmp_path
+    )
+    window.choose_button().click()
+    _complete_safe_real_ingest(ingest_starter)
+    window.eject_button().click()
+
+    eject_starter.calls[0]["on_succeeded"]()
+
+    assert window.eject_button() is None
+    assert EJECT_SUCCESS_TEXT in window.preview_lines()
+
+
+def test_a_second_eject_after_success_is_impossible(qapp, tmp_path, monkeypatch):
+    _patch_eject_gating(monkeypatch)
+    window, _preview, ingest_starter, eject_starter = _window_with_finished_preview_and_eject(
+        qapp, tmp_path
+    )
+    window.choose_button().click()
+    _complete_safe_real_ingest(ingest_starter)
+    window.eject_button().click()
+    eject_starter.calls[0]["on_succeeded"]()
+
+    # De knop is al weg (geen manier meer om via de UI te klikken); dit
+    # bewijst dat de guard in _on_eject_clicked zelf ook standhoudt.
+    window._on_eject_clicked()
+
+    assert len(eject_starter.calls) == 1
+
+
+def test_eject_failure_eg_resource_busy_shows_a_friendly_message_and_offers_a_retry(
+    qapp, tmp_path, monkeypatch
+):
+    _patch_eject_gating(monkeypatch)
+    window, _preview, ingest_starter, eject_starter = _window_with_finished_preview_and_eject(
+        qapp, tmp_path
+    )
+    window.choose_button().click()
+    _complete_safe_real_ingest(ingest_starter)
+    window.eject_button().click()
+
+    eject_starter.calls[0]["on_failed"]("Kon de schijf niet veilig uitwerpen — mogelijk in gebruik.")
+
+    button = window.eject_button()
+    assert button is not None
+    assert button.isEnabled()
+    assert button.text() == EJECT_BUTTON_TEXT
+    assert "Kon de schijf niet veilig uitwerpen — mogelijk in gebruik." in window.preview_lines()
+
+    button.click()  # retry
+    assert len(eject_starter.calls) == 2
+
+
+def test_a_stale_eject_result_after_navigating_away_is_ignored(qapp, tmp_path, monkeypatch):
+    """A user can click "Nieuwe ingest" while an eject is still running in
+    the background; its eventual result must never redraw a screen the user
+    already left (see _report_generation in main_window.py)."""
+    _patch_eject_gating(monkeypatch)
+    window, _preview, ingest_starter, eject_starter = _window_with_finished_preview_and_eject(
+        qapp, tmp_path
+    )
+    window.choose_button().click()
+    _complete_safe_real_ingest(ingest_starter)
+    window.eject_button().click()
+
+    window.secondary_action_button().click()  # "Nieuwe ingest" -- navigeert weg
+
+    eject_starter.calls[0]["on_succeeded"]()  # komt te laat binnen
+
+    assert window.current_message() != INGEST_DONE_TITLE_TEXT
 
 
 # -- failure and cancellation ------------------------------------------------------

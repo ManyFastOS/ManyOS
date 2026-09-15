@@ -118,3 +118,26 @@ def test_exists_reflects_real_filesystem_state(tmp_path):
     storage = LocalFilesystemStorage()
     assert storage.exists(present) is True
     assert storage.exists(absent) is False
+
+
+def test_free_bytes_matches_shutil_disk_usage(tmp_path):
+    storage = LocalFilesystemStorage()
+    assert storage.free_bytes(tmp_path) == shutil.disk_usage(tmp_path).free
+
+
+def test_remove_deletes_an_existing_file(tmp_path):
+    target = tmp_path / "partial.bin"
+    target.write_bytes(b"partial content")
+
+    storage = LocalFilesystemStorage()
+    storage.remove(target)
+
+    assert not target.exists()
+
+
+def test_remove_is_a_safe_no_op_when_the_file_does_not_exist(tmp_path):
+    """Never raises — `_process_asset` calls this unconditionally after any
+    copy() failure, including when copy() never got far enough to create
+    anything at all (see core/ingest_service.py)."""
+    storage = LocalFilesystemStorage()
+    storage.remove(tmp_path / "never_existed.bin")  # mag nooit raisen

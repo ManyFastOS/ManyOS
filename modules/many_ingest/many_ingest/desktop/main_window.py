@@ -37,7 +37,8 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QUrl, Qt
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
@@ -53,7 +54,7 @@ from PySide6.QtWidgets import (
 from many_ingest.config import load_storage_layout
 from many_ingest.core.ingest_service import CLIENT_FOLDER_NAME, ProgressUpdate
 from many_ingest.core.report import IngestSummary
-from many_ingest.desktop import ingest_process
+from many_ingest.desktop import eject, ingest_process
 from many_ingest.desktop.volumes import (
     DestinationInfo,
     VolumeInfo,
@@ -90,6 +91,25 @@ INGESTING_TEXT = "Bezig met kopiëren..."
 INGEST_DONE_TITLE_TEXT = "Klaar"
 INGEST_PARTIAL_TITLE_TEXT = "Bijna klaar"
 NEW_INGEST_TEXT = "Nieuwe ingest"
+
+SECTION_DURATION = "Duur"
+SECTION_METADATA_WARNINGS = "Metadata-waarschuwingen"
+METADATA_WARNINGS_NOTE_TEXT = (
+    "Deze bestanden zijn inhoudelijk correct gekopieerd en geverifieerd — "
+    "alleen een paar niet-kritieke details (zoals tijdstempels) konden niet "
+    "volledig worden overgenomen."
+)
+VERIFIED_SAFE_TEXT = "Alle bestanden zijn geverifieerd."
+
+# Zoveel losse bestand+reden-regels toont het eindscherm maximaal bij fouten
+# — voorkomt een onbeheersbare lijst bij een kaart met veel problemen; de
+# rest blijft meegeteld in de "+ N meer"-regel, nooit stilzwijgend weggelaten.
+_MAX_VISIBLE_ERROR_DETAILS = 10
+
+OPEN_IN_FINDER_BUTTON_TEXT = "Open in Finder"
+EJECT_BUTTON_TEXT = "Schijf veilig verwijderen"
+EJECT_IN_PROGRESS_TEXT = "Bezig met uitwerpen…"
+EJECT_SUCCESS_TEXT = "Bron veilig verwijderd."
 
 DO_NOT_DISCONNECT_TEXT = "Verwijder of koppel geen opslagapparaten los tijdens het kopiëren."
 ETA_PLACEHOLDER_TEXT = "Resterende tijd berekenen…"
@@ -146,6 +166,7 @@ DetectVolumes = Callable[[], list[VolumeInfo]]
 DetectDestinations = Callable[[Path], list[DestinationInfo]]
 StartPreview = Callable[..., object]
 StartRealIngest = Callable[..., object]
+StartEject = Callable[..., object]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -179,6 +200,7 @@ class MainWindow(QWidget):
         detect_destinations: DetectDestinations | None = None,
         start_preview: StartPreview | None = None,
         start_real_ingest: StartRealIngest | None = None,
+        start_eject: StartEject | None = None,
         config_path: Path = ingest_process.DEFAULT_CONFIG_PATH,
         camera_profiles_path: Path = ingest_process.DEFAULT_CAMERA_PROFILES_PATH,
     ) -> None:
@@ -204,6 +226,7 @@ class MainWindow(QWidget):
         self._start_real_ingest: StartRealIngest = (
             start_real_ingest or ingest_process.start_real_ingest
         )
+        self._start_eject: StartEject = start_eject or eject.start_eject
         self._config_path = config_path
         self._camera_profiles_path = camera_profiles_path
 
@@ -234,6 +257,32 @@ class MainWindow(QWidget):
         self._consecutive_ingest_failures = 0
         self._safety_stop_triggered = False
         self._cancel_confirmation_pending = False
+
+        # Fase 4: per-bestand foutdetail, verzameld terwijl een échte ingest
+        # loopt (via _on_ingest_asset_processed, hetzelfde asset_processed-
+        # event dat de safety-stop-teller al gebruikt) — nooit voor preview
+        # (on_asset_processed wordt alleen aan een echte ingest doorgegeven,
+        # zie _on_start_ingest_clicked). Alleen geleegd bij het starten van
+        # een NIEUWE ingest (_on_start_ingest_clicked), nooit door
+        # _reset_ingest_progress_state() — dat draait al vóór
+        # _render_ingest_report() de data nog nodig heeft (zie
+        # _on_ingest_completed).
+        self._ingest_failed_assets: list[tuple[str, str]] = []
+
+        # Fase 4: eindscherm-state voor Open in Finder / Schijf veilig
+        # verwijderen — alleen gezet zodra een échte ingest voltooit (zie
+        # _on_ingest_completed), nooit voor preview. `_report_generation`
+        # bewijst of een later binnenkomend eject-resultaat nog bij het
+        # zichtbare eindscherm hoort (zie _on_eject_succeeded/_failed) — een
+        # gebruiker kan tijdens het uitwerpen al op "Nieuwe ingest" klikken.
+        self._last_ingest_summary: IngestSummary | None = None
+        self._report_destination_path: Path | None = None
+        self._report_generation = 0
+        self._eject_runner: object | None = None
+        self._eject_status = "idle"  # idle | ejecting | ejected | failed
+        self._eject_source_path: Path | None = None
+        self._eject_destination_path: Path | None = None
+        self._eject_failure_message = ""
 
         self._outer_layout = QVBoxLayout(self)
 
@@ -273,6 +322,7 @@ class MainWindow(QWidget):
         """
         self._wait_for_preview_to_stop()
         self._wait_for_ingest_to_stop()
+        self._wait_for_eject_to_stop()
         super().closeEvent(event)
 
     def _wait_for_preview_to_stop(self) -> None:
@@ -298,6 +348,13 @@ class MainWindow(QWidget):
         silently running."""
         if self._ingest_runner is not None:
             self._ingest_runner.stop_and_wait()
+
+    def _wait_for_eject_to_stop(self) -> None:
+        """The eject equivalent of `_wait_for_ingest_to_stop` — see
+        `eject.EjectRunner.wait()`'s docstring for why this blocks rather
+        than terminates."""
+        if self._eject_runner is not None:
+            self._eject_runner.wait()
 
     # -- public introspection (used by the app and by tests) ----------------
 
@@ -354,6 +411,12 @@ class MainWindow(QWidget):
     def cancel_confirmation_message(self) -> str:
         label = self._content.findChild(QLabel, "cancelConfirmationLabel") if self._content else None
         return label.text() if label else ""
+
+    def open_in_finder_button(self) -> QPushButton | None:
+        return self._content.findChild(QPushButton, "openInFinderButton") if self._content else None
+
+    def eject_button(self) -> QPushButton | None:
+        return self._content.findChild(QPushButton, "ejectButton") if self._content else None
 
     # -- detection ------------------------------------------------------------
 
@@ -474,6 +537,12 @@ class MainWindow(QWidget):
         # ongeldig — een nieuwe "Start Ingest" vereist altijd eerst weer een
         # verse, geslaagde preview (zie hoofdstuk 14 van de Fase 3-opdracht).
         self._confirmed_preview_input = None
+        # Maakt ook een eventueel nog lopende eject van het zojuist verlaten
+        # eindscherm ongeldig (zie _on_eject_succeeded/_on_eject_failed) —
+        # niet alleen een nieuw voltooide ingest (_on_ingest_completed)
+        # ongedaan het eindscherm, ook zelf terugklikken naar "Nieuwe
+        # ingest" is een manier om dit eindscherm te verlaten.
+        self._report_generation += 1
         if self._selection is not None:
             self._render_selected()
 
@@ -496,6 +565,7 @@ class MainWindow(QWidget):
 
         preview_input = self._confirmed_preview_input
         self._reset_ingest_progress_state()
+        self._ingest_failed_assets = []
         self._ingest_start_time = time.monotonic()
         self._render_ingesting()
         self._ingest_runner = self._start_real_ingest(
@@ -612,6 +682,9 @@ class MainWindow(QWidget):
         outcome = payload.get("outcome")
         if outcome == "failed_verification":
             self._consecutive_ingest_failures += 1
+            name = Path(payload.get("source_path") or "").name or "Onbekend bestand"
+            reason = payload.get("error") or "Onbekende fout"
+            self._ingest_failed_assets.append((name, reason))
         elif outcome == "copied":
             self._consecutive_ingest_failures = 0
         # duplicate_skipped (en elke andere/toekomstige uitkomst): neutraal,
@@ -634,6 +707,17 @@ class MainWindow(QWidget):
     def _on_ingest_completed(self, summary: IngestSummary) -> None:
         self._ingest_runner = None
         self._reset_ingest_progress_state()
+        self._report_generation += 1
+        self._eject_runner = None
+        self._eject_status = "idle"
+        self._eject_failure_message = ""
+        # Bepaald hier, vóórdat _confirmed_preview_input hieronder geleegd
+        # wordt — de enige plek waar de bestemming van déze run nog bekend
+        # is (zie _resolve_eject_targets). Een latere re-render van dit
+        # eindscherm (bijv. na een eject-resultaat) leest alleen nog
+        # self._eject_source_path/_eject_destination_path terug, herleidt ze
+        # nooit opnieuw uit _confirmed_preview_input.
+        self._eject_source_path, self._eject_destination_path = self._resolve_eject_targets(summary)
         # Gerenderd vóórdat _confirmed_preview_input hieronder geleegd wordt —
         # _render_ingest_report toont via _destination_breadcrumb_lines() nog
         # de bestemming van déze run.
@@ -642,6 +726,32 @@ class MainWindow(QWidget):
         # nogmaals op "Start Ingest" klikken zonder nieuwe preview mag nooit
         # dezelfde run herhalen.
         self._confirmed_preview_input = None
+
+    def _resolve_eject_targets(self, summary: IngestSummary) -> tuple[Path | None, Path | None]:
+        """Whether Fase 4's "Schijf veilig verwijderen"-knop may be offered
+        at all for this run, and if so, the exact (source, destination) pair
+        `eject.can_eject`/`start_eject` must validate against. Returns
+        (None, None) whenever any condition isn't met — the caller never has
+        to separately check `summary.safe_to_delete_source` again.
+
+        `self._selection.source_path` may itself be a subfolder of the real
+        volume (e.g. a manually chosen `/Volumes/Sharpwaves/Test`, see the
+        2026-09-15 audit) — `eject.resolve_volume_root()` derives the actual
+        mounted volume-root via device identity first, never by string-
+        matching. `eject.can_eject`'s destination/boot-volume safety checks
+        then run on that resolved root, exactly as before; nothing about
+        those checks changes."""
+        if not summary.safe_to_delete_source:
+            return None, None
+        if self._selection is None or self._confirmed_preview_input is None:
+            return None, None
+        resolved_source = eject.resolve_volume_root(self._selection.source_path)
+        if resolved_source is None:
+            return None, None
+        destination = self._confirmed_preview_input.destination.path
+        if not eject.can_eject(resolved_source, destination):
+            return None, None
+        return resolved_source, destination
 
     def _on_ingest_failed(self, message: str) -> None:
         self._ingest_runner = None
@@ -971,18 +1081,32 @@ class MainWindow(QWidget):
         confirm_cancel_button.clicked.connect(self._on_confirm_cancel_ingest_clicked)
         layout.addWidget(confirm_cancel_button, alignment=Qt.AlignmentFlag.AlignCenter)
 
-    def _add_preview_section(self, layout: QVBoxLayout, header_text: str, value_lines: list[str]) -> None:
+    def _add_preview_section(
+        self, layout: QVBoxLayout, header_text: str, value_lines: list[str], *, tone: str | None = None
+    ) -> None:
         header = QLabel(header_text)
         header.setObjectName("fieldLabel")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
         for value in value_lines:
-            line_label = QLabel(value)
-            line_label.setObjectName("previewLine")
-            line_label.setWordWrap(True)
-            line_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(line_label)
+            self._add_status_line(layout, value, tone=tone)
         layout.addSpacing(14)
+
+    def _add_status_line(self, layout: QVBoxLayout, text: str, *, tone: str | None = None) -> None:
+        """One `previewLine`-styled label, optionally tagged with a `tone`
+        Qt property (`"success"`/`"warning"`) — theme.py styles these via a
+        `QLabel#previewLine[tone="..."]` attribute selector, so the
+        objectName stays exactly `previewLine` either way (test helpers like
+        `preview_lines()` keep finding every line, toned or not, with no
+        separate accessor needed for Fase 4's richer safe-to-delete/error
+        styling)."""
+        line_label = QLabel(text)
+        line_label.setObjectName("previewLine")
+        line_label.setWordWrap(True)
+        line_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if tone is not None:
+            line_label.setProperty("tone", tone)
+        layout.addWidget(line_label)
 
     def _footage_subpath_labels(self) -> tuple[str, ...]:
         """The fixed breadcrumb levels between the chosen destination disk
@@ -1095,14 +1219,46 @@ class MainWindow(QWidget):
         layout.addStretch()
         self._set_content(content)
 
+    def _error_detail_lines(self, summary: IngestSummary) -> list[str]:
+        """The aggregate count first (unchanged from before Fase 4, so an
+        existing test that only ever supplied a bare `errors` count without
+        streaming per-asset events still sees exactly that), followed by
+        bounded per-file detail (bestandsnaam + de exacte, al-vertaalde
+        `AssetResult.error`-reden de engine zelf meegeeft — nooit een nieuw
+        eigen foutformat) when it's actually available. `self._ingest_failed_assets`
+        is empty whenever `on_completed` was handed a summary directly
+        without ever streaming `asset_processed` first (e.g. some tests) —
+        the count-only line is exactly the pre-Fase-4 behaviour for that
+        case, not a regression."""
+        lines = [str(summary.errors)]
+        details = self._ingest_failed_assets[:_MAX_VISIBLE_ERROR_DETAILS]
+        lines += [f"{name} — {reason}" for name, reason in details]
+        remaining = len(self._ingest_failed_assets) - len(details)
+        if remaining > 0:
+            lines.append(f"+ {remaining} meer")
+        return lines
+
+    def _metadata_warning_lines(self, summary: IngestSummary) -> list[str]:
+        return [str(summary.metadata_warnings), METADATA_WARNINGS_NOTE_TEXT]
+
     def _render_ingest_report(self, summary: IngestSummary) -> None:
-        """The Fase 3 eindscherm — reuses the exact same `IngestSummary` and
-        section-rendering helper as `_render_preview` (see
+        """The Fase 3/4 eindscherm — reuses the exact same `IngestSummary`
+        and section-rendering helper as `_render_preview` (see
         `_add_preview_section`), for a REAL result instead of a dry-run
-        preview. Never a functional "verwijder de bron"-knop: only the text
-        status the engine itself already computes
-        (`summary.safe_to_delete_source`) — an actual delete/eject action is
-        out of scope for this phase (see CLAUDE.md: v0.1 is copy-only)."""
+        preview.
+
+        Fase 4 adds: duur, metadata-waarschuwingen (nooit van invloed op
+        safe-to-delete — zie METADATA_WARNINGS_NOTE_TEXT), per-bestand
+        foutdetail (begrensd, zie _error_detail_lines), een visueel
+        onderscheiden safe-to-delete-blok (tone="success"/"warning", zie
+        _add_status_line), "Open in Finder" (het door de engine resolved
+        `summary.destination_path` — nooit hier gereconstrueerd, zie
+        IngestSummary/IngestReport in core/), en de "Schijf veilig
+        verwijderen"-knop (alleen aangeboden als _on_ingest_completed al
+        vastgesteld heeft dat dit veilig mag, zie _resolve_eject_targets)."""
+        self._last_ingest_summary = summary
+        self._report_destination_path = _existing_directory_or_none(summary.destination_path)
+
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.addStretch()
@@ -1122,6 +1278,7 @@ class MainWindow(QWidget):
             SECTION_FILES,
             [_pluralize_files(summary.total_files), format_size(summary.total_bytes)],
         )
+        self._add_preview_section(layout, SECTION_DURATION, [_format_duration_label(summary.duration_seconds)])
 
         camera_lines = self._camera_breakdown_lines(summary)
         if camera_lines:
@@ -1130,11 +1287,36 @@ class MainWindow(QWidget):
         self._add_preview_section(layout, SECTION_DUPLICATES, [str(summary.duplicates)])
         self._add_preview_section(layout, SECTION_NAME_CONFLICTS, [str(summary.name_conflicts_resolved)])
 
-        if summary.errors:
-            self._add_preview_section(layout, SECTION_ERRORS, [str(summary.errors)])
+        if summary.metadata_warnings:
+            self._add_preview_section(
+                layout, SECTION_METADATA_WARNINGS, self._metadata_warning_lines(summary)
+            )
 
-        safe_text = SAFE_TO_DELETE_YES_TEXT if summary.safe_to_delete_source else SAFE_TO_DELETE_NO_TEXT
-        self._add_preview_section(layout, SECTION_SOURCE_STATUS, [safe_text])
+        if summary.errors:
+            self._add_preview_section(
+                layout, SECTION_ERRORS, self._error_detail_lines(summary), tone="warning"
+            )
+
+        if summary.safe_to_delete_source:
+            self._add_preview_section(
+                layout,
+                SECTION_SOURCE_STATUS,
+                [VERIFIED_SAFE_TEXT, SAFE_TO_DELETE_YES_TEXT],
+                tone="success",
+            )
+        else:
+            self._add_preview_section(
+                layout, SECTION_SOURCE_STATUS, [SAFE_TO_DELETE_NO_TEXT], tone="warning"
+            )
+
+        self._add_eject_controls(layout)
+
+        if self._report_destination_path is not None:
+            open_finder_button = QPushButton(OPEN_IN_FINDER_BUTTON_TEXT)
+            open_finder_button.setObjectName("openInFinderButton")
+            open_finder_button.clicked.connect(self._on_open_in_finder_clicked)
+            layout.addWidget(open_finder_button, alignment=Qt.AlignmentFlag.AlignCenter)
+            layout.addSpacing(8)
 
         new_ingest_button = QPushButton(NEW_INGEST_TEXT)
         new_ingest_button.setObjectName("linkButton")
@@ -1143,6 +1325,67 @@ class MainWindow(QWidget):
 
         layout.addStretch()
         self._set_content(content)
+
+    def _add_eject_controls(self, layout: QVBoxLayout) -> None:
+        """Fase 4 — Safe Eject. `self._eject_source_path` is `None` unless
+        `_on_ingest_completed` already established every condition holds
+        (safe_to_delete_source, a genuine mounted volume-root, not the
+        destination device, not the boot volume — see
+        `_resolve_eject_targets`/`eject.can_eject`); this method only ever
+        reflects `self._eject_status`, it never re-derives eligibility."""
+        if self._eject_status == "ejected":
+            self._add_status_line(layout, EJECT_SUCCESS_TEXT, tone="success")
+            layout.addSpacing(12)
+            return
+
+        if self._eject_source_path is None:
+            return
+
+        eject_button = QPushButton(
+            EJECT_IN_PROGRESS_TEXT if self._eject_status == "ejecting" else EJECT_BUTTON_TEXT
+        )
+        eject_button.setObjectName("ejectButton")
+        eject_button.setEnabled(self._eject_status != "ejecting")
+        eject_button.clicked.connect(self._on_eject_clicked)
+        layout.addWidget(eject_button, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addSpacing(8)
+
+        if self._eject_status == "failed" and self._eject_failure_message:
+            self._add_status_line(layout, self._eject_failure_message, tone="warning")
+            layout.addSpacing(8)
+
+    def _on_open_in_finder_clicked(self) -> None:
+        if self._report_destination_path is None:
+            return  # niet bereikbaar via de UI (knop staat dan uit), extra zekerheid
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._report_destination_path)))
+
+    def _on_eject_clicked(self) -> None:
+        if self._eject_source_path is None or self._eject_status in ("ejecting", "ejected"):
+            return  # niet bereikbaar via de UI in deze staat, extra zekerheid
+        self._eject_status = "ejecting"
+        generation = self._report_generation
+        self._render_ingest_report(self._last_ingest_summary)
+        self._eject_runner = self._start_eject(
+            self._eject_source_path,
+            self._eject_destination_path,
+            on_succeeded=lambda: self._on_eject_succeeded(generation),
+            on_failed=lambda message: self._on_eject_failed(generation, message),
+        )
+
+    def _on_eject_succeeded(self, generation: int) -> None:
+        self._eject_runner = None
+        if generation != self._report_generation:
+            return  # gebruiker is al weg van dit eindscherm, zie _on_ingest_completed
+        self._eject_status = "ejected"
+        self._render_ingest_report(self._last_ingest_summary)
+
+    def _on_eject_failed(self, generation: int, message: str) -> None:
+        self._eject_runner = None
+        if generation != self._report_generation:
+            return
+        self._eject_status = "failed"
+        self._eject_failure_message = message
+        self._render_ingest_report(self._last_ingest_summary)
 
     def _render_analysis_failed(self, message: str) -> None:
         content = QWidget()
@@ -1163,6 +1406,36 @@ class MainWindow(QWidget):
 
         layout.addStretch()
         self._set_content(content)
+
+
+def _existing_directory_or_none(destination_path: str) -> Path | None:
+    """`summary.destination_path` (Fase 4, engine-resolved — see
+    core/report.py/core/ingest_service.py) is only "geldig/beschikbaar" for
+    "Open in Finder" if a directory actually exists there — e.g. a
+    zero-file real ingest never creates the Project Workspace folder at all
+    (nothing ever calls `Storage.copy()`). Never reconstructs the path
+    itself, only checks the one the engine already resolved."""
+    if not destination_path:
+        return None
+    path = Path(destination_path)
+    return path if path.is_dir() else None
+
+
+def _format_duration_label(seconds: float) -> str:
+    """Same h/m/s convention as core/report.py's own `_format_duration` —
+    kept as a small, deliberate local copy for the GUI layer, same
+    established reason desktop/volumes.py's `format_size` already is one
+    (see that function's docstring): not a new duration format, the exact
+    same one, just needed directly in the GUI since it never calls
+    `render_report()` itself."""
+    total_seconds = int(seconds)
+    minutes, secs = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 def _pluralize_media(count: int) -> str:

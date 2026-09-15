@@ -79,6 +79,12 @@ corrected before being emitted — see `_corrected_summary()` below for why
 (a real, pre-existing gap in `core/report.py`'s own dry-run reporting, not
 introduced here and not fixed there, since that's shared engine code).
 
+For a REAL run only (never a dry-run — see `_write_report_file()` below),
+this also writes the exact same human-readable report `cli.py` has always
+written (`render_report()`, unchanged — no second report format) to
+`{run_id}_report.txt` next to the JSONL action log, so a desktop ingest
+leaves the same on-disk artifact a CLI ingest always has (Fase 4).
+
 Cancellation: SIGTERM sets a module-level flag, checked from inside the
 progress callback IngestService already calls after every file — a signal
 handler, since there is no in-process object to call a method on across an
@@ -99,11 +105,12 @@ from pathlib import Path
 
 from many_ingest.core.ingest_service import (
     AssetResult,
+    DestinationFullError,
     DestinationUnavailableError,
     IngestReport,
     ProgressUpdate,
 )
-from many_ingest.core.report import summarize
+from many_ingest.core.report import render_report, summarize
 from many_ingest.device_identity import same_physical_device
 from many_ingest.metadata_extractor import FfprobeNotFoundError
 from many_ingest.service_factory import build_ingest_service
@@ -172,6 +179,34 @@ def _corrected_summary(report: IngestReport):
         return summary
     actual_duplicates = sum(1 for asset in report.assets if asset.is_duplicate)
     return dataclasses.replace(summary, duplicates=actual_duplicates)
+
+
+def _write_report_file(report: IngestReport, summary) -> None:
+    """Writes the same human-readable `.txt` report `cli.py` has always
+    written (`render_report()`, unchanged — see this module's docstring),
+    next to the JSONL action log.
+
+    Real runs only, never a dry-run: a preview must stay strictly read-only
+    (see logger.py's `ActionLogger` — it already skips creating `log_dir`
+    for a dry-run for the exact same reason: a preview never needs the
+    destination to be reachable/writable at all). Writing this file
+    unconditionally, the way `cli.py` does, would reintroduce that same
+    "destination unreachable" failure mode for the desktop app's read-only
+    preview flow — the specific bug Fase 3.5's dry-run logging guard exists
+    to prevent. A failure here (e.g. the destination disk was unplugged in
+    the instant between the last file finishing and this write) is
+    non-critical and must never turn an otherwise-successful, fully
+    verified real run into `ingest_failed` — every file is already copied
+    and checksum-verified by this point.
+    """
+    if report.dry_run:
+        return
+    report_path = report.log_path.with_name(f"{report.run_id}_report.txt")
+    try:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(render_report(summary), encoding="utf-8")
+    except OSError:
+        pass
 
 
 _cancel_requested = False
@@ -294,6 +329,14 @@ def main(argv: list[str] | None = None) -> int:
     except _IngestCancelled:
         _emit("ingest_cancelled")
         return EXIT_CANCELLED
+    except DestinationFullError as exc:
+        # str(exc) is already the complete, friendly, Dutch message (built in
+        # core/ingest_service.py, where the actual required/available sizes
+        # are known) — unlike the other branches here, never mapped to a
+        # static canned string. Never "source unreadable" (see the
+        # 2026-09-15 forensic audit this fix is a direct response to).
+        _emit("ingest_failed", message=str(exc))
+        return EXIT_FAILED
     except DestinationUnavailableError:
         _emit("ingest_failed", message=_DESTINATION_UNAVAILABLE_MESSAGE)
         return EXIT_FAILED
@@ -308,6 +351,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_FAILED
 
     summary = _corrected_summary(report)
+    _write_report_file(report, summary)
     _emit("ingest_completed", **dataclasses.asdict(summary))
     return EXIT_SUCCESS
 

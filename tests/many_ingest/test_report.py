@@ -48,6 +48,7 @@ def _report(assets: list[AssetResult], dry_run: bool = False) -> IngestReport:
         duration_seconds=761.0,  # 12m 41s
         total_bytes=914 * 1024**3,
         assets=assets,
+        project_workspace_path=Path("/out/Klanten/ManyFast/Jan Rotmans"),
     )
 
 
@@ -158,3 +159,13 @@ def test_render_report_omits_metadata_warnings_line_when_there_are_none():
     text = render_report(summarize(_report(assets, dry_run=False)))
 
     assert "Metadata-waarschuwingen" not in text
+
+
+def test_summarize_exposes_the_engine_resolved_project_workspace_path():
+    """Fase 4: the resolved Project Workspace path is engine-computed
+    (IngestReport.project_workspace_path), never reconstructed by a caller —
+    summarize() must carry it through unchanged, just stringified."""
+    assets = [_asset(AssetOutcome.COPIED)]
+    summary = summarize(_report(assets, dry_run=False))
+
+    assert summary.destination_path == "/out/Klanten/ManyFast/Jan Rotmans"

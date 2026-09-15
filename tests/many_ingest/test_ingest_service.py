@@ -8,6 +8,7 @@ fake Storage to force a checksum mismatch and exercise the verification-failure 
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import json
 from pathlib import Path
 
@@ -18,11 +19,13 @@ from many_ingest.adapters.local_fs_storage import LocalFilesystemStorage
 from many_ingest.config import IngestConfig
 from many_ingest.core.ingest_service import (
     AssetOutcome,
+    DestinationFullError,
     DestinationUnavailableError,
     IngestService,
     ProgressUpdate,
 )
 from many_ingest.core.report import summarize
+from many_ingest.logger import ActionLogger
 from many_ingest.metadata_extractor import FfprobeNotFoundError
 from many_ingest.ports.storage import Storage
 
@@ -188,6 +191,12 @@ def test_failed_verification_is_not_registered_and_does_not_crash_the_run(tmp_pa
             if config.storage_root in Path(path).parents:
                 return "destination-checksum"
             return "source-checksum"
+
+        def free_bytes(self, path):
+            return real_storage.free_bytes(path)
+
+        def remove(self, path):
+            real_storage.remove(path)
 
     service = _make_service(config, camera_profiles, storage=_MismatchingStorage())
     report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
@@ -530,3 +539,317 @@ class TestCollisionProtection:
         assert asset.destination_path.name == "DJI_0001_001.MP4"
         # dry-run: er is niets nieuws op de schijf geschreven
         assert not asset.destination_path.exists()
+
+
+# -- Fase 4.1: destination-capacity safety hardening (2026-09-15) -----------------
+#
+# See that day's forensic audit: a real manual test drove a destination disk
+# to 0 bytes free mid-run, which surfaced as a misleading "source unreadable"
+# error via an uncaught OSError from the action-log write. These tests cover
+# the preflight capacity check, the runtime ENOSPC classification/cleanup,
+# and that a non-ENOSPC destination-write failure is still classified
+# correctly (never silently swallowed, never conflated with "source").
+
+
+class _FixedFreeSpaceStorage(Storage):
+    """Wraps the real LocalFilesystemStorage but reports a controlled, fixed
+    free-space figure — lets capacity-preflight tests run against real
+    tmp_path files without ever needing to actually fill a real disk (this
+    round's testing rules explicitly forbid that)."""
+
+    def __init__(self, free_bytes_value: int) -> None:
+        self._real = LocalFilesystemStorage()
+        self._free_bytes_value = free_bytes_value
+
+    def list_files(self, root):
+        return self._real.list_files(root)
+
+    def exists(self, path):
+        return self._real.exists(path)
+
+    def checksum(self, path):
+        return self._real.checksum(path)
+
+    def copy(self, source, destination):
+        return self._real.copy(source, destination)
+
+    def free_bytes(self, path):
+        return self._free_bytes_value
+
+    def remove(self, path):
+        self._real.remove(path)
+
+
+class _EnospcAfterPartialWriteStorage(Storage):
+    """Simulates a copy() that writes some bytes to the destination before
+    failing with ENOSPC — the real C0066.MP4 scenario from the 2026-09-15
+    incident (a partial, not a clean all-or-nothing failure). `fail_on`
+    names the one source file this should fail for; every other file is
+    copied for real via the real adapter."""
+
+    def __init__(self, fail_on: str) -> None:
+        self._real = LocalFilesystemStorage()
+        self._fail_on = fail_on
+
+    def list_files(self, root):
+        return self._real.list_files(root)
+
+    def exists(self, path):
+        return self._real.exists(path)
+
+    def checksum(self, path):
+        return self._real.checksum(path)
+
+    def copy(self, source, destination):
+        if Path(source).name != self._fail_on:
+            return self._real.copy(source, destination)
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"partial-bytes-only")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def free_bytes(self, path):
+        return self._real.free_bytes(path)
+
+    def remove(self, path):
+        self._real.remove(path)
+
+
+def _patch_action_logger_log(monkeypatch, *, fail_on_event: str, errno_value: int | None) -> None:
+    """Makes `ActionLogger.log()` raise an OSError (with the given errno,
+    or none — a plain OSError) the moment it's asked to log `fail_on_event`,
+    while every other event still logs for real."""
+    original_log = ActionLogger.log
+
+    def _maybe_failing_log(self, event, **fields):
+        if event == fail_on_event:
+            raise OSError(errno_value, "gesimuleerde schrijffout")
+        return original_log(self, event, **fields)
+
+    monkeypatch.setattr(ActionLogger, "log", _maybe_failing_log)
+
+
+class TestDestinationCapacityPreflight:
+    def test_rejects_a_destination_with_insufficient_free_space(self, tmp_path, camera_profiles):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"x" * 1000)
+
+        config = _make_config(tmp_path)
+        storage = _FixedFreeSpaceStorage(free_bytes_value=100)  # veel te weinig
+        service = _make_service(config, camera_profiles, storage=storage)
+
+        with pytest.raises(DestinationFullError) as excinfo:
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        assert "Onvoldoende ruimte" in str(excinfo.value)
+        assert "Benodigd" in str(excinfo.value)
+        assert "Beschikbaar" in str(excinfo.value)
+        assert not config.manifest_path.exists()  # niets gekopieerd of geregistreerd
+
+    def test_accepts_a_destination_with_sufficient_free_space(self, tmp_path, camera_profiles):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"x" * 1000)
+
+        config = _make_config(tmp_path)
+        storage = _FixedFreeSpaceStorage(free_bytes_value=10 * 1024**3)  # 10 GB, ruim genoeg
+        service = _make_service(config, camera_profiles, storage=storage)
+
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        assert report.assets[0].outcome == AssetOutcome.COPIED
+
+    def test_the_safety_margin_is_actually_taken_into_account(self, tmp_path, camera_profiles):
+        """Available space that covers the raw file size but not the extra
+        margin on top must still be rejected — proves the margin is really
+        added, not just a bare files-vs-available comparison."""
+        from many_ingest.core.ingest_service import _DESTINATION_FREE_SPACE_MARGIN_BYTES
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        content = b"x" * 1000
+        (input_dir / "DJI_0001.MP4").write_bytes(content)
+
+        config = _make_config(tmp_path)
+        just_short = len(content) + _DESTINATION_FREE_SPACE_MARGIN_BYTES - 1
+        storage = _FixedFreeSpaceStorage(free_bytes_value=just_short)
+        service = _make_service(config, camera_profiles, storage=storage)
+
+        with pytest.raises(DestinationFullError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+    def test_accepts_exactly_files_plus_margin(self, tmp_path, camera_profiles):
+        from many_ingest.core.ingest_service import _DESTINATION_FREE_SPACE_MARGIN_BYTES
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        content = b"x" * 1000
+        (input_dir / "DJI_0001.MP4").write_bytes(content)
+
+        config = _make_config(tmp_path)
+        exactly_enough = len(content) + _DESTINATION_FREE_SPACE_MARGIN_BYTES
+        storage = _FixedFreeSpaceStorage(free_bytes_value=exactly_enough)
+        service = _make_service(config, camera_profiles, storage=storage)
+
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        assert report.assets[0].outcome == AssetOutcome.COPIED
+
+    def test_dry_run_ignores_destination_capacity_entirely(self, tmp_path, camera_profiles):
+        """A preview must stay strictly read-only — never rejected, never
+        even asked about free space, no matter how full the destination
+        claims to be. Same principle as the destination-writability preflight."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"x" * 1000)
+
+        config = _make_config(tmp_path)
+        storage = _FixedFreeSpaceStorage(free_bytes_value=0)  # "hartstikke vol"
+        service = _make_service(config, camera_profiles, storage=storage)
+
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        assert report.assets[0].outcome == AssetOutcome.PREVIEW
+        assert not config.storage_root.exists()
+
+
+class TestRuntimeEnospc:
+    def test_enospc_during_copy_raises_destination_full_and_cleans_up_the_partial_file(
+        self, tmp_path, camera_profiles
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        good = input_dir / "DJI_0001.MP4"
+        good.write_bytes(b"good bytes")
+        bad = input_dir / "DJI_0002.MP4"
+        bad.write_bytes(b"never actually copied")
+
+        config = _make_config(tmp_path)
+        storage = _EnospcAfterPartialWriteStorage(fail_on="DJI_0002.MP4")
+        service = _make_service(config, camera_profiles, storage=storage)
+
+        with pytest.raises(DestinationFullError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        workspace = _workspace_dir(config, "Nike", "Zomer", "Drone")
+
+        # De partial destination-file van de mislukte copy is weggehaald:
+        assert not (workspace / "DJI_0002.MP4").exists()
+
+        # Het eerder al gekopieerde, geverifieerde bestand blijft gewoon staan
+        # en geregistreerd:
+        verified_path = workspace / "DJI_0001.MP4"
+        assert verified_path.exists()
+        assert verified_path.read_bytes() == b"good bytes"
+        schema = json.loads(config.manifest_path.read_text())
+        assert len(schema["assets"]) == 1
+        assert schema["assets"][0]["original_path"] == str(good)
+
+        # De bron is volledig onaangetast — beide bestanden, ongewijzigd:
+        assert good.read_bytes() == b"good bytes"
+        assert bad.read_bytes() == b"never actually copied"
+
+    def test_a_non_enospc_copy_failure_still_behaves_exactly_as_before(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """Regression guard: only ENOSPC aborts the whole run. Any other
+        copy-write failure must keep today's existing behaviour — a per-asset
+        FAILED_VERIFICATION, the run itself still completes normally (see
+        test_genuine_content_copy_failure_is_still_a_real_failure above,
+        which this mirrors) — never a DestinationFullError, never abort."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        def _broken_copyfile(src, dst):
+            raise OSError("disk vol (gesimuleerd, geen ENOSPC-errno)")
+
+        monkeypatch.setattr(
+            "many_ingest.adapters.local_fs_storage.shutil.copyfile", _broken_copyfile
+        )
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        assert report.assets[0].outcome == AssetOutcome.FAILED_VERIFICATION
+        assert not config.manifest_path.exists()
+
+    def test_enospc_during_action_log_write_is_classified_as_destination_full(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"x")
+
+        _patch_action_logger_log(monkeypatch, fail_on_event="asset_processed", errno_value=errno.ENOSPC)
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        with pytest.raises(DestinationFullError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+    def test_non_enospc_action_log_failure_is_destination_unavailable_not_source(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """The 2026-09-15 bug, reproduced directly: an unclassified OSError
+        from the action-log write used to escape all the way up unclassified
+        (this exact call had no try/except at all). It must now be a
+        distinct, destination-specific error — never left bare (which is
+        what let a caller's generic `except OSError` mislabel it as
+        "source unreadable")."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"x")
+
+        _patch_action_logger_log(monkeypatch, fail_on_event="asset_processed", errno_value=errno.EIO)
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        with pytest.raises(DestinationUnavailableError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+    def test_enospc_during_manifest_write_is_destination_full_and_keeps_the_copied_file(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"good content")
+
+        def _failing_register(self, record):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(JSONManifest, "register", _failing_register)
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        with pytest.raises(DestinationFullError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        # Het bestand zelf is al compleet gekopieerd én checksum-geverifieerd
+        # vóór de manifest-write faalde — dat maakt het geen "partial" bestand,
+        # en het wordt dus nooit weggegooid, alleen de hele run stopt.
+        workspace = _workspace_dir(config, "Nike", "Zomer", "Drone")
+        assert (workspace / "DJI_0001.MP4").read_bytes() == b"good content"
+
+    def test_non_enospc_manifest_write_failure_is_destination_unavailable(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"good content")
+
+        def _failing_register(self, record):
+            raise OSError(errno.EIO, "gesimuleerde I/O-fout")
+
+        monkeypatch.setattr(JSONManifest, "register", _failing_register)
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        with pytest.raises(DestinationUnavailableError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=False)

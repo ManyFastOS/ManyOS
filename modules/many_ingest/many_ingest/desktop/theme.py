@@ -11,6 +11,14 @@ Fase 2 adds: form fields with an always-visible label (hoofdstuk 6 — never a
 placeholder as the only label), a disabled Primary state (the "Bekijk
 inhoud"-button before both fields are filled in), and a progress bar
 (hoofdstuk 8 — never a spinner for something with a measurable duration).
+
+Fase 4 adds: a `tone` dynamic Qt property on `previewLine` labels
+(`success`/`warning`, set via desktop/main_window.py's `_add_status_line`)
+so the eindscherm's safe-to-delete/error/eject-result text is visually
+distinguishable from a flat, uncolored line — without a new widget/
+objectName per tone, and without touching any existing `previewLine` that
+never sets one. `ejectButton`/`openInFinderButton` reuse the existing
+Primary/Link visual language rather than inventing a third button style.
 """
 
 from __future__ import annotations
@@ -92,6 +100,52 @@ QLabel#fieldLabel {
 QLabel#previewLine {
     font-size: 14px;
     color: #e5e5e7;
+}
+
+QLabel#previewLine[tone="success"] {
+    color: #30d158;
+    font-weight: 600;
+}
+
+QLabel#previewLine[tone="warning"] {
+    color: #ff9f0a;
+    font-weight: 600;
+}
+
+QPushButton#ejectButton {
+    background-color: #0a84ff;
+    color: #ffffff;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 28px;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+QPushButton#ejectButton:hover {
+    background-color: #3396ff;
+}
+
+QPushButton#ejectButton:pressed {
+    background-color: #086bd1;
+}
+
+QPushButton#ejectButton:disabled {
+    background-color: #3a3a3c;
+    color: #6e6e73;
+}
+
+QPushButton#openInFinderButton {
+    background-color: transparent;
+    color: #0a84ff;
+    border: none;
+    padding: 4px 8px;
+    font-size: 13px;
+    font-weight: 500;
+}
+
+QPushButton#openInFinderButton:hover {
+    color: #3396ff;
 }
 
 QLineEdit {

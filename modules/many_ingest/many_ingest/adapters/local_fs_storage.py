@@ -59,3 +59,9 @@ class LocalFilesystemStorage(Storage):
                 f"vlaggen) kon niet volledig worden overgenomen: {exc}"
             )
         return None
+
+    def free_bytes(self, path: Path) -> int:
+        return shutil.disk_usage(path).free
+
+    def remove(self, path: Path) -> None:
+        Path(path).unlink(missing_ok=True)

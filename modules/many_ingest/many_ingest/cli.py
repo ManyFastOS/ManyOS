@@ -8,6 +8,7 @@ import click
 
 from many_ingest.core.ingest_service import (
     AssetOutcome,
+    DestinationFullError,
     DestinationUnavailableError,
     IngestReport,
     ProgressUpdate,
@@ -92,6 +93,9 @@ def run(
             progress_callback=_print_progress,
         )
     except FfprobeNotFoundError as exc:
+        click.echo(f"\n{exc}", err=True)
+        raise SystemExit(1) from exc
+    except DestinationFullError as exc:
         click.echo(f"\n{exc}", err=True)
         raise SystemExit(1) from exc
     except DestinationUnavailableError as exc:

@@ -38,6 +38,7 @@ def main() -> None:
     window = MainWindow(detect_volumes=_slow_detect_volumes)
     app.aboutToQuit.connect(window._wait_for_preview_to_stop)
     app.aboutToQuit.connect(window._wait_for_ingest_to_stop)
+    app.aboutToQuit.connect(window._wait_for_eject_to_stop)
     window.show()
     # "Opnieuw zoeken" herhaalt dezelfde (synchrone) detectie nogmaals,
     # daarna meteen sluiten — het vroegst mogelijke moment ná een scan.

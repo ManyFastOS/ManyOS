@@ -57,6 +57,7 @@ def main() -> None:
     )
     app.aboutToQuit.connect(window._wait_for_preview_to_stop)
     app.aboutToQuit.connect(window._wait_for_ingest_to_stop)
+    app.aboutToQuit.connect(window._wait_for_eject_to_stop)
     window._set_manual_source(input_dir)
     window.client_input().setText("Nike")
     window.project_input().setText("Zomer")

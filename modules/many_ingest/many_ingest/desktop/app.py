@@ -33,10 +33,12 @@ def main() -> None:
     # app-menu Quit item, confirmed by reproduction — never delivers a
     # QCloseEvent to the window, so closeEvent() alone misses that path.
     # aboutToQuit fires for every quit path. See
-    # MainWindow._wait_for_preview_to_stop and _wait_for_ingest_to_stop for
-    # the shared, idempotent logic (both stop an IngestRunner/QProcess).
+    # MainWindow._wait_for_preview_to_stop, _wait_for_ingest_to_stop and
+    # _wait_for_eject_to_stop for the shared, idempotent logic (each stops
+    # its own QProcess-backed runner).
     app.aboutToQuit.connect(window._wait_for_preview_to_stop)
     app.aboutToQuit.connect(window._wait_for_ingest_to_stop)
+    app.aboutToQuit.connect(window._wait_for_eject_to_stop)
     window.show()
 
     sys.exit(app.exec())

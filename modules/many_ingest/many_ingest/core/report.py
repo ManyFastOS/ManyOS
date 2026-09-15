@@ -35,6 +35,11 @@ class IngestSummary:
     log_path: str
     safe_to_delete_source: bool
     metadata_warnings: int = 0
+    # The resolved Project Workspace folder (IngestReport.project_workspace_path,
+    # stringified) — additive (Fase 4). The engine is the only thing that
+    # computes this; a caller (the desktop GUI's "Open in Finder") must never
+    # reconstruct footage_subpath/CLIENT_FOLDER_NAME/client/project itself.
+    destination_path: str = ""
 
 
 def summarize(report: IngestReport) -> IngestSummary:
@@ -64,6 +69,7 @@ def summarize(report: IngestReport) -> IngestSummary:
         # (tijden/rechten/vlaggen) niet volledig kon worden overgenomen — nooit
         # een reden om safe_to_delete_source te beïnvloeden, wel traceerbaar.
         metadata_warnings=sum(1 for a in report.assets if a.metadata_warning is not None),
+        destination_path=str(report.project_workspace_path),
     )
 
 

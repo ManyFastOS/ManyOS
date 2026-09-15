@@ -24,6 +24,28 @@ Safety-first additions (see docs/MANY_INGEST_V0.1_READINESS_ASSESSMENT.md):
   moment it's known — additive, defaults to `None`, no change for existing
   callers. Lets a caller stream per-asset results live instead of only seeing
   them in the final `IngestReport.assets` list (see ingest_worker.py).
+
+Destination capacity safety (added after a real manual Fase 4 test drove a
+destination disk to 0 bytes free mid-run — see the 2026-09-15 forensic audit):
+- A capacity preflight (`DestinationFullError`, `_ensure_destination_has_capacity`)
+  aborts a REAL run before the first copy if the destination doesn't have
+  enough free space for the scanned files plus a small explicit margin
+  (`_DESTINATION_FREE_SPACE_MARGIN_BYTES`). Never raised for a dry-run — same
+  read-only principle as `DestinationUnavailableError`.
+- A filesystem can still fill up mid-run despite that preflight (e.g. another
+  process writing to the same disk concurrently). Every destination-write
+  call `_process_asset`/`run()` makes (copy, action-log, manifest) is
+  classified: `errno.ENOSPC` becomes `DestinationFullError`, any other
+  destination-write `OSError` becomes `DestinationUnavailableError` — never
+  left to escape unclassified, which is what previously let a destination
+  problem be mislabeled as "source unreadable" by a caller's broad
+  `except OSError` (ingest_worker.py). A non-ENOSPC failure during the
+  content copy itself keeps its pre-existing behaviour (a per-asset
+  `FAILED_VERIFICATION`, the run continues to the next file) — only ENOSPC
+  aborts the whole run, since every subsequent file would fail identically.
+- A failed copy never leaves a partial destination file behind: `_resolve_destination`
+  already proves the chosen `destination` path did not exist before the copy
+  attempt, so it's always safe to remove on failure (see `_process_asset`).
 """
 
 from __future__ import annotations
@@ -31,6 +53,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import enum
+import errno
 import getpass
 import socket
 import time
@@ -73,7 +96,25 @@ class DestinationUnavailableError(Exception):
     (ingest_worker.py, cli.py) can catch this separately and show a message
     that actually names the destination, instead of the destination's
     failure being caught by a generic `except OSError` and misattributed to
-    the source (a real bug found in manual testing before this existed)."""
+    the source (a real bug found in manual testing before this existed).
+
+    Also raised mid-run (not just at the start) for a non-ENOSPC OSError
+    while writing the action log or the manifest — those are infrastructure
+    writes tied to the whole run's integrity, not a single asset's, so a
+    genuine write failure there aborts the run rather than being silently
+    treated as "this one file is bad" (see `_log_or_raise`/`_process_asset`)."""
+
+
+class DestinationFullError(Exception):
+    """Raised when the destination doesn't have enough free space — either
+    detected up front, before any copy starts (`_ensure_destination_has_capacity`),
+    or mid-run when a write actually hits `errno.ENOSPC` (the filesystem can
+    fill up between the preflight check and the last file). Distinct from
+    `DestinationUnavailableError` on purpose: a caller shows a specific
+    "onvoldoende ruimte" message with the actual required/available sizes,
+    never the generic "kon deze locatie niet meer lezen" message a bare,
+    unclassified `OSError` used to produce (found via a real manual test,
+    2026-09-15 — see that day's forensic audit)."""
 
 
 class AssetOutcome(enum.Enum):
@@ -137,6 +178,13 @@ class IngestReport:
     duration_seconds: float
     total_bytes: int
     assets: list[AssetResult]
+    # The resolved Project Workspace folder ("Klanten/{client}/{project}" under
+    # the chosen destination_root) — the engine is the single source of truth
+    # for this path (Fase 4), so a caller (the desktop GUI's "Open in Finder")
+    # never has to reconstruct footage_subpath/CLIENT_FOLDER_NAME/client/project
+    # itself. Well-defined for a dry-run too (a pure path join, no filesystem
+    # access) even though nothing may exist there yet.
+    project_workspace_path: Path
 
 
 class IngestService:
@@ -175,11 +223,21 @@ class IngestService:
 
         start = time.monotonic()
         scan_result = self.scan(source)
+
+        if not dry_run:
+            # Needs the scan result (the actual file list), so this can only run
+            # after `self.scan(source)` above — never for a dry-run, same
+            # read-only principle as `_ensure_destination_is_writable`.
+            _ensure_destination_has_capacity(
+                self._storage, self._config.storage_root, scan_result.files
+            )
+
         run_id = str(uuid.uuid4())
         logger = ActionLogger(
             path=self._config.log_dir / f"{run_id}.jsonl", run_id=run_id, dry_run=dry_run
         )
-        logger.log(
+        _log_or_raise(
+            logger,
             "run_started",
             source=str(source),
             client=client,
@@ -219,7 +277,8 @@ class IngestService:
                     )
                 )
 
-        logger.log(
+        _log_or_raise(
+            logger,
             "run_completed",
             total=len(assets),
             copied=sum(1 for a in assets if a.outcome == AssetOutcome.COPIED),
@@ -237,6 +296,9 @@ class IngestService:
             duration_seconds=time.monotonic() - start,
             total_bytes=bytes_processed,
             assets=assets,
+            project_workspace_path=_project_workspace_path(
+                self._config.storage_root, client, project
+            ),
         )
 
     def _process_asset(
@@ -291,34 +353,69 @@ class IngestService:
                 # mode/xattrs/BSD flags) comes back as a returned warning
                 # string instead, never as an exception — see its docstring.
                 metadata_warning = self._storage.copy(path, destination)
-                destination_checksum = self._storage.checksum(destination)
             except OSError as exc:
+                # `_resolve_destination` above only ever returns a `destination`
+                # that was proven not to exist yet (its own collision loop only
+                # exits once `exists(candidate)` is False) — so any file found
+                # here was necessarily just (partially) written by this failed
+                # copy attempt, never something that pre-dates this run. Safe
+                # to remove unconditionally; a no-op if copy() never got far
+                # enough to create anything.
+                self._storage.remove(destination)
+                if _is_enospc(exc):
+                    raise DestinationFullError(_DESTINATION_FULL_DURING_RUN_MESSAGE) from exc
                 outcome = AssetOutcome.FAILED_VERIFICATION
                 error = str(exc)
             else:
-                if destination_checksum != checksum:
+                try:
+                    destination_checksum = self._storage.checksum(destination)
+                except OSError as exc:
+                    # The copy itself succeeded — only reading it back for
+                    # verification failed. That's not evidence the content is
+                    # bad, so (unlike the copy() failure above) this file is
+                    # never removed here.
                     outcome = AssetOutcome.FAILED_VERIFICATION
-                    error = "Checksum van de kopie komt niet overeen met het origineel."
+                    error = str(exc)
                 else:
-                    self._manifest.register(
-                        AssetRecord(
-                            asset_id=checksum,
-                            client_id=client,
-                            project_id=project,
-                            ingest_run_id=run_id,
-                            operator=getpass.getuser(),
-                            source_machine=socket.gethostname(),
-                            original_path=path,
-                            destination_path=destination,
-                            category=classification.category,
-                            camera_profile=classification.camera_profile,
-                            confidence=classification.confidence.value,
-                            ingested_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-                        )
-                    )
-                    outcome = AssetOutcome.COPIED
+                    if destination_checksum != checksum:
+                        outcome = AssetOutcome.FAILED_VERIFICATION
+                        error = "Checksum van de kopie komt niet overeen met het origineel."
+                    else:
+                        try:
+                            self._manifest.register(
+                                AssetRecord(
+                                    asset_id=checksum,
+                                    client_id=client,
+                                    project_id=project,
+                                    ingest_run_id=run_id,
+                                    operator=getpass.getuser(),
+                                    source_machine=socket.gethostname(),
+                                    original_path=path,
+                                    destination_path=destination,
+                                    category=classification.category,
+                                    camera_profile=classification.camera_profile,
+                                    confidence=classification.confidence.value,
+                                    ingested_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                                )
+                            )
+                        except OSError as exc:
+                            # The destination FILE is complete and checksum-
+                            # verified at this point — only the manifest write
+                            # failed. Never delete a verified file over that;
+                            # abort the whole run instead (same reasoning as
+                            # `_log_or_raise`: a manifest write failure is an
+                            # infrastructure problem, not a single bad asset).
+                            if _is_enospc(exc):
+                                raise DestinationFullError(
+                                    _DESTINATION_FULL_DURING_RUN_MESSAGE
+                                ) from exc
+                            raise DestinationUnavailableError(
+                                f"Kon het manifest niet bijwerken: {exc}"
+                            ) from exc
+                        outcome = AssetOutcome.COPIED
 
-        logger.log(
+        _log_or_raise(
+            logger,
             "asset_processed",
             source_path=str(path),
             destination_path=str(destination),
@@ -386,6 +483,92 @@ def _ensure_destination_is_writable(storage_root: Path) -> None:
         ) from exc
 
 
+# Kleine, expliciete reserve bovenop de daadwerkelijk geschatte ingest-grootte
+# (zie _estimate_total_bytes) — vast, niet proportioneel: "klein en
+# expliciet", geen ingewikkelde heuristiek. Dekt (a) de eigen, niet-nul writes
+# van een run zelf (het actielog en het JSON-manifest groeien mee met elk
+# bestand), en (b) dat elk bestandssysteem — exFAT is het formaat van elke
+# externe ManyFast-schijf, zie device_identity.py — clusterruimte per bestand
+# reserveert die nooit exact overeenkomt met de bronbestandsgrootte. Gevonden
+# n.a.v. een echte handmatige Fase 4-test (2026-09-15): de bestemmingsschijf
+# liep tijdens een echte run tot 0 bytes vrij leeg, wat via een niet-
+# afgevangen OSError ten onrechte als "bron onleesbaar" werd gepresenteerd —
+# zie het forensische auditrapport van die dag voor de volledige analyse.
+_DESTINATION_FREE_SPACE_MARGIN_BYTES = 500 * 1024 * 1024  # 500 MiB
+
+_DESTINATION_FULL_DURING_RUN_MESSAGE = (
+    "De bestemmingsschijf is tijdens het kopiëren vol geraakt. Maak ruimte "
+    "vrij op de bestemmingsschijf en probeer het opnieuw."
+)
+
+
+def _is_enospc(exc: OSError) -> bool:
+    return exc.errno == errno.ENOSPC
+
+
+def _format_bytes_for_message(num_bytes: int) -> str:
+    """Same B/KB/MB/GB/TB convention as core/report.py's own `_format_size` —
+    kept as a small, deliberate local copy (same established reason
+    desktop/volumes.py's `format_size` already is one) purely so this module
+    never has to import the reporting layer just for one error message; the
+    reverse import (report.py importing from here) already exists, so the
+    other direction would be circular."""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _estimate_total_bytes(files: list[Path]) -> int:
+    """Best-effort sum of every source file's current size — used only for
+    the capacity preflight below, never for progress/reporting (that's
+    `bytes_processed`'s job in `run()`, built up as files are actually
+    processed). An individual `stat()` failure is skipped, not fatal — same
+    "best-effort, not critical" stance `run()`'s own progress-byte tally
+    already takes for the exact same call."""
+    total = 0
+    for path in files:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _ensure_destination_has_capacity(storage: Storage, storage_root: Path, files: list[Path]) -> None:
+    """Preflight capacity check for a REAL run, before the first copy starts
+    (see `IngestService.run()`). Never raised for a dry-run — a preview only
+    reads, it must never need to know how much free space the destination
+    has, same principle as `_ensure_destination_is_writable`."""
+    required = _estimate_total_bytes(files) + _DESTINATION_FREE_SPACE_MARGIN_BYTES
+    available = storage.free_bytes(storage_root)
+    if available < required:
+        raise DestinationFullError(
+            "Onvoldoende ruimte op de bestemmingsschijf.\n"
+            f"Benodigd: {_format_bytes_for_message(required)}\n"
+            f"Beschikbaar: {_format_bytes_for_message(available)}"
+        )
+
+
+def _log_or_raise(logger: ActionLogger, event: str, **fields: object) -> None:
+    """Wraps `ActionLogger.log()` so an `OSError` while writing the action
+    log itself (e.g. the destination filled up, or was yanked mid-run) is
+    classified and raised as a semantic error — never left to escape
+    unclassified and be mislabeled as a source problem by a caller's broad
+    `except OSError` (see this module's docstring, and the 2026-09-15
+    forensic audit)."""
+    try:
+        logger.log(event, **fields)
+    except OSError as exc:
+        if _is_enospc(exc):
+            raise DestinationFullError(_DESTINATION_FULL_DURING_RUN_MESSAGE) from exc
+        raise DestinationUnavailableError(
+            f"Kon niet naar het actielogboek schrijven: {exc}"
+        ) from exc
+
+
 def _with_suffix(path: Path, index: int) -> Path:
     return path.with_name(f"{path.stem}_{index:03d}{path.suffix}")
 
@@ -401,6 +584,10 @@ def _resolve_recording_date(path: Path, probe_result: ProbeResult | None) -> dt.
     return dt.date.fromtimestamp(path.stat().st_mtime)
 
 
+def _project_workspace_path(storage_root: Path, client: str, project: str) -> Path:
+    return storage_root / CLIENT_FOLDER_NAME / client / project
+
+
 def _build_workspace_path(
     storage_root: Path,
     client: str,
@@ -410,10 +597,7 @@ def _build_workspace_path(
     filename: str,
 ) -> Path:
     return (
-        storage_root
-        / CLIENT_FOLDER_NAME
-        / client
-        / project
+        _project_workspace_path(storage_root, client, project)
         / f"{recording_date.isoformat()}_Raw"
         / category
         / filename

@@ -624,3 +624,110 @@ def test_dry_run_cancel_via_sigterm_stops_gracefully_and_reports_ingest_cancelle
     assert lines[-1]["event"] == "ingest_cancelled"
     assert process.returncode == 2
     assert not (tmp_path / "storage").exists()
+
+
+# -- Fase 4: human-readable .txt report, same format cli.py has always written ----
+
+
+def _report_path_from(completed: dict) -> Path:
+    log_path = Path(completed["log_path"])
+    return log_path.with_name(f"{log_path.stem}_report.txt")
+
+
+def test_real_ingest_writes_the_same_human_readable_report_cli_has_always_written(tmp_path):
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+    result, lines = _run_worker(tmp_path, input_dir, client="Nike", project="Zomer")
+    assert result.returncode == 0
+
+    completed = next(line for line in lines if line["event"] == "ingest_completed")
+    report_path = _report_path_from(completed)
+
+    assert report_path.exists()
+    text = report_path.read_text(encoding="utf-8")
+    assert "✅ INGEST VOLTOOID" in text
+    assert "Zomer" in text
+    assert "Veilig om bronmedia te verwijderen:\nJA" in text
+
+
+def test_destination_full_is_never_labeled_source_unreadable_and_never_completes(
+    tmp_path, monkeypatch, capsys
+):
+    """Fase 4.1 (2026-09-15 forensic audit): the whole point of introducing
+    `DestinationFullError` is that a full destination must never be
+    presented as "Kon deze locatie niet meer lezen" — and, since the whole
+    run aborts, must never emit `ingest_completed` either (which is what
+    ultimately gates `safe_to_delete_source`/the eject button in the GUI —
+    see desktop/main_window.py's `_resolve_eject_targets`). A real ENOSPC
+    can't be forced through a real subprocess without actually filling a
+    real disk (forbidden by this round's testing rules), so — unlike every
+    other test in this file — this one calls `ingest_worker.main()`
+    in-process, with `build_ingest_service` monkeypatched to return a stub
+    whose `.run()` raises `DestinationFullError` directly. This still proves
+    the real thing that matters: `main()`'s own except-clause dispatch."""
+    from many_ingest import ingest_worker
+    from many_ingest.core.ingest_service import DestinationFullError
+
+    class _StubService:
+        def run(self, **kwargs):
+            raise DestinationFullError(
+                "Onvoldoende ruimte op de bestemmingsschijf.\n"
+                "Benodigd: 1.0 GB\n"
+                "Beschikbaar: 200.0 MB"
+            )
+
+    monkeypatch.setattr(ingest_worker, "build_ingest_service", lambda *a, **k: _StubService())
+    monkeypatch.setenv("MANY_INGEST_ALLOW_SAME_DEVICE_FOR_TESTS", "1")
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    config_path = _write_config(tmp_path)
+
+    exit_code = ingest_worker.main(
+        [
+            "--source",
+            str(input_dir),
+            "--client",
+            "Nike",
+            "--project",
+            "Zomer",
+            "--destination",
+            str(tmp_path),
+            "--config",
+            str(config_path),
+            "--camera-profiles",
+            str(CAMERA_PROFILES_PATH),
+            "--mode",
+            "copy",
+        ]
+    )
+
+    lines = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.strip()]
+    failed = next(l for l in lines if l["event"] == "ingest_failed")
+
+    assert exit_code == ingest_worker.EXIT_FAILED
+    assert "Onvoldoende ruimte" in failed["message"]
+    assert "Kon deze locatie niet meer lezen" not in failed["message"]
+    assert not any(l["event"] == "ingest_completed" for l in lines)
+
+
+def test_dry_run_never_writes_a_report_file(tmp_path):
+    """A preview must stay strictly read-only (same guarantee ActionLogger
+    already gives the JSONL log for a dry-run) — writing the .txt report
+    unconditionally, like cli.py does, would reintroduce the exact
+    'destination unreachable' failure mode Fase 3.5's dry-run logging guard
+    exists to prevent for the desktop app's preview flow."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+    result, lines = _run_worker(tmp_path, input_dir, dry_run=True)
+    assert result.returncode == 0
+
+    completed = next(line for line in lines if line["event"] == "ingest_completed")
+    report_path = _report_path_from(completed)
+
+    assert not report_path.exists()
+    assert not (tmp_path / "storage").exists()
