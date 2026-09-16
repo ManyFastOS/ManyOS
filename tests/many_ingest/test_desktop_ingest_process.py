@@ -261,6 +261,7 @@ def test_cancel_stops_a_preview_gracefully(qapp, tmp_path):
 # -- crash handling: the GUI (this process) must never crash or raise -----------
 
 
+@pytest.mark.crash_isolation
 def test_worker_crash_emits_failed_and_never_raises(qapp, tmp_path):
     runner = ingest_process.IngestRunner(
         tmp_path,
@@ -285,6 +286,7 @@ def test_worker_crash_emits_failed_and_never_raises(qapp, tmp_path):
     assert "kopiëren" in received[0]  # echte-ingest bewoording, niet de preview-variant
 
 
+@pytest.mark.crash_isolation
 def test_preview_worker_crash_emits_failed_and_never_raises(qapp, tmp_path):
     """Zelfde als hierboven, maar voor een preview (`dry_run=True`) — bewijst
     dat de GUI ook tijdens een preview nooit meecrasht (het hele punt van

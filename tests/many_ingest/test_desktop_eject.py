@@ -406,6 +406,7 @@ def test_eject_failure_eg_resource_busy_gives_a_friendly_message_and_never_a_sta
     assert "diskutil" not in collector.failed_message.lower()
 
 
+@pytest.mark.crash_isolation
 def test_eject_crash_emits_failed_and_never_raises(qapp, tmp_path):
     volumes_root = tmp_path / "Volumes"
     volumes_root.mkdir()

@@ -26,3 +26,7 @@ include = ["many_ingest*"]
 
 [tool.pytest.ini_options]
 testpaths = ["../../tests/many_ingest"]
+markers = [
+    "crash_isolation: intentionally crashes a child QProcess with SIGSEGV to prove the GUI survives it; excluded by default (see -m). Run explicitly with `pytest -m crash_isolation`.",
+]
+addopts = "-m \"not crash_isolation\""
