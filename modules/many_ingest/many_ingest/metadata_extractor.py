@@ -45,6 +45,12 @@ class ProbeResult:
     major_brand: str | None
     compatible_brands: str | None
     container_format: str | None
+    # Fase 5.2 — additief. Only ffprobe's MXF demuxer exposes this tag (see
+    # the Fase 5.2 real-media audit: confirmed on 123/123 real Sony FX6 MXF
+    # files, 0 mismatches against the paired XML sidecar's umidRef; never
+    # present for MP4-wrapped Sony footage, e.g. FX3/A7IV). None when absent
+    # — never guessed or derived.
+    material_package_umid: str | None
 
 
 def _ffprobe_path() -> str:
@@ -95,6 +101,7 @@ def probe(path: Path) -> ProbeResult:
         major_brand=_first_tag(format_tags, ["major_brand"]),
         compatible_brands=_first_tag(format_tags, ["compatible_brands"]),
         container_format=format_info.get("format_name"),
+        material_package_umid=_first_tag(format_tags, ["material_package_umid"]),
     )
 
 

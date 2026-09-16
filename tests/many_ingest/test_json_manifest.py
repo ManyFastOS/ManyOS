@@ -25,6 +25,8 @@ def _record(
     duration_seconds: float | None = None,
     has_video_stream: bool | None = None,
     has_audio_stream: bool | None = None,
+    sidecar_of_asset_id: str | None = None,
+    relationship_evidence: str = "none",
 ) -> AssetRecord:
     return AssetRecord(
         asset_id=checksum,
@@ -51,6 +53,8 @@ def _record(
         duration_seconds=duration_seconds,
         has_video_stream=has_video_stream,
         has_audio_stream=has_audio_stream,
+        sidecar_of_asset_id=sidecar_of_asset_id,
+        relationship_evidence=relationship_evidence,
     )
 
 
@@ -281,3 +285,91 @@ def test_an_old_shaped_manifest_without_fase_5_1_keys_still_supports_dedupe(tmp_
     manifest.register(_record("new-checksum", classification_source="container_metadata"))
     assert manifest.is_duplicate("new-checksum") is True
     assert manifest.is_duplicate("pre-fase-5-1-checksum") is True
+
+
+# -- Fase 5.2: sidecar_of_asset_id + relationship_evidence -------------------
+
+
+def test_register_persists_the_new_fase_5_2_fields(tmp_path):
+    manifest_path = tmp_path / "asset_schema.json"
+    manifest = JSONManifest(manifest_path)
+
+    manifest.register(
+        _record(
+            "sidecar-checksum",
+            sidecar_of_asset_id="main-media-checksum",
+            relationship_evidence="umid_match",
+        )
+    )
+
+    schema = json.loads(manifest_path.read_text())
+    asset = schema["assets"][0]
+    assert asset["sidecar_of_asset_id"] == "main-media-checksum"
+    # Een stabiele string, nooit de Python enum-representatie (bv. niet
+    # "RelationshipEvidence.UMID_MATCH").
+    assert asset["relationship_evidence"] == "umid_match"
+
+
+def test_register_persists_none_and_none_for_a_non_sidecar_asset(tmp_path):
+    manifest_path = tmp_path / "asset_schema.json"
+    manifest = JSONManifest(manifest_path)
+
+    manifest.register(_record("abc123"))  # defaults: sidecar_of_asset_id=None, evidence="none"
+
+    schema = json.loads(manifest_path.read_text())
+    asset = schema["assets"][0]
+    assert asset["sidecar_of_asset_id"] is None
+    assert asset["relationship_evidence"] == "none"
+
+
+def test_an_old_shaped_manifest_without_fase_5_2_keys_still_supports_dedupe(tmp_path):
+    """Same guarantee as the Fase 5.0/5.1 tests above: a manifest written
+    before Fase 5.2 (with the Fase 5.0/5.1 keys, but without
+    sidecar_of_asset_id/relationship_evidence) must still work, unmigrated."""
+    manifest_path = tmp_path / "asset_schema.json"
+    old_shaped = {
+        "assets": [
+            {
+                "asset_id": "pre-fase-5-2-checksum",
+                "client_id": "Nike",
+                "project_id": "Zomer",
+                "ingest_run_id": "run-0",
+                "operator": "tester",
+                "source_machine": "test-machine",
+                "original_path": "/in/clip.mxf",
+                "destination_path": "/out/clip.mxf",
+                "category": "Camera",
+                "camera_profile": "Sony FX6",
+                "confidence": "hoog",
+                "ingested_at": "2026-08-03T00:00:00+00:00",
+                "media_type": "video",
+                "manufacturer": "Sony",
+                "model": "FX6",
+                "source_relative_path": "611_4921.MXF",
+                "classification_source": "metadata_make_or_model",
+                "codec": "prores",
+                "width": 3840,
+                "height": 2160,
+                "frame_rate": "25/1",
+                "duration_seconds": 34.84,
+                "has_video_stream": True,
+                "has_audio_stream": True,
+                # geen sidecar_of_asset_id/relationship_evidence
+            }
+        ]
+    }
+    manifest_path.write_text(json.dumps(old_shaped))
+
+    manifest = JSONManifest(manifest_path)
+    assert manifest.is_duplicate("pre-fase-5-2-checksum") is True
+    assert manifest.is_duplicate("something-else") is False
+
+    manifest.register(
+        _record(
+            "new-sidecar-checksum",
+            sidecar_of_asset_id="pre-fase-5-2-checksum",
+            relationship_evidence="umid_match",
+        )
+    )
+    assert manifest.is_duplicate("new-sidecar-checksum") is True
+    assert manifest.is_duplicate("pre-fase-5-2-checksum") is True

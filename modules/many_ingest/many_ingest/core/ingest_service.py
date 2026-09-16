@@ -79,6 +79,12 @@ from many_ingest.metadata_extractor import (
 )
 from many_ingest.ports.manifest import AssetRecord, Manifest
 from many_ingest.ports.storage import Storage
+from many_ingest.sidecar_relationship import (
+    RelationshipEvidence,
+    find_sidecar_candidates,
+    parse_sony_sidecar,
+    resolve_relationship,
+)
 
 _MAX_COLLISION_ATTEMPTS = 999
 
@@ -198,6 +204,14 @@ class AssetResult:
     duration_seconds: float | None = None
     has_video_stream: bool | None = None
     has_audio_stream: bool | None = None
+    # Fase 5.2 — additief, same rationale as the blocks above. Populated only
+    # when sidecar_relationship.resolve_relationship() actually found
+    # evidence for this file (a sidecar); every non-sidecar asset (and every
+    # sidecar without proven evidence) keeps sidecar_of_asset_id=None,
+    # relationship_evidence=NONE — see sidecar_relationship.py's module
+    # docstring for why this is evidence-driven, never camera-model-driven.
+    sidecar_of_asset_id: str | None = None
+    relationship_evidence: RelationshipEvidence = RelationshipEvidence.NONE
 
 
 AssetCallback = Callable[[AssetResult], None]
@@ -281,13 +295,35 @@ class IngestService:
             files_found=len(scan_result.files),
         )
 
+        # Fase 5.2 — resolved once, up front, over the whole file list: a
+        # sidecar can appear before or after its main media in
+        # scan_result.files (arbitrary rglob order), and resolution here
+        # only ever reads each candidate file directly (XML text, ffprobe),
+        # never depends on another file having been "processed" yet — so
+        # the result is identical regardless of scan order. See
+        # sidecar_relationship.py's module docstring for the evidence rules.
+        resolved_sidecars = _resolve_sidecar_relationships(scan_result.files, scan_result.source)
+        # Run-scoped only: guarantees a main-media file referenced by a
+        # sidecar is never checksummed twice (once for its own asset, once
+        # for the sidecar's sidecar_of_asset_id) regardless of which one
+        # this loop reaches first — see _cached_checksum().
+        checksum_cache: dict[Path, str] = {}
+
         total = len(scan_result.files)
         assets: list[AssetResult] = []
         bytes_processed = 0
 
         for index, path in enumerate(scan_result.files, start=1):
             asset = self._process_asset(
-                path, scan_result.source, client, project, run_id, dry_run, logger
+                path,
+                scan_result.source,
+                client,
+                project,
+                run_id,
+                dry_run,
+                logger,
+                resolved_sidecars,
+                checksum_cache,
             )
             assets.append(asset)
 
@@ -348,6 +384,8 @@ class IngestService:
         run_id: str,
         dry_run: bool,
         logger: ActionLogger,
+        resolved_sidecars: dict[Path, tuple[Path, RelationshipEvidence]],
+        checksum_cache: dict[Path, str],
     ) -> AssetResult:
         probe_result = safe_probe(path)
         file_type = detect_file_type(path, probe_result)
@@ -364,8 +402,19 @@ class IngestService:
             category=classification.category,
             filename=path.name,
         )
-        checksum = self._storage.checksum(path)
+        checksum = _cached_checksum(self._storage, checksum_cache, path)
         is_duplicate = self._manifest.is_duplicate(checksum)
+
+        # Fase 5.2 — populated only when resolve_relationship() already
+        # found evidence for this exact file (see run()); nothing here
+        # changes checksum/dedupe semantics — sidecar_of_asset_id is just
+        # the main media's own, already-computed asset_id.
+        sidecar_of_asset_id: str | None = None
+        relationship_evidence = RelationshipEvidence.NONE
+        resolved = resolved_sidecars.get(path)
+        if resolved is not None:
+            main_media_path, relationship_evidence = resolved
+            sidecar_of_asset_id = _cached_checksum(self._storage, checksum_cache, main_media_path)
 
         destination = naive_destination
         name_conflict_resolved = False
@@ -450,6 +499,8 @@ class IngestService:
                                     duration_seconds=technical_metadata.duration_seconds,
                                     has_video_stream=technical_metadata.has_video_stream,
                                     has_audio_stream=technical_metadata.has_audio_stream,
+                                    sidecar_of_asset_id=sidecar_of_asset_id,
+                                    relationship_evidence=relationship_evidence.value,
                                 )
                             )
                         except OSError as exc:
@@ -495,6 +546,8 @@ class IngestService:
             duration_seconds=technical_metadata.duration_seconds,
             has_video_stream=technical_metadata.has_video_stream,
             has_audio_stream=technical_metadata.has_audio_stream,
+            sidecar_of_asset_id=sidecar_of_asset_id,
+            relationship_evidence=relationship_evidence.value,
         )
 
         return AssetResult(
@@ -522,6 +575,8 @@ class IngestService:
             duration_seconds=technical_metadata.duration_seconds,
             has_video_stream=technical_metadata.has_video_stream,
             has_audio_stream=technical_metadata.has_audio_stream,
+            sidecar_of_asset_id=sidecar_of_asset_id,
+            relationship_evidence=relationship_evidence,
         )
 
     def _resolve_destination(self, source_checksum: str, destination: Path) -> tuple[Path, bool]:
@@ -649,6 +704,42 @@ def _log_or_raise(logger: ActionLogger, event: str, **fields: object) -> None:
 
 def _with_suffix(path: Path, index: int) -> Path:
     return path.with_name(f"{path.stem}_{index:03d}{path.suffix}")
+
+
+def _cached_checksum(storage: Storage, cache: dict[Path, str], path: Path) -> str:
+    """Fase 5.2 — run-scoped cache (see run()). Guarantees a main-media file
+    referenced by a sidecar's sidecar_of_asset_id is never checksummed twice
+    within one run: once when the main media reaches its own turn in the
+    per-file loop, once when a sidecar (processed before or after it,
+    scan-order independent) needs the exact same checksum. Every checksum
+    computation in _process_asset() goes through this, not just
+    sidecar-related ones, so double-hashing can never happen in either
+    direction."""
+    cached = cache.get(path)
+    if cached is not None:
+        return cached
+    checksum = storage.checksum(path)
+    cache[path] = checksum
+    return checksum
+
+
+def _resolve_sidecar_relationships(
+    files: list[Path], source: Path
+) -> dict[Path, tuple[Path, RelationshipEvidence]]:
+    """Fase 5.2 — resolved once, up front (see run()), over the whole scan
+    result: candidate discovery (naming + same-directory only) and evidence
+    resolution (UMID, then duration fallback) both read each candidate file
+    directly and independently, so the result never depends on scan order.
+    Only candidates with actual evidence (not RelationshipEvidence.NONE) are
+    kept — everything else stays an ordinary, unrelated asset."""
+    resolved: dict[Path, tuple[Path, RelationshipEvidence]] = {}
+    for sidecar_path, main_media_path in find_sidecar_candidates(files, source).items():
+        evidence = resolve_relationship(
+            parse_sony_sidecar(sidecar_path), safe_probe(main_media_path)
+        )
+        if evidence is not RelationshipEvidence.NONE:
+            resolved[sidecar_path] = (main_media_path, evidence)
+    return resolved
 
 
 def _resolve_source_relative_path(path: Path, source: Path) -> Path | None:

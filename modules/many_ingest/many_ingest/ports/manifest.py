@@ -52,6 +52,14 @@ class AssetRecord:
     duration_seconds: float | None = None
     has_video_stream: bool | None = None
     has_audio_stream: bool | None = None
+    # Fase 5.2 — additief, same backward-compat pattern as above.
+    # relationship_evidence is typed as plain str (the RelationshipEvidence
+    # enum's .value), same deliberate ports/classification decoupling reason
+    # as classification_source above. sidecar_of_asset_id is the main
+    # media's own asset_id (SHA-256) — never a new kind of identity; a
+    # sidecar keeps its own separate asset_id/checksum unchanged.
+    sidecar_of_asset_id: str | None = None
+    relationship_evidence: str = "none"
 
 
 class Manifest(abc.ABC):

@@ -21,6 +21,7 @@ from many_ingest.adapters.local_fs_storage import LocalFilesystemStorage
 from many_ingest.classification.camera_profiles import ClassificationSource
 from many_ingest.classification.file_types import MediaType
 from many_ingest.config import IngestConfig
+from many_ingest.core import ingest_service as ingest_service_module
 from many_ingest.core.ingest_service import (
     AssetOutcome,
     DestinationFullError,
@@ -28,11 +29,13 @@ from many_ingest.core.ingest_service import (
     IngestService,
     ProgressUpdate,
     _normalize_frame_rate,
+    _resolve_sidecar_relationships,
 )
 from many_ingest.core.report import summarize
 from many_ingest.logger import ActionLogger
 from many_ingest.metadata_extractor import FfprobeNotFoundError
 from many_ingest.ports.storage import Storage
+from many_ingest.sidecar_relationship import RelationshipEvidence
 
 requires_ffmpeg = pytest.mark.skipif(
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
@@ -1109,3 +1112,244 @@ class TestFase51MetadataProvenance:
         assert summary.video_count == 1
         assert summary.camera_profile_counts == {"DJI": 1}
         assert summary.errors == 0
+
+
+class _CountingChecksumStorage(LocalFilesystemStorage):
+    """Fase 5.2 — wraps the real storage adapter to count how often each
+    path is actually checksummed, so the "never hash a main-media file
+    twice" guarantee can be verified as observable behaviour through the
+    existing Storage port, not as a brittle inspection of an internal cache
+    dict."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.checksum_calls: dict[Path, int] = {}
+
+    def checksum(self, path: Path) -> str:
+        self.checksum_calls[path] = self.checksum_calls.get(path, 0) + 1
+        return super().checksum(path)
+
+
+_REAL_UMID = "060A2B340101010501010D43130000006AED1A61791206D210322CFFFE7DA477"
+
+
+class TestFase52SidecarAssociation:
+    """Fase 5.2 — sidecar_of_asset_id/relationship_evidence. None of these
+    tests touch destination paths, category, camera_profile, confidence,
+    manufacturer, model, classification_source, checksum/dedupe semantics,
+    or collision resolution — those are covered, unchanged, elsewhere."""
+
+    def _write_umid_matched_pair(self, input_dir: Path, umid: str = _REAL_UMID) -> None:
+        (input_dir / "611_4921.MXF").write_bytes(b"fake mxf bytes")
+        (input_dir / "611_4921M01.XML").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<NonRealTimeMeta xmlns="urn:schemas-professionalDisc:nonRealTimeMeta:ver.2.20">\n'
+            f'  <TargetMaterial umidRef="{umid}"/>\n'
+            '  <Duration value="871"/>\n'
+            '  <LtcChangeTable tcFps="25" halfStep="false"></LtcChangeTable>\n'
+            "</NonRealTimeMeta>\n"
+        )
+
+    def _fake_safe_probe_with_umid(self, umid: str):
+        def _fake(path: Path):
+            if path.name == "611_4921.MXF":
+                return _probe_result_with_umid(f"0x{umid}")
+            return None
+
+        return _fake
+
+    def test_umid_matched_sidecar_gets_the_main_medias_checksum(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        self._write_umid_matched_pair(input_dir)
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", self._fake_safe_probe_with_umid(_REAL_UMID)
+        )
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {asset.source_path.name: asset for asset in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.UMID_MATCH
+        assert sidecar_asset.sidecar_of_asset_id == main_asset.checksum
+        # De sidecar behoudt gewoon zijn eigen, andere checksum.
+        assert sidecar_asset.checksum != main_asset.checksum
+
+    def test_non_sidecar_assets_have_no_relationship(self, tmp_path, camera_profiles):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        asset = report.assets[0]
+        assert asset.sidecar_of_asset_id is None
+        assert asset.relationship_evidence == RelationshipEvidence.NONE
+
+    def test_sidecar_without_a_naming_candidate_has_no_relationship(
+        self, tmp_path, camera_profiles
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "notes.XML").write_text("<not-sony-metadata/>")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        asset = report.assets[0]
+        assert asset.sidecar_of_asset_id is None
+        assert asset.relationship_evidence == RelationshipEvidence.NONE
+        assert asset.outcome == AssetOutcome.COPIED  # blokkeert de ingest niet
+
+    def test_dry_run_resolves_relationships_without_writing_anything(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """Sidecar-resolutie leest alleen (XML-tekst, ffprobe) — een preview
+        blijft dus net zo read-only als vóór Fase 5.2."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        self._write_umid_matched_pair(input_dir)
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", self._fake_safe_probe_with_umid(_REAL_UMID)
+        )
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        by_name = {asset.source_path.name: asset for asset in report.assets}
+        assert by_name["611_4921M01.XML"].relationship_evidence == RelationshipEvidence.UMID_MATCH
+        assert not config.storage_root.exists()  # niets gekopieerd
+        assert not config.manifest_path.exists()  # niets geregistreerd
+
+    def test_main_media_referenced_by_a_sidecar_is_checksummed_only_once(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        self._write_umid_matched_pair(input_dir)
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", self._fake_safe_probe_with_umid(_REAL_UMID)
+        )
+
+        config = _make_config(tmp_path)
+        counting_storage = _CountingChecksumStorage()
+        service = _make_service(config, camera_profiles, storage=counting_storage)
+        service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        main_media_path = input_dir / "611_4921.MXF"
+        assert counting_storage.checksum_calls[main_media_path] == 1
+
+    def test_malformed_sidecar_xml_does_not_block_ingest(self, tmp_path, camera_profiles):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "611_4921.MXF").write_bytes(b"fake mxf bytes")
+        (input_dir / "611_4921M01.XML").write_text("<NonRealTimeMeta><Unclosed>")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {asset.source_path.name: asset for asset in report.assets}
+        sidecar_asset = by_name["611_4921M01.XML"]
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.NONE
+        assert sidecar_asset.sidecar_of_asset_id is None
+        assert sidecar_asset.outcome == AssetOutcome.COPIED
+
+    def test_destination_paths_are_exactly_unchanged_by_fase_5_2(self, tmp_path, camera_profiles):
+        """Regression guard: Fase 5.2 changes nothing about where a sidecar
+        ends up on disk — that's Fase 5.3's job."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        self._write_umid_matched_pair(input_dir)
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        by_name = {asset.source_path.name: asset for asset in report.assets}
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Onbekend")
+        # De sidecar wordt vandaag nog gewoon als Onbekend geclassificeerd —
+        # de relatie staat los van category/destination in Fase 5.2.
+        assert by_name["611_4921M01.XML"].destination_path == expected_dir / "611_4921M01.XML"
+
+    def test_classification_is_unaffected_by_sidecar_association(self, tmp_path, camera_profiles):
+        """Regression guard: category/camera_profile/confidence/manufacturer/
+        model/classification_source stay exactly what they were before
+        Fase 5.2, for both the sidecar and its main media."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        self._write_umid_matched_pair(input_dir)
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        by_name = {asset.source_path.name: asset for asset in report.assets}
+        sidecar_asset = by_name["611_4921M01.XML"]
+        assert sidecar_asset.category == "Onbekend"
+        assert sidecar_asset.camera_profile == "Onbekend"
+        assert sidecar_asset.classification_source == ClassificationSource.NO_SIGNAL_MATCHED
+
+
+def _probe_result_with_umid(material_package_umid: str | None):
+    from many_ingest.metadata_extractor import ProbeResult
+
+    return ProbeResult(
+        has_video_stream=True,
+        has_audio_stream=True,
+        codec=None,
+        width=None,
+        height=None,
+        frame_rate=None,
+        duration_seconds=None,
+        make=None,
+        model=None,
+        creation_time=None,
+        major_brand=None,
+        compatible_brands=None,
+        container_format=None,
+        material_package_umid=material_package_umid,
+    )
+
+
+class TestResolveSidecarRelationshipsOrderIndependence:
+    """Fase 5.2 — proves _resolve_sidecar_relationships() gives an identical
+    result regardless of which order scan_result.files happens to list a
+    sidecar and its main media in (rglob order is not something this logic
+    may depend on)."""
+
+    def test_same_result_regardless_of_scan_order(self, tmp_path, monkeypatch):
+        source = tmp_path
+        xml_path = tmp_path / "611_4921M01.XML"
+        xml_path.write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<NonRealTimeMeta xmlns="urn:schemas-professionalDisc:nonRealTimeMeta:ver.2.20">\n'
+            f'  <TargetMaterial umidRef="{_REAL_UMID}"/>\n'
+            '  <Duration value="871"/>\n'
+            '  <LtcChangeTable tcFps="25" halfStep="false"></LtcChangeTable>\n'
+            "</NonRealTimeMeta>\n"
+        )
+        media_path = tmp_path / "611_4921.MXF"
+        media_path.write_bytes(b"fake mxf bytes")
+
+        monkeypatch.setattr(
+            ingest_service_module,
+            "safe_probe",
+            lambda path: _probe_result_with_umid(f"0x{_REAL_UMID}") if path == media_path else None,
+        )
+
+        sidecar_first = _resolve_sidecar_relationships([xml_path, media_path], source)
+        media_first = _resolve_sidecar_relationships([media_path, xml_path], source)
+
+        assert sidecar_first == media_first
+        assert sidecar_first == {xml_path: (media_path, RelationshipEvidence.UMID_MATCH)}
