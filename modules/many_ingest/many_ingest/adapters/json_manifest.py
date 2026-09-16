@@ -37,6 +37,9 @@ class JSONManifest(Manifest):
         asset_dict = dataclasses.asdict(record)
         asset_dict["original_path"] = str(record.original_path)
         asset_dict["destination_path"] = str(record.destination_path)
+        asset_dict["source_relative_path"] = (
+            str(record.source_relative_path) if record.source_relative_path is not None else None
+        )
         data.setdefault("assets", []).append(asset_dict)
 
         self._path.parent.mkdir(parents=True, exist_ok=True)

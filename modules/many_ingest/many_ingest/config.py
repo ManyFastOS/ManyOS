@@ -70,6 +70,15 @@ class CameraProfile:
     metadata_container_contains: list[str]
     audio_only: bool = False
     container_requires_brand: bool = False
+    # Fase 5.0 — additief, nooit gebruikt door classify()'s matching-logica zelf
+    # (die blijft ongewijzigd op filename/metadata-patronen). Puur beschrijvende
+    # data, voor het eerst gebruikt door ClassificationResult.manufacturer/model
+    # (zie classification/camera_profiles.py). Nullable: een profiel zonder
+    # specifiek model (bv. "DJI", "Audio") laat `model` gewoon None; een oude
+    # camera_profiles.yaml zonder deze sleutels blijft laden (zie
+    # load_camera_profiles()'s .get()-defaults hieronder).
+    manufacturer: str | None = None
+    model: str | None = None
 
 
 def load_storage_layout(path: Path) -> StorageLayout:
@@ -147,6 +156,8 @@ def load_camera_profiles(path: Path) -> list[CameraProfile]:
                 metadata_container_contains=metadata_match.get("container_contains", []),
                 audio_only=entry.get("audio_only", False),
                 container_requires_brand=metadata_match.get("container_requires_brand", False),
+                manufacturer=entry.get("manufacturer"),
+                model=entry.get("model"),
             )
         )
     return profiles

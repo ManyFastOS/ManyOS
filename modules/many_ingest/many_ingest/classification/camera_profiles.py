@@ -64,6 +64,12 @@ class ClassificationResult:
     category: str
     camera_profile: str
     confidence: Confidence
+    # Fase 5.0 — additief, uit exact hetzelfde gematchte CameraProfile-record als
+    # camera_profile/category hierboven (nooit los berekend of afgeleid uit de
+    # label-string). None bij Onbekend, of bij een profiel dat geen specifiek
+    # model target (bv. "DJI", "GoPro" — zie camera_profiles.yaml).
+    manufacturer: str | None
+    model: str | None
 
 
 def classify(
@@ -139,7 +145,11 @@ def _matches_container(probe_result: ProbeResult | None, profile: CameraProfile)
 
 def _result_for(profile: CameraProfile, confidence: Confidence) -> ClassificationResult:
     return ClassificationResult(
-        category=profile.category, camera_profile=profile.label, confidence=confidence
+        category=profile.category,
+        camera_profile=profile.label,
+        confidence=confidence,
+        manufacturer=profile.manufacturer,
+        model=profile.model,
     )
 
 
@@ -148,4 +158,6 @@ def _unknown() -> ClassificationResult:
         category=UNKNOWN_CATEGORY,
         camera_profile=UNKNOWN_PROFILE_LABEL,
         confidence=Confidence.LOW,
+        manufacturer=None,
+        model=None,
     )

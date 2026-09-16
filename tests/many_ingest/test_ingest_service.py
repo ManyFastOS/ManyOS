@@ -16,6 +16,7 @@ import pytest
 
 from many_ingest.adapters.json_manifest import JSONManifest
 from many_ingest.adapters.local_fs_storage import LocalFilesystemStorage
+from many_ingest.classification.file_types import MediaType
 from many_ingest.config import IngestConfig
 from many_ingest.core.ingest_service import (
     AssetOutcome,
@@ -853,3 +854,102 @@ class TestRuntimeEnospc:
 
         with pytest.raises(DestinationUnavailableError):
             service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+
+class TestFase50ClassificationFoundation:
+    """Fase 5.0 — additive domain-model fields (media_type/manufacturer/model/
+    source_relative_path). None of these tests exercise anything new about
+    destination paths, category, camera_profile, confidence, dedupe, or
+    collision resolution — those are covered, unchanged, by the tests above."""
+
+    def test_source_relative_path_captures_the_nested_card_structure(
+        self, tmp_path, camera_profiles
+    ):
+        input_dir = tmp_path / "input"
+        nested = input_dir / "PRIVATE" / "M4ROOT" / "CLIP"
+        nested.mkdir(parents=True)
+        (nested / "C0001.MXF").write_bytes(b"fake mxf bytes")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        asset = report.assets[0]
+        assert asset.source_relative_path == Path("PRIVATE/M4ROOT/CLIP/C0001.MXF")
+        # Card-structuur mag geen enkele invloed hebben op waar het bestand
+        # terechtkomt — alleen de bestandsnaam telt mee, zoals altijd al.
+        assert asset.destination_path.name == "C0001.MXF"
+
+    def test_source_relative_path_falls_back_to_none_when_relative_to_fails(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        def _broken_relative_to(self, *args, **kwargs):
+            raise ValueError("gesimuleerd: pad valt niet onder de bronroot")
+
+        monkeypatch.setattr(Path, "relative_to", _broken_relative_to)
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        asset = report.assets[0]
+        assert asset.source_relative_path is None
+        # Een niet-bepaalbare provenance-waarde mag de rest van de asset nooit
+        # beïnvloeden — de ingest zelf slaagt gewoon.
+        assert asset.outcome == AssetOutcome.COPIED
+        assert asset.destination_path.exists()
+
+    def test_destination_path_is_exactly_unchanged_by_fase_5_0(self, tmp_path, camera_profiles):
+        """Regression guard: threading `source` into _process_asset() for
+        source_relative_path must not shift destination resolution by even
+        one character."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        expected = _workspace_dir(config, "Nike", "Zomer", "Drone") / "DJI_0001.MP4"
+        assert report.assets[0].destination_path == expected
+
+    def test_real_run_exposes_media_type_manufacturer_and_model_on_the_asset_result(
+        self, tmp_path, camera_profiles
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        asset = report.assets[0]
+        assert asset.media_type == MediaType.VIDEO
+        assert asset.manufacturer == "DJI"
+        assert asset.model is None  # DJI-profiel is generiek, geen specifiek model
+        assert asset.source_relative_path == Path("DJI_0001.MP4")
+
+    def test_real_run_persists_fase_5_0_fields_in_the_manifest(self, tmp_path, camera_profiles):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        schema = json.loads(config.manifest_path.read_text())
+        record = schema["assets"][0]
+        assert record["media_type"] == "video"
+        assert record["manufacturer"] == "DJI"
+        assert record["model"] is None
+        assert record["source_relative_path"] == "DJI_0001.MP4"
+        # Bestaande velden blijven onaangeroerd.
+        assert record["category"] == "Drone"
+        assert record["camera_profile"] == "DJI"

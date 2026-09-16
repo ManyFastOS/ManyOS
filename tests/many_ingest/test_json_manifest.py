@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,13 @@ from many_ingest.adapters.json_manifest import JSONManifest
 from many_ingest.ports.manifest import AssetRecord
 
 
-def _record(checksum: str) -> AssetRecord:
+def _record(
+    checksum: str,
+    media_type: str = "unknown",
+    manufacturer: str | None = None,
+    model: str | None = None,
+    source_relative_path: Path | None = None,
+) -> AssetRecord:
     return AssetRecord(
         asset_id=checksum,
         client_id="Nike",
@@ -24,6 +31,10 @@ def _record(checksum: str) -> AssetRecord:
         camera_profile="DJI",
         confidence="hoog",
         ingested_at="2026-08-03T00:00:00+00:00",
+        media_type=media_type,
+        manufacturer=manufacturer,
+        model=model,
+        source_relative_path=source_relative_path,
     )
 
 
@@ -80,3 +91,81 @@ def test_a_failed_write_never_corrupts_the_existing_manifest(tmp_path, monkeypat
     reloaded = JSONManifest(manifest_path)
     assert reloaded.is_duplicate("already-safe") is True
     assert reloaded.is_duplicate("never-makes-it-in") is False
+
+
+# -- Fase 5.0: additive fields + backward compatibility ---------------------
+
+
+def test_register_persists_the_new_fase_5_0_fields(tmp_path):
+    manifest_path = tmp_path / "asset_schema.json"
+    manifest = JSONManifest(manifest_path)
+
+    manifest.register(
+        _record(
+            "abc123",
+            media_type="video",
+            manufacturer="Sony",
+            model="FX6",
+            source_relative_path=Path("PRIVATE/M4ROOT/CLIP/C0001.MXF"),
+        )
+    )
+
+    schema = json.loads(manifest_path.read_text())
+    asset = schema["assets"][0]
+    assert asset["media_type"] == "video"
+    assert asset["manufacturer"] == "Sony"
+    assert asset["model"] == "FX6"
+    assert asset["source_relative_path"] == "PRIVATE/M4ROOT/CLIP/C0001.MXF"
+
+
+def test_register_persists_null_manufacturer_model_and_source_relative_path_when_unknown(
+    tmp_path,
+):
+    manifest_path = tmp_path / "asset_schema.json"
+    manifest = JSONManifest(manifest_path)
+
+    manifest.register(_record("abc123"))  # defaults: manufacturer/model/source_relative_path=None
+
+    schema = json.loads(manifest_path.read_text())
+    asset = schema["assets"][0]
+    assert asset["media_type"] == "unknown"
+    assert asset["manufacturer"] is None
+    assert asset["model"] is None
+    assert asset["source_relative_path"] is None
+
+
+def test_an_old_shaped_manifest_without_fase_5_0_keys_still_supports_dedupe(tmp_path):
+    """A manifest written before Fase 5.0 has entries with no media_type/
+    manufacturer/model/source_relative_path keys at all — no migration is
+    performed in Fase 5.0, so is_duplicate() must keep working against a
+    manifest file exactly like that, unchanged."""
+    manifest_path = tmp_path / "asset_schema.json"
+    old_shaped = {
+        "assets": [
+            {
+                "asset_id": "pre-fase-5-0-checksum",
+                "client_id": "Nike",
+                "project_id": "Zomer",
+                "ingest_run_id": "run-0",
+                "operator": "tester",
+                "source_machine": "test-machine",
+                "original_path": "/in/clip.mp4",
+                "destination_path": "/out/clip.mp4",
+                "category": "Drone",
+                "camera_profile": "DJI",
+                "confidence": "hoog",
+                "ingested_at": "2026-08-03T00:00:00+00:00",
+                # geen media_type/manufacturer/model/source_relative_path
+            }
+        ]
+    }
+    manifest_path.write_text(json.dumps(old_shaped))
+
+    manifest = JSONManifest(manifest_path)
+    assert manifest.is_duplicate("pre-fase-5-0-checksum") is True
+    assert manifest.is_duplicate("something-else") is False
+
+    # Nieuwe registraties naast oude, kale records blijven werken.
+    manifest.register(_record("new-checksum", media_type="video"))
+    assert manifest.is_duplicate("new-checksum") is True
+    assert manifest.is_duplicate("pre-fase-5-0-checksum") is True

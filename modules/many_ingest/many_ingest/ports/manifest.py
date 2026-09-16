@@ -25,6 +25,16 @@ class AssetRecord:
     camera_profile: str
     confidence: str
     ingested_at: str
+    # Fase 5.0 — additief. Defaulted (not just nullable) so existing call sites
+    # that construct an AssetRecord without them keep working unchanged; every
+    # NEW record written by IngestService always passes real values explicitly
+    # (see core/ingest_service.py). Old, already-persisted JSON manifest
+    # entries simply lack these keys entirely — no migration in Fase 5.0, and
+    # nothing here requires one (is_duplicate() only ever reads asset_id).
+    media_type: str = "unknown"
+    manufacturer: str | None = None
+    model: str | None = None
+    source_relative_path: Path | None = None
 
 
 class Manifest(abc.ABC):

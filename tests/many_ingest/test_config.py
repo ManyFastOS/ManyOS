@@ -157,3 +157,47 @@ def test_sony_fx6_in_the_real_config_does_not_require_brand_for_its_container_si
 ):
     fx6 = next(p for p in camera_profiles if p.id == "sony_fx6")
     assert fx6.container_requires_brand is False
+
+
+# -- Fase 5.0: manufacturer/model vocabulary --------------------------------
+
+
+def test_camera_profile_manufacturer_and_model_default_to_none_when_absent(tmp_path):
+    """A camera_profiles.yaml written before Fase 5.0 (no manufacturer/model
+    keys at all) must keep loading without error — these two fields are
+    purely additive."""
+    path = tmp_path / "camera_profiles.yaml"
+    path.write_text("profiles:\n  - id: x\n    label: X\n    category: Camera\n")
+    profiles = load_camera_profiles(path)
+    assert profiles[0].manufacturer is None
+    assert profiles[0].model is None
+
+
+def test_camera_profile_manufacturer_and_model_load_when_present(tmp_path):
+    path = tmp_path / "camera_profiles.yaml"
+    path.write_text(
+        "profiles:\n"
+        "  - id: x\n"
+        "    label: X\n"
+        "    category: Camera\n"
+        "    manufacturer: Sony\n"
+        "    model: FX6\n"
+    )
+    profiles = load_camera_profiles(path)
+    assert profiles[0].manufacturer == "Sony"
+    assert profiles[0].model == "FX6"
+
+
+def test_sony_fx6_and_fx3_in_the_real_config_have_manufacturer_and_model(camera_profiles):
+    fx6 = next(p for p in camera_profiles if p.id == "sony_fx6")
+    fx3 = next(p for p in camera_profiles if p.id == "sony_fx3")
+    assert (fx6.manufacturer, fx6.model) == ("Sony", "FX6")
+    assert (fx3.manufacturer, fx3.model) == ("Sony", "FX3")
+
+
+def test_dji_in_the_real_config_has_a_manufacturer_but_no_specific_model(camera_profiles):
+    """DJI's profile matches generically on the make tag, not one specific
+    drone model — model stays None rather than a guessed/invented value."""
+    dji = next(p for p in camera_profiles if p.id == "dji")
+    assert dji.manufacturer == "DJI"
+    assert dji.model is None

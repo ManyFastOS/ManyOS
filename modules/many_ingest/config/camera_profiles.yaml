@@ -36,6 +36,8 @@ profiles:
   - id: sony_fx6
     label: "Sony FX6"
     category: Camera
+    manufacturer: "Sony"
+    model: "FX6"
     confirmed_filename_patterns:
       - "^611_\\d{4}\\.MXF$"   # bevestigd over drie onafhankelijke ManyFast-projecten
                                 # met crew-gelabelde "FX6"-mappen, zie
@@ -55,6 +57,8 @@ profiles:
   - id: sony_a7iv
     label: "Sony A7 IV"
     category: Camera
+    manufacturer: "Sony"
+    model: "A7 IV"
     filename_patterns:
       - "^DSC\\d+\\..*"
     metadata_match:
@@ -65,6 +69,8 @@ profiles:
   - id: sony_fx3
     label: "Sony FX3"
     category: Camera
+    manufacturer: "Sony"
+    model: "FX3"
     filename_patterns:
       - "^C\\d{4}\\..*"
     metadata_match:
@@ -87,6 +93,9 @@ profiles:
   - id: dji
     label: "DJI"
     category: Drone
+    manufacturer: "DJI"
+    # Geen 'model' — dit profiel matcht generiek op de DJI-merknaam, niet op
+    # een specifiek dronemodel (zie metadata_match.make_contains hieronder).
     filename_patterns:
       - "^DJI_.*"
     metadata_match:
@@ -96,6 +105,8 @@ profiles:
   - id: gopro
     label: "GoPro"
     category: Camera
+    manufacturer: "GoPro"
+    # Geen 'model' — generiek merkprofiel, niet gebonden aan één GoPro-model.
     filename_patterns:
       - "^GH\\d+\\..*"
       - "^GOPR\\d+\\..*"

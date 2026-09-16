@@ -12,6 +12,10 @@ def test_dji_matches_via_filename_and_metadata(camera_profiles, make_probe_resul
     assert result.category == "Drone"
     assert result.camera_profile == "DJI"
     assert result.confidence == Confidence.HIGH
+    # Fase 5.0: manufacturer/model come from the same matched CameraProfile —
+    # DJI's profile is generic (no specific model), so model stays None.
+    assert result.manufacturer == "DJI"
+    assert result.model is None
 
 
 def test_gopro_matches_via_metadata_regardless_of_filename(camera_profiles, make_probe_result):
@@ -30,12 +34,17 @@ def test_fx6_metadata_disambiguates(camera_profiles, make_probe_result):
     result = classify(Path("C0001.MP4"), make_probe_result(model="ILME-FX6"), camera_profiles)
     assert result.camera_profile == "Sony FX6"
     assert result.confidence == Confidence.HIGH
+    # Fase 5.0: manufacturer/model, from the same matched CameraProfile record.
+    assert result.manufacturer == "Sony"
+    assert result.model == "FX6"
 
 
 def test_fx3_metadata_disambiguates(camera_profiles, make_probe_result):
     result = classify(Path("C0001.MP4"), make_probe_result(model="ILME-FX3"), camera_profiles)
     assert result.camera_profile == "Sony FX3"
     assert result.confidence == Confidence.HIGH
+    assert result.manufacturer == "Sony"
+    assert result.model == "FX3"
 
 
 def test_audio_via_stream_analysis(camera_profiles, make_probe_result):
@@ -170,3 +179,6 @@ def test_unknown_file_has_low_confidence(camera_profiles):
     result = classify(Path("random_export.mp4"), None, camera_profiles)
     assert result.category == "Onbekend"
     assert result.confidence == Confidence.LOW
+    # Fase 5.0: no matched profile -> no manufacturer/model either, never guessed.
+    assert result.manufacturer is None
+    assert result.model is None

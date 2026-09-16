@@ -62,7 +62,12 @@ from pathlib import Path
 from typing import Callable
 
 from many_ingest.classification.camera_profiles import Confidence, classify
-from many_ingest.classification.file_types import FileType, detect_file_type
+from many_ingest.classification.file_types import (
+    FileType,
+    MediaType,
+    detect_file_type,
+    detect_media_type,
+)
 from many_ingest.config import CameraProfile, IngestConfig
 from many_ingest.logger import ActionLogger
 from many_ingest.metadata_extractor import (
@@ -162,6 +167,20 @@ class AssetResult:
     # mode/xattrs/BSD flags) — non-critical, never a reason to fail the asset.
     # See Storage.copy()'s docstring for the failure-severity split this is from.
     metadata_warning: str | None = None
+    # Fase 5.0 — additief, computed alongside the fields above but never
+    # replacing them (see the Fase 5.0 domain-model design: category/
+    # camera_profile/FileType/destination paths/dedupe are all unchanged).
+    # manufacturer/model come from the exact same classify() call/CameraProfile
+    # record as camera_profile/category — never derived from the label string.
+    # media_type is always populated for a new AssetResult (UNKNOWN is its safe
+    # fallback, never None); the default below only exists to satisfy dataclass
+    # field ordering, real construction in _process_asset() always passes it
+    # explicitly. source_relative_path is None only when path.relative_to(source)
+    # genuinely can't be computed — see _resolve_source_relative_path().
+    manufacturer: str | None = None
+    model: str | None = None
+    media_type: MediaType = MediaType.UNKNOWN
+    source_relative_path: Path | None = None
 
 
 AssetCallback = Callable[[AssetResult], None]
@@ -250,7 +269,9 @@ class IngestService:
         bytes_processed = 0
 
         for index, path in enumerate(scan_result.files, start=1):
-            asset = self._process_asset(path, client, project, run_id, dry_run, logger)
+            asset = self._process_asset(
+                path, scan_result.source, client, project, run_id, dry_run, logger
+            )
             assets.append(asset)
 
             if asset_callback is not None:
@@ -304,6 +325,7 @@ class IngestService:
     def _process_asset(
         self,
         path: Path,
+        source: Path,
         client: str,
         project: str,
         run_id: str,
@@ -312,7 +334,9 @@ class IngestService:
     ) -> AssetResult:
         probe_result = safe_probe(path)
         file_type = detect_file_type(path, probe_result)
+        media_type = detect_media_type(path, probe_result)
         classification = classify(path, probe_result, self._camera_profiles)
+        source_relative_path = _resolve_source_relative_path(path, source)
         recording_date = _resolve_recording_date(path, probe_result)
         naive_destination = _build_workspace_path(
             storage_root=self._config.storage_root,
@@ -396,6 +420,10 @@ class IngestService:
                                     camera_profile=classification.camera_profile,
                                     confidence=classification.confidence.value,
                                     ingested_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                                    media_type=media_type.value,
+                                    manufacturer=classification.manufacturer,
+                                    model=classification.model,
+                                    source_relative_path=source_relative_path,
                                 )
                             )
                         except OSError as exc:
@@ -429,6 +457,10 @@ class IngestService:
             outcome=outcome.value,
             error=error,
             metadata_warning=metadata_warning,
+            media_type=media_type.value,
+            manufacturer=classification.manufacturer,
+            model=classification.model,
+            source_relative_path=source_relative_path,
         )
 
         return AssetResult(
@@ -444,6 +476,10 @@ class IngestService:
             name_conflict_resolved=name_conflict_resolved,
             error=error,
             metadata_warning=metadata_warning,
+            manufacturer=classification.manufacturer,
+            model=classification.model,
+            media_type=media_type,
+            source_relative_path=source_relative_path,
         )
 
     def _resolve_destination(self, source_checksum: str, destination: Path) -> tuple[Path, bool]:
@@ -571,6 +607,21 @@ def _log_or_raise(logger: ActionLogger, event: str, **fields: object) -> None:
 
 def _with_suffix(path: Path, index: int) -> Path:
     return path.with_name(f"{path.stem}_{index:03d}{path.suffix}")
+
+
+def _resolve_source_relative_path(path: Path, source: Path) -> Path | None:
+    """Fase 5.0 — computed once here, the sole writer of `source_relative_path`
+    (see AssetResult/AssetRecord). Stored only, never read back by any
+    classification/destination/dedupe logic in this phase — see the Fase 5.0
+    domain-model design. `list_files(source)` only ever yields descendants of
+    `source`, so `relative_to()` failing here should not happen in practice;
+    it's guarded anyway (e.g. a symlink could theoretically break the
+    ancestor relationship) so a cosmetic provenance field can never abort or
+    fail an asset — `None` is a safe, honest "couldn't determine this"."""
+    try:
+        return path.relative_to(source)
+    except ValueError:
+        return None
 
 
 def _resolve_recording_date(path: Path, probe_result: ProbeResult | None) -> dt.date:
