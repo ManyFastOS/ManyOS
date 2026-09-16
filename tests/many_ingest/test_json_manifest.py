@@ -17,6 +17,14 @@ def _record(
     manufacturer: str | None = None,
     model: str | None = None,
     source_relative_path: Path | None = None,
+    classification_source: str = "no_signal_matched",
+    codec: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+    frame_rate: str | None = None,
+    duration_seconds: float | None = None,
+    has_video_stream: bool | None = None,
+    has_audio_stream: bool | None = None,
 ) -> AssetRecord:
     return AssetRecord(
         asset_id=checksum,
@@ -35,6 +43,14 @@ def _record(
         manufacturer=manufacturer,
         model=model,
         source_relative_path=source_relative_path,
+        classification_source=classification_source,
+        codec=codec,
+        width=width,
+        height=height,
+        frame_rate=frame_rate,
+        duration_seconds=duration_seconds,
+        has_video_stream=has_video_stream,
+        has_audio_stream=has_audio_stream,
     )
 
 
@@ -169,3 +185,99 @@ def test_an_old_shaped_manifest_without_fase_5_0_keys_still_supports_dedupe(tmp_
     manifest.register(_record("new-checksum", media_type="video"))
     assert manifest.is_duplicate("new-checksum") is True
     assert manifest.is_duplicate("pre-fase-5-0-checksum") is True
+
+
+# -- Fase 5.1: classification_source + technical metadata -------------------
+
+
+def test_register_persists_the_new_fase_5_1_fields(tmp_path):
+    manifest_path = tmp_path / "asset_schema.json"
+    manifest = JSONManifest(manifest_path)
+
+    manifest.register(
+        _record(
+            "abc123",
+            classification_source="metadata_make_or_model",
+            codec="prores",
+            width=3840,
+            height=2160,
+            frame_rate="30000/1001",
+            duration_seconds=125.371800,
+            has_video_stream=True,
+            has_audio_stream=False,
+        )
+    )
+
+    schema = json.loads(manifest_path.read_text())
+    asset = schema["assets"][0]
+    # classification_source is een stabiele string, nooit de Python
+    # enum-representatie (bv. niet "ClassificationSource.METADATA_MAKE_OR_MODEL").
+    assert asset["classification_source"] == "metadata_make_or_model"
+    assert asset["codec"] == "prores"
+    assert asset["width"] == 3840
+    assert asset["height"] == 2160
+    # De exacte rationale framerate-string, nooit afgerond/omgezet naar float.
+    assert asset["frame_rate"] == "30000/1001"
+    assert asset["duration_seconds"] == 125.371800
+    assert asset["has_video_stream"] is True
+    assert asset["has_audio_stream"] is False
+
+
+def test_register_persists_none_technical_metadata_when_probe_was_unavailable(tmp_path):
+    manifest_path = tmp_path / "asset_schema.json"
+    manifest = JSONManifest(manifest_path)
+
+    manifest.register(_record("abc123"))  # defaults: alle Fase 5.1-velden None/no_signal_matched
+
+    schema = json.loads(manifest_path.read_text())
+    asset = schema["assets"][0]
+    assert asset["classification_source"] == "no_signal_matched"
+    assert asset["codec"] is None
+    assert asset["width"] is None
+    assert asset["height"] is None
+    assert asset["frame_rate"] is None
+    assert asset["duration_seconds"] is None
+    # None (geen probe), niet False (probe draaide en vond geen stream).
+    assert asset["has_video_stream"] is None
+    assert asset["has_audio_stream"] is None
+
+
+def test_an_old_shaped_manifest_without_fase_5_1_keys_still_supports_dedupe(tmp_path):
+    """Same guarantee as the Fase 5.0 test above, one phase further: a
+    manifest written before Fase 5.1 (with the Fase 5.0 keys, but without
+    classification_source/codec/width/height/frame_rate/duration_seconds/
+    has_video_stream/has_audio_stream) must still work, unmigrated."""
+    manifest_path = tmp_path / "asset_schema.json"
+    old_shaped = {
+        "assets": [
+            {
+                "asset_id": "pre-fase-5-1-checksum",
+                "client_id": "Nike",
+                "project_id": "Zomer",
+                "ingest_run_id": "run-0",
+                "operator": "tester",
+                "source_machine": "test-machine",
+                "original_path": "/in/clip.mp4",
+                "destination_path": "/out/clip.mp4",
+                "category": "Drone",
+                "camera_profile": "DJI",
+                "confidence": "hoog",
+                "ingested_at": "2026-08-03T00:00:00+00:00",
+                "media_type": "video",
+                "manufacturer": "DJI",
+                "model": None,
+                "source_relative_path": "DJI_0001.MP4",
+                # geen classification_source/codec/width/height/frame_rate/
+                # duration_seconds/has_video_stream/has_audio_stream
+            }
+        ]
+    }
+    manifest_path.write_text(json.dumps(old_shaped))
+
+    manifest = JSONManifest(manifest_path)
+    assert manifest.is_duplicate("pre-fase-5-1-checksum") is True
+    assert manifest.is_duplicate("something-else") is False
+
+    manifest.register(_record("new-checksum", classification_source="container_metadata"))
+    assert manifest.is_duplicate("new-checksum") is True
+    assert manifest.is_duplicate("pre-fase-5-1-checksum") is True

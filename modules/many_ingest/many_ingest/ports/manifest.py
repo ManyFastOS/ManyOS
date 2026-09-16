@@ -35,6 +35,23 @@ class AssetRecord:
     manufacturer: str | None = None
     model: str | None = None
     source_relative_path: Path | None = None
+    # Fase 5.1 — additief, same backward-compat pattern as Fase 5.0 above.
+    # classification_source is typed as plain str (the enum's .value), not
+    # the ClassificationSource enum itself — same deliberate reason
+    # `confidence` above is already a plain str: this ports module must not
+    # depend on the classification package's implementation details.
+    # Technical metadata fields are nullable per Fase 5.1's None-vs-False
+    # rule: None means "no reliable probe data" (ffprobe didn't run/failed),
+    # False means "ffprobe ran and definitively found no such stream" — never
+    # conflated.
+    classification_source: str = "no_signal_matched"
+    codec: str | None = None
+    width: int | None = None
+    height: int | None = None
+    frame_rate: str | None = None
+    duration_seconds: float | None = None
+    has_video_stream: bool | None = None
+    has_audio_stream: bool | None = None
 
 
 class Manifest(abc.ABC):

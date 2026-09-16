@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from many_ingest.classification.camera_profiles import Confidence, classify
+from many_ingest.classification.camera_profiles import ClassificationSource, Confidence, classify
+from many_ingest.config import CameraProfile
 
 
 def test_dji_matches_via_filename_and_metadata(camera_profiles, make_probe_result):
@@ -16,18 +17,21 @@ def test_dji_matches_via_filename_and_metadata(camera_profiles, make_probe_resul
     # DJI's profile is generic (no specific model), so model stays None.
     assert result.manufacturer == "DJI"
     assert result.model is None
+    assert result.classification_source == ClassificationSource.METADATA_MAKE_OR_MODEL
 
 
 def test_gopro_matches_via_metadata_regardless_of_filename(camera_profiles, make_probe_result):
     result = classify(Path("weird_name.mp4"), make_probe_result(make="GoPro"), camera_profiles)
     assert result.camera_profile == "GoPro"
     assert result.confidence == Confidence.HIGH
+    assert result.classification_source == ClassificationSource.METADATA_MAKE_OR_MODEL
 
 
 def test_fx6_and_fx3_share_a_filename_pattern_and_need_metadata_to_disambiguate(camera_profiles):
     result = classify(Path("C0001.MP4"), None, camera_profiles)
     assert result.category == "Onbekend"
     assert result.confidence == Confidence.LOW
+    assert result.classification_source == ClassificationSource.CONFLICTING_SIGNALS
 
 
 def test_fx6_metadata_disambiguates(camera_profiles, make_probe_result):
@@ -37,6 +41,7 @@ def test_fx6_metadata_disambiguates(camera_profiles, make_probe_result):
     # Fase 5.0: manufacturer/model, from the same matched CameraProfile record.
     assert result.manufacturer == "Sony"
     assert result.model == "FX6"
+    assert result.classification_source == ClassificationSource.METADATA_MAKE_OR_MODEL
 
 
 def test_fx3_metadata_disambiguates(camera_profiles, make_probe_result):
@@ -45,6 +50,7 @@ def test_fx3_metadata_disambiguates(camera_profiles, make_probe_result):
     assert result.confidence == Confidence.HIGH
     assert result.manufacturer == "Sony"
     assert result.model == "FX3"
+    assert result.classification_source == ClassificationSource.METADATA_MAKE_OR_MODEL
 
 
 def test_audio_via_stream_analysis(camera_profiles, make_probe_result):
@@ -55,12 +61,14 @@ def test_audio_via_stream_analysis(camera_profiles, make_probe_result):
     )
     assert result.category == "Audio"
     assert result.confidence == Confidence.HIGH
+    assert result.classification_source == ClassificationSource.STREAM_ANALYSIS
 
 
 def test_audio_via_extension_without_metadata(camera_profiles):
     result = classify(Path("recording.wav"), None, camera_profiles)
     assert result.category == "Audio"
     assert result.confidence == Confidence.MEDIUM
+    assert result.classification_source == ClassificationSource.GENERIC_FILENAME_PATTERN
 
 
 def test_xavc_brand_without_model_or_container_stays_ambiguous(
@@ -75,6 +83,7 @@ def test_xavc_brand_without_model_or_container_stays_ambiguous(
     result = classify(Path("C9666.MP4"), probe_result, camera_profiles)
     assert result.category == "Onbekend"
     assert result.confidence == Confidence.LOW
+    assert result.classification_source == ClassificationSource.CONFLICTING_SIGNALS
 
 
 def test_container_format_resolves_fx3_without_model_tag(camera_profiles, make_probe_result):
@@ -94,6 +103,7 @@ def test_container_format_resolves_fx3_without_model_tag(camera_profiles, make_p
     assert result.category == "Camera"
     assert result.camera_profile == "Sony FX3"
     assert result.confidence == Confidence.HIGH
+    assert result.classification_source == ClassificationSource.CONTAINER_METADATA
 
 
 def test_container_format_resolves_fx6_independent_of_confirmed_filename(
@@ -109,6 +119,7 @@ def test_container_format_resolves_fx6_independent_of_confirmed_filename(
     assert result.category == "Camera"
     assert result.camera_profile == "Sony FX6"
     assert result.confidence == Confidence.HIGH
+    assert result.classification_source == ClassificationSource.CONTAINER_METADATA
 
 
 def test_generic_mp4_without_sony_metadata_is_never_classified_as_fx3(
@@ -128,6 +139,7 @@ def test_generic_mp4_without_sony_metadata_is_never_classified_as_fx3(
     assert result.camera_profile != "Sony FX3"
     assert result.category == "Onbekend"
     assert result.confidence == Confidence.LOW
+    assert result.classification_source == ClassificationSource.NO_SIGNAL_MATCHED
 
 
 def test_xavc_brand_with_model_still_disambiguates(camera_profiles, make_probe_result):
@@ -137,6 +149,7 @@ def test_xavc_brand_with_model_still_disambiguates(camera_profiles, make_probe_r
     result = classify(Path("C9666.MP4"), probe_result, camera_profiles)
     assert result.camera_profile == "Sony FX6"
     assert result.confidence == Confidence.HIGH
+    assert result.classification_source == ClassificationSource.METADATA_MAKE_OR_MODEL
 
 
 def test_sony_mxf_company_name_alone_is_not_enough_for_a_specific_model_match(
@@ -149,6 +162,7 @@ def test_sony_mxf_company_name_alone_is_not_enough_for_a_specific_model_match(
     probe_result = make_probe_result(make="Sony", model="Mem")
     result = classify(Path("randomly_named_export.mxf"), probe_result, camera_profiles)
     assert result.category == "Onbekend"
+    assert result.classification_source == ClassificationSource.NO_SIGNAL_MATCHED
 
 
 def test_confirmed_611_pattern_matches_fx6_at_high_confidence(camera_profiles):
@@ -161,6 +175,7 @@ def test_confirmed_611_pattern_matches_fx6_at_high_confidence(camera_profiles):
     assert result.camera_profile == "Sony FX6"
     assert result.category == "Camera"
     assert result.confidence == Confidence.HIGH
+    assert result.classification_source == ClassificationSource.CONFIRMED_FILENAME_PATTERN
 
 
 def test_generic_filename_pattern_still_only_reaches_medium_confidence(camera_profiles):
@@ -172,6 +187,7 @@ def test_generic_filename_pattern_still_only_reaches_medium_confidence(camera_pr
     assert result.category == "Drone"
     assert result.camera_profile == "DJI"
     assert result.confidence == Confidence.MEDIUM
+    assert result.classification_source == ClassificationSource.GENERIC_FILENAME_PATTERN
 
 
 def test_unknown_file_has_low_confidence(camera_profiles):
@@ -182,3 +198,68 @@ def test_unknown_file_has_low_confidence(camera_profiles):
     # Fase 5.0: no matched profile -> no manufacturer/model either, never guessed.
     assert result.manufacturer is None
     assert result.model is None
+    assert result.classification_source == ClassificationSource.NO_SIGNAL_MATCHED
+
+
+# -- Fase 5.1: classification_source tie-break priority ---------------------
+# Synthetic profiles (not the real camera_profiles.yaml) so a single winning
+# profile can be made to match on more than one predicate at once, in
+# isolation — the real config's Sony profiles share filename patterns in a
+# way that always produces a genuine conflict rather than a clean tie.
+
+
+def test_high_tier_metadata_wins_over_confirmed_filename_when_both_match(make_probe_result):
+    profile = CameraProfile(
+        id="test_cam",
+        label="Test Cam",
+        category="Camera",
+        filename_patterns=[],
+        confirmed_filename_patterns=[r"^TEST\d+\..*"],
+        metadata_make_contains=[],
+        metadata_model_contains=["TESTMODEL"],
+        metadata_brand_contains=[],
+        metadata_container_contains=[],
+    )
+    probe_result = make_probe_result(model="TESTMODEL")
+    result = classify(Path("TEST001.MP4"), probe_result, [profile])
+    assert result.camera_profile == "Test Cam"
+    assert result.confidence == Confidence.HIGH
+    assert result.classification_source == ClassificationSource.METADATA_MAKE_OR_MODEL
+
+
+def test_high_tier_confirmed_filename_wins_over_container_when_both_match(make_probe_result):
+    profile = CameraProfile(
+        id="test_cam",
+        label="Test Cam",
+        category="Camera",
+        filename_patterns=[],
+        confirmed_filename_patterns=[r"^TEST\d+\..*"],
+        metadata_make_contains=[],
+        metadata_model_contains=[],
+        metadata_brand_contains=[],
+        metadata_container_contains=["testcontainer"],
+    )
+    probe_result = make_probe_result(container_format="testcontainer")
+    result = classify(Path("TEST001.MP4"), probe_result, [profile])
+    assert result.camera_profile == "Test Cam"
+    assert result.confidence == Confidence.HIGH
+    assert result.classification_source == ClassificationSource.CONFIRMED_FILENAME_PATTERN
+
+
+def test_medium_tier_brand_wins_over_generic_filename_when_both_match(make_probe_result):
+    profile = CameraProfile(
+        id="test_cam",
+        label="Test Cam",
+        category="Camera",
+        filename_patterns=[r"^TEST.*"],
+        confirmed_filename_patterns=[],
+        metadata_make_contains=[],
+        metadata_model_contains=[],
+        metadata_brand_contains=["TESTBRAND"],
+        metadata_container_contains=[],
+    )
+    probe_result = make_probe_result(major_brand="TESTBRAND")
+    result = classify(Path("TESTCLIP.MP4"), probe_result, [profile])
+    assert result.camera_profile == "Test Cam"
+    assert result.confidence == Confidence.MEDIUM
+    assert result.classification_source == ClassificationSource.METADATA_BRAND

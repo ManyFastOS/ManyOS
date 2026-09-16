@@ -61,7 +61,7 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-from many_ingest.classification.camera_profiles import Confidence, classify
+from many_ingest.classification.camera_profiles import ClassificationSource, Confidence, classify
 from many_ingest.classification.file_types import (
     FileType,
     MediaType,
@@ -181,6 +181,23 @@ class AssetResult:
     model: str | None = None
     media_type: MediaType = MediaType.UNKNOWN
     source_relative_path: Path | None = None
+    # Fase 5.1 — additief, same rationale as the Fase 5.0 block above: real
+    # construction in _process_asset() always passes these explicitly, the
+    # defaults here only satisfy dataclass field ordering.
+    # classification_source is provenance (WHY the classification above was
+    # chosen), never a second classification decision — see
+    # classification/camera_profiles.py's ClassificationSource. Technical
+    # metadata fields follow the None-vs-False rule: None means no reliable
+    # probe data (ffprobe missing/failed for this file), False means ffprobe
+    # ran and definitively found no such stream.
+    classification_source: ClassificationSource = ClassificationSource.NO_SIGNAL_MATCHED
+    codec: str | None = None
+    width: int | None = None
+    height: int | None = None
+    frame_rate: str | None = None
+    duration_seconds: float | None = None
+    has_video_stream: bool | None = None
+    has_audio_stream: bool | None = None
 
 
 AssetCallback = Callable[[AssetResult], None]
@@ -337,6 +354,7 @@ class IngestService:
         media_type = detect_media_type(path, probe_result)
         classification = classify(path, probe_result, self._camera_profiles)
         source_relative_path = _resolve_source_relative_path(path, source)
+        technical_metadata = _resolve_technical_metadata(probe_result)
         recording_date = _resolve_recording_date(path, probe_result)
         naive_destination = _build_workspace_path(
             storage_root=self._config.storage_root,
@@ -424,6 +442,14 @@ class IngestService:
                                     manufacturer=classification.manufacturer,
                                     model=classification.model,
                                     source_relative_path=source_relative_path,
+                                    classification_source=classification.classification_source.value,
+                                    codec=technical_metadata.codec,
+                                    width=technical_metadata.width,
+                                    height=technical_metadata.height,
+                                    frame_rate=technical_metadata.frame_rate,
+                                    duration_seconds=technical_metadata.duration_seconds,
+                                    has_video_stream=technical_metadata.has_video_stream,
+                                    has_audio_stream=technical_metadata.has_audio_stream,
                                 )
                             )
                         except OSError as exc:
@@ -461,6 +487,14 @@ class IngestService:
             manufacturer=classification.manufacturer,
             model=classification.model,
             source_relative_path=source_relative_path,
+            classification_source=classification.classification_source.value,
+            codec=technical_metadata.codec,
+            width=technical_metadata.width,
+            height=technical_metadata.height,
+            frame_rate=technical_metadata.frame_rate,
+            duration_seconds=technical_metadata.duration_seconds,
+            has_video_stream=technical_metadata.has_video_stream,
+            has_audio_stream=technical_metadata.has_audio_stream,
         )
 
         return AssetResult(
@@ -480,6 +514,14 @@ class IngestService:
             model=classification.model,
             media_type=media_type,
             source_relative_path=source_relative_path,
+            classification_source=classification.classification_source,
+            codec=technical_metadata.codec,
+            width=technical_metadata.width,
+            height=technical_metadata.height,
+            frame_rate=technical_metadata.frame_rate,
+            duration_seconds=technical_metadata.duration_seconds,
+            has_video_stream=technical_metadata.has_video_stream,
+            has_audio_stream=technical_metadata.has_audio_stream,
         )
 
     def _resolve_destination(self, source_checksum: str, destination: Path) -> tuple[Path, bool]:
@@ -622,6 +664,75 @@ def _resolve_source_relative_path(path: Path, source: Path) -> Path | None:
         return path.relative_to(source)
     except ValueError:
         return None
+
+
+@dataclasses.dataclass(frozen=True)
+class _TechnicalMetadata:
+    """Fase 5.1 — normalized technical metadata (layer B, see the Fase 5.1
+    design: raw ffprobe stays in ProbeResult, this is ManyOS's own stable
+    subset of it). Purely a grouping convenience for _process_asset(); never
+    persisted as a nested object — AssetResult/AssetRecord keep these as flat
+    sibling fields, same shape as Fase 5.0."""
+
+    codec: str | None
+    width: int | None
+    height: int | None
+    frame_rate: str | None
+    duration_seconds: float | None
+    has_video_stream: bool | None
+    has_audio_stream: bool | None
+
+
+_MISSING_TECHNICAL_METADATA = _TechnicalMetadata(
+    codec=None,
+    width=None,
+    height=None,
+    frame_rate=None,
+    duration_seconds=None,
+    has_video_stream=None,
+    has_audio_stream=None,
+)
+
+
+def _resolve_technical_metadata(probe_result: ProbeResult | None) -> _TechnicalMetadata:
+    """Fase 5.1 — the sole writer of the technical-metadata fields on
+    AssetResult/AssetRecord. `None` on every field when `probe_result` is
+    `None` (ffprobe missing or failed for this file) — never a reason to
+    fail the asset itself (see `safe_probe()`). Deliberately distinct from
+    `False` on has_video_stream/has_audio_stream, which means ffprobe ran
+    and definitively found no such stream — the two must never be conflated."""
+    if probe_result is None:
+        return _MISSING_TECHNICAL_METADATA
+    return _TechnicalMetadata(
+        codec=probe_result.codec,
+        width=probe_result.width,
+        height=probe_result.height,
+        frame_rate=_normalize_frame_rate(probe_result.frame_rate),
+        duration_seconds=probe_result.duration_seconds,
+        has_video_stream=probe_result.has_video_stream,
+        has_audio_stream=probe_result.has_audio_stream,
+    )
+
+
+def _normalize_frame_rate(raw: str | None) -> str | None:
+    """Fase 5.1 — validates ProbeResult's raw rational frame-rate string
+    (e.g. "30000/1001") and returns it UNCHANGED when usable — the exact
+    rational value is the persisted source of truth (never a float; a future
+    UI derives a display value like 29.97 from this if it wants one). Only
+    genuinely unusable input becomes `None`: missing, empty, malformed, or a
+    zero/negative numerator or denominator (e.g. "0/0")."""
+    if not raw:
+        return None
+    parts = raw.split("/")
+    if len(parts) != 2:
+        return None
+    try:
+        numerator, denominator = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if numerator <= 0 or denominator <= 0:
+        return None
+    return raw
 
 
 def _resolve_recording_date(path: Path, probe_result: ProbeResult | None) -> dt.date:

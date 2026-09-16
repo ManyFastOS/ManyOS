@@ -10,12 +10,15 @@ from __future__ import annotations
 import datetime as dt
 import errno
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from many_ingest.adapters.json_manifest import JSONManifest
 from many_ingest.adapters.local_fs_storage import LocalFilesystemStorage
+from many_ingest.classification.camera_profiles import ClassificationSource
 from many_ingest.classification.file_types import MediaType
 from many_ingest.config import IngestConfig
 from many_ingest.core.ingest_service import (
@@ -24,11 +27,17 @@ from many_ingest.core.ingest_service import (
     DestinationUnavailableError,
     IngestService,
     ProgressUpdate,
+    _normalize_frame_rate,
 )
 from many_ingest.core.report import summarize
 from many_ingest.logger import ActionLogger
 from many_ingest.metadata_extractor import FfprobeNotFoundError
 from many_ingest.ports.storage import Storage
+
+requires_ffmpeg = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+    reason="ffmpeg/ffprobe niet geïnstalleerd",
+)
 
 
 def _make_config(tmp_path: Path) -> IngestConfig:
@@ -953,3 +962,150 @@ class TestFase50ClassificationFoundation:
         # Bestaande velden blijven onaangeroerd.
         assert record["category"] == "Drone"
         assert record["camera_profile"] == "DJI"
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("24000/1001", "24000/1001"),
+        ("25/1", "25/1"),
+        ("30000/1001", "30000/1001"),
+        ("50/1", "50/1"),
+        ("60000/1001", "60000/1001"),
+        ("0/0", None),
+        (None, None),
+        ("", None),
+        ("not-a-fraction", None),
+        ("25", None),
+        ("25/1/2", None),
+        ("25/0", None),
+        ("-25/1", None),
+        ("25/-1", None),
+    ],
+)
+def test_normalize_frame_rate(raw, expected):
+    """Fase 5.1: the exact rational string is the persisted source of truth
+    (never a float) — a valid value is returned byte-for-byte unchanged,
+    never reformatted; only genuinely unusable input becomes None."""
+    assert _normalize_frame_rate(raw) == expected
+
+
+class TestFase51MetadataProvenance:
+    """Fase 5.1 — classification_source + technical metadata
+    (codec/width/height/frame_rate/duration_seconds/has_video_stream/
+    has_audio_stream). None of these tests touch destination paths,
+    category, camera_profile, confidence, manufacturer, model, dedupe, or
+    collision resolution — those are covered, unchanged, elsewhere."""
+
+    def test_real_run_exposes_classification_source_on_the_asset_result(
+        self, tmp_path, camera_profiles
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        asset = report.assets[0]
+        # "fake video bytes" is not a real video -> ffprobe fails -> classify()
+        # falls back to the DJI_* filename pattern alone (MEDIUM tier).
+        assert asset.classification_source == ClassificationSource.GENERIC_FILENAME_PATTERN
+
+    def test_missing_probe_result_leaves_all_technical_metadata_none(
+        self, tmp_path, camera_profiles
+    ):
+        """None (not False) means "no reliable probe data" — ffprobe failed
+        on this file entirely, never a claim about what streams exist."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        asset = report.assets[0]
+        assert asset.codec is None
+        assert asset.width is None
+        assert asset.height is None
+        assert asset.frame_rate is None
+        assert asset.duration_seconds is None
+        assert asset.has_video_stream is None
+        assert asset.has_audio_stream is None
+        # Een ontbrekende probe mag de ingest zelf nooit laten falen.
+        assert asset.outcome == AssetOutcome.COPIED
+
+    @requires_ffmpeg
+    def test_real_video_technical_metadata_is_extracted_and_persisted(
+        self, tmp_path, camera_profiles
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        clip = input_dir / "DJI_0001.MP4"
+        subprocess.run(
+            [
+                "ffmpeg", "-v", "quiet", "-y",
+                "-f", "lavfi", "-i", "color=c=black:s=320x240:r=25:d=1",
+                "-c:v", "libx264",
+                str(clip),
+            ],
+            check=True,
+        )
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        asset = report.assets[0]
+        assert asset.codec is not None
+        assert asset.width == 320
+        assert asset.height == 240
+        assert asset.frame_rate == "25/1"
+        assert asset.duration_seconds is not None
+        assert asset.has_video_stream is True
+        assert asset.has_audio_stream is False
+
+        schema = json.loads(config.manifest_path.read_text())
+        record = schema["assets"][0]
+        assert record["codec"] == asset.codec
+        assert record["width"] == 320
+        assert record["height"] == 240
+        assert record["frame_rate"] == "25/1"
+        assert record["has_video_stream"] is True
+        assert record["has_audio_stream"] is False
+        # classification_source moet als stabiele string geserialiseerd zijn,
+        # nooit als Python enum-representatie (bv. niet
+        # "ClassificationSource.GENERIC_FILENAME_PATTERN").
+        assert record["classification_source"] == "generic_filename_pattern"
+
+    def test_destination_path_is_exactly_unchanged_by_fase_5_1(self, tmp_path, camera_profiles):
+        """Regression guard, same style as the Fase 5.0 equivalent above."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        expected = _workspace_dir(config, "Nike", "Zomer", "Drone") / "DJI_0001.MP4"
+        assert report.assets[0].destination_path == expected
+
+    def test_reporting_counts_are_unaffected_by_fase_5_1_fields(self, tmp_path, camera_profiles):
+        """Regression guard: core/report.py is untouched in Fase 5.1 — the
+        new fields must not perturb the existing summarize() output."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        summary = summarize(report)
+        assert summary.total_files == 1
+        assert summary.video_count == 1
+        assert summary.camera_profile_counts == {"DJI": 1}
+        assert summary.errors == 0

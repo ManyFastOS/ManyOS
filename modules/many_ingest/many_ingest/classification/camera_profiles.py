@@ -59,6 +59,26 @@ class Confidence(enum.Enum):
     LOW = "laag"
 
 
+class ClassificationSource(enum.Enum):
+    """Fase 5.1 — provenance only: WHICH signal decided the winning match,
+    never a second vote on WHAT the match is. Populated strictly after
+    classify() has already picked a winner (or Onbekend); the tie-break
+    priority used when a profile matches on more than one signal at once
+    mirrors camera_profiles.yaml's own documented rule ("Metadata weegt
+    binnen elk niveau zwaarder dan bestandsnaam") plus this module's
+    docstring, which explicitly calls a container match a workflow
+    convention rather than a hardware fact like make/model."""
+
+    METADATA_MAKE_OR_MODEL = "metadata_make_or_model"
+    STREAM_ANALYSIS = "stream_analysis"
+    CONFIRMED_FILENAME_PATTERN = "confirmed_filename_pattern"
+    CONTAINER_METADATA = "container_metadata"
+    METADATA_BRAND = "metadata_brand"
+    GENERIC_FILENAME_PATTERN = "generic_filename_pattern"
+    CONFLICTING_SIGNALS = "conflicting_signals"
+    NO_SIGNAL_MATCHED = "no_signal_matched"
+
+
 @dataclasses.dataclass(frozen=True)
 class ClassificationResult:
     category: str
@@ -70,6 +90,10 @@ class ClassificationResult:
     # model target (bv. "DJI", "GoPro" — zie camera_profiles.yaml).
     manufacturer: str | None
     model: str | None
+    # Fase 5.1 — provenance, altijd gevuld (ook voor Onbekend, via
+    # CONFLICTING_SIGNALS/NO_SIGNAL_MATCHED). Nooit gebruikt om de
+    # classificatiebeslissing zelf te beïnvloeden — zie classify().
+    classification_source: ClassificationSource
 
 
 def classify(
@@ -85,9 +109,14 @@ def classify(
         or _matches_container(probe_result, p)
     ]
     if len(high_matches) == 1:
-        return _result_for(high_matches[0], Confidence.HIGH)
+        profile = high_matches[0]
+        return _result_for(
+            profile, Confidence.HIGH, _explain_high_match(path, probe_result, profile)
+        )
     if len(high_matches) > 1:
-        return _unknown()  # tegenstrijdige signalen op het hoogste niveau -> te onzeker
+        return _unknown(
+            ClassificationSource.CONFLICTING_SIGNALS
+        )  # tegenstrijdige signalen op het hoogste niveau -> te onzeker
 
     medium_matches = [
         p
@@ -95,11 +124,16 @@ def classify(
         if _matches_brand(probe_result, p) or _matches_generic_filename(path, p)
     ]
     if len(medium_matches) == 1:
-        return _result_for(medium_matches[0], Confidence.MEDIUM)
+        profile = medium_matches[0]
+        return _result_for(
+            profile, Confidence.MEDIUM, _explain_medium_match(path, probe_result, profile)
+        )
     if len(medium_matches) > 1:
-        return _unknown()  # bijv. Sony XAVC zonder model -> kan FX6 of FX3 zijn
+        return _unknown(
+            ClassificationSource.CONFLICTING_SIGNALS
+        )  # bijv. Sony XAVC zonder model -> kan FX6 of FX3 zijn
 
-    return _unknown()  # geen enkel signaal matcht
+    return _unknown(ClassificationSource.NO_SIGNAL_MATCHED)  # geen enkel signaal matcht
 
 
 def _matches_confirmed_filename(path: Path, profile: CameraProfile) -> bool:
@@ -143,21 +177,59 @@ def _matches_container(probe_result: ProbeResult | None, profile: CameraProfile)
     return any(needle.lower() in container for needle in profile.metadata_container_contains)
 
 
-def _result_for(profile: CameraProfile, confidence: Confidence) -> ClassificationResult:
+def _explain_high_match(
+    path: Path, probe_result: ProbeResult | None, profile: CameraProfile
+) -> ClassificationSource:
+    """Fase 5.1 — provenance only. Re-checks the same predicates
+    high_matches already evaluated, against the single winning profile,
+    purely to label which one fired; called only after classify() has
+    already decided this profile won, and can never change that decision.
+    Priority when several predicates match at once: metadata/stream evidence
+    (a hardware fact) outranks a confirmed filename pattern (evidence-backed,
+    but still a naming convention), which outranks a container match
+    (explicitly documented as a workflow convention, not a hardware fact)."""
+    if _matches_make_or_model(probe_result, profile):
+        return (
+            ClassificationSource.STREAM_ANALYSIS
+            if profile.audio_only
+            else ClassificationSource.METADATA_MAKE_OR_MODEL
+        )
+    if _matches_confirmed_filename(path, profile):
+        return ClassificationSource.CONFIRMED_FILENAME_PATTERN
+    return ClassificationSource.CONTAINER_METADATA
+
+
+def _explain_medium_match(
+    path: Path, probe_result: ProbeResult | None, profile: CameraProfile
+) -> ClassificationSource:
+    """Fase 5.1 — provenance only, see _explain_high_match(). Metadata
+    (brand) outranks a generic, not-yet-confirmed filename pattern, per
+    camera_profiles.yaml's documented "metadata weegt zwaarder dan
+    bestandsnaam" tie-break."""
+    if _matches_brand(probe_result, profile):
+        return ClassificationSource.METADATA_BRAND
+    return ClassificationSource.GENERIC_FILENAME_PATTERN
+
+
+def _result_for(
+    profile: CameraProfile, confidence: Confidence, source: ClassificationSource
+) -> ClassificationResult:
     return ClassificationResult(
         category=profile.category,
         camera_profile=profile.label,
         confidence=confidence,
         manufacturer=profile.manufacturer,
         model=profile.model,
+        classification_source=source,
     )
 
 
-def _unknown() -> ClassificationResult:
+def _unknown(source: ClassificationSource) -> ClassificationResult:
     return ClassificationResult(
         category=UNKNOWN_CATEGORY,
         camera_profile=UNKNOWN_PROFILE_LABEL,
         confidence=Confidence.LOW,
         manufacturer=None,
         model=None,
+        classification_source=source,
     )
