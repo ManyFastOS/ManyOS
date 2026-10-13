@@ -302,7 +302,12 @@ class IngestService:
         # never depends on another file having been "processed" yet — so
         # the result is identical regardless of scan order. See
         # sidecar_relationship.py's module docstring for the evidence rules.
-        resolved_sidecars = _resolve_sidecar_relationships(scan_result.files, scan_result.source)
+        # Fase 5.3 adds a second, equally order-independent return value
+        # (`sidecar_placements`) — see _resolve_sidecar_relationships()'s
+        # docstring and _process_asset()'s Fase 5.3 comment.
+        resolved_sidecars, sidecar_placements = _resolve_sidecar_relationships(
+            scan_result.files, scan_result.source, self._camera_profiles
+        )
         # Run-scoped only: guarantees a main-media file referenced by a
         # sidecar is never checksummed twice (once for its own asset, once
         # for the sidecar's sidecar_of_asset_id) regardless of which one
@@ -323,6 +328,7 @@ class IngestService:
                 dry_run,
                 logger,
                 resolved_sidecars,
+                sidecar_placements,
                 checksum_cache,
             )
             assets.append(asset)
@@ -385,6 +391,7 @@ class IngestService:
         dry_run: bool,
         logger: ActionLogger,
         resolved_sidecars: dict[Path, tuple[Path, RelationshipEvidence]],
+        sidecar_placements: dict[Path, _InheritedPlacement],
         checksum_cache: dict[Path, str],
     ) -> AssetResult:
         probe_result = safe_probe(path)
@@ -394,14 +401,6 @@ class IngestService:
         source_relative_path = _resolve_source_relative_path(path, source)
         technical_metadata = _resolve_technical_metadata(probe_result)
         recording_date = _resolve_recording_date(path, probe_result)
-        naive_destination = _build_workspace_path(
-            storage_root=self._config.storage_root,
-            client=client,
-            project=project,
-            recording_date=recording_date,
-            category=classification.category,
-            filename=path.name,
-        )
         checksum = _cached_checksum(self._storage, checksum_cache, path)
         is_duplicate = self._manifest.is_duplicate(checksum)
 
@@ -415,6 +414,38 @@ class IngestService:
         if resolved is not None:
             main_media_path, relationship_evidence = resolved
             sidecar_of_asset_id = _cached_checksum(self._storage, checksum_cache, main_media_path)
+
+        # Fase 5.3 — a proven sidecar inherits ONLY its main media's placement
+        # (category/camera_profile/recording_date) for destination-path
+        # purposes, never its own classification: `classification` above
+        # (and everything derived from it — AssetResult/AssetRecord's
+        # category/camera_profile/confidence/manufacturer/model/
+        # classification_source) stays the sidecar's own honest result,
+        # unaffected by this. An unresolved sidecar, or any other ordinary
+        # asset (`resolved is None`), keeps its own classification/date
+        # exactly as before Fase 5.3 — still Onbekend/ for an unlinked XML.
+        # `sidecar_placements` always has an entry for `main_media_path` here
+        # (populated unconditionally alongside `resolved_sidecars` in
+        # _resolve_sidecar_relationships(), in the same branch) — a plain
+        # index lookup rather than `.get()`, so a broken invariant fails
+        # loudly instead of silently misfiling the sidecar.
+        placement = sidecar_placements[main_media_path] if resolved is not None else None
+        destination_category = placement.category if placement is not None else classification.category
+        destination_camera_profile = (
+            placement.camera_profile if placement is not None else classification.camera_profile
+        )
+        destination_recording_date = (
+            placement.recording_date if placement is not None else recording_date
+        )
+        naive_destination = _build_workspace_path(
+            storage_root=self._config.storage_root,
+            client=client,
+            project=project,
+            recording_date=destination_recording_date,
+            category=destination_category,
+            camera_profile=destination_camera_profile,
+            filename=path.name,
+        )
 
         destination = naive_destination
         name_conflict_resolved = False
@@ -723,23 +754,56 @@ def _cached_checksum(storage: Storage, cache: dict[Path, str], path: Path) -> st
     return checksum
 
 
+@dataclasses.dataclass(frozen=True)
+class _InheritedPlacement:
+    """Fase 5.3 — the subset of a main-media file's own placement a proven
+    sidecar inherits for destination-path purposes ONLY — never its full
+    classification (see _process_asset()'s Fase 5.3 comment: the sidecar's
+    own AssetResult/AssetRecord category/camera_profile/confidence/
+    manufacturer/model/classification_source are never touched by this).
+    Computed once per main_media_path in _resolve_sidecar_relationships(),
+    reusing the exact same safe_probe() result already fetched there for
+    evidence resolution — never a second ffprobe call for the same file."""
+
+    category: str
+    camera_profile: str
+    recording_date: dt.date
+
+
 def _resolve_sidecar_relationships(
-    files: list[Path], source: Path
-) -> dict[Path, tuple[Path, RelationshipEvidence]]:
+    files: list[Path], source: Path, camera_profiles: list[CameraProfile]
+) -> tuple[dict[Path, tuple[Path, RelationshipEvidence]], dict[Path, _InheritedPlacement]]:
     """Fase 5.2 — resolved once, up front (see run()), over the whole scan
     result: candidate discovery (naming + same-directory only) and evidence
     resolution (UMID, then duration fallback) both read each candidate file
     directly and independently, so the result never depends on scan order.
     Only candidates with actual evidence (not RelationshipEvidence.NONE) are
-    kept — everything else stays an ordinary, unrelated asset."""
+    kept — everything else stays an ordinary, unrelated asset.
+
+    Fase 5.3 — alongside that, for every main_media_path that has at least
+    one proven sidecar, also resolves the _InheritedPlacement it hands down
+    (see that class's docstring). Classifying main_media_path here is
+    equally scan-order-independent (classify() is a pure function of the
+    path + the probe result already fetched for evidence resolution), and
+    is skipped if already resolved for a given main_media_path (more than
+    one sidecar could in principle point at the same main media)."""
     resolved: dict[Path, tuple[Path, RelationshipEvidence]] = {}
+    placements: dict[Path, _InheritedPlacement] = {}
     for sidecar_path, main_media_path in find_sidecar_candidates(files, source).items():
-        evidence = resolve_relationship(
-            parse_sony_sidecar(sidecar_path), safe_probe(main_media_path)
-        )
+        main_media_probe = safe_probe(main_media_path)
+        evidence = resolve_relationship(parse_sony_sidecar(sidecar_path), main_media_probe)
         if evidence is not RelationshipEvidence.NONE:
             resolved[sidecar_path] = (main_media_path, evidence)
-    return resolved
+            if main_media_path not in placements:
+                main_media_classification = classify(
+                    main_media_path, main_media_probe, camera_profiles
+                )
+                placements[main_media_path] = _InheritedPlacement(
+                    category=main_media_classification.category,
+                    camera_profile=main_media_classification.camera_profile,
+                    recording_date=_resolve_recording_date(main_media_path, main_media_probe),
+                )
+    return resolved, placements
 
 
 def _resolve_source_relative_path(path: Path, source: Path) -> Path | None:
@@ -841,17 +905,46 @@ def _project_workspace_path(storage_root: Path, client: str, project: str) -> Pa
     return storage_root / CLIENT_FOLDER_NAME / client / project
 
 
+# Fase 5.3 — only these two categories get a camera_profile subfolder (see
+# the Fase 5.3 target layout). Audio/Onbekend stay flat: Audio's only
+# current profile ("Audio") and Onbekend (by construction, see
+# classify()'s _unknown()) would make a subfolder redundant/meaningless —
+# a data decision, not a structural limitation, revisit if that ever
+# changes (e.g. more than one Audio profile).
+_CAMERA_AWARE_CATEGORIES = {"Camera", "Drone"}
+
+
+def _is_safe_profile_segment(camera_profile: str) -> bool:
+    """Fase 5.3 — defense in depth for the profile subfolder name. In
+    practice `category` being "Camera"/"Drone" already implies classify()
+    matched a real CameraProfile: its only fallback, `_unknown()`, always
+    pairs with category "Onbekend", never "Camera"/"Drone" — so
+    `camera_profile` here is never missing/"Onbekend"/conflicting. This
+    check exists anyway so a malformed or unexpected profile label (e.g. a
+    future camera_profiles.yaml entry containing a path separator or "..")
+    can never be turned into a path-escaping or misleading folder segment:
+    it falls back to no subfolder (flat under the category) rather than
+    raising or silently misfiling — the same "never guess, never silently
+    misfile" stance as the rest of classification."""
+    if not camera_profile or camera_profile in (".", ".."):
+        return False
+    return "/" not in camera_profile and "\\" not in camera_profile
+
+
 def _build_workspace_path(
     storage_root: Path,
     client: str,
     project: str,
     recording_date: dt.date,
     category: str,
+    camera_profile: str,
     filename: str,
 ) -> Path:
-    return (
+    folder = (
         _project_workspace_path(storage_root, client, project)
         / f"{recording_date.isoformat()}_Raw"
         / category
-        / filename
     )
+    if category in _CAMERA_AWARE_CATEGORIES and _is_safe_profile_segment(camera_profile):
+        folder = folder / camera_profile
+    return folder / filename

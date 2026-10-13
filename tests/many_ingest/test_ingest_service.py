@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import errno
+import hashlib
 import json
 import shutil
 import subprocess
@@ -51,11 +52,22 @@ def _make_config(tmp_path: Path) -> IngestConfig:
     )
 
 
-def _workspace_dir(config: IngestConfig, client: str, project: str, category: str) -> Path:
+def _workspace_dir(
+    config: IngestConfig,
+    client: str,
+    project: str,
+    category: str,
+    camera_profile: str | None = None,
+) -> Path:
     """Mirrors _build_workspace_path's layout for tests that need to pre-place a
-    colliding file at the exact path the pipeline will compute today."""
+    colliding file at the exact path the pipeline will compute today. Fase 5.3:
+    pass `camera_profile` for Camera/Drone categories to mirror the new
+    camera-aware subfolder; omit it for Audio/Onbekend, which stay flat."""
     today = dt.date.today().isoformat()
-    return config.storage_root / "Klanten" / client / project / f"{today}_Raw" / category
+    folder = config.storage_root / "Klanten" / client / project / f"{today}_Raw" / category
+    if camera_profile is not None:
+        folder = folder / camera_profile
+    return folder
 
 
 def _make_service(config: IngestConfig, camera_profiles, storage: Storage | None = None) -> IngestService:
@@ -473,7 +485,7 @@ class TestCollisionProtection:
 
         # Simuleert een bestand dat al op de bestemming staat zonder dat het
         # manifest ervan weet (bijv. een eerdere, onderbroken run).
-        destination_dir = _workspace_dir(config, "Nike", "Zomer", "Drone")
+        destination_dir = _workspace_dir(config, "Nike", "Zomer", "Drone", camera_profile="DJI")
         destination_dir.mkdir(parents=True)
         destination = destination_dir / "DJI_0001.MP4"
         destination.write_bytes(b"same content")
@@ -496,7 +508,7 @@ class TestCollisionProtection:
         input_dir.mkdir()
         (input_dir / "DJI_0001.MP4").write_bytes(b"new content")
 
-        destination_dir = _workspace_dir(config, "Nike", "Zomer", "Drone")
+        destination_dir = _workspace_dir(config, "Nike", "Zomer", "Drone", camera_profile="DJI")
         destination_dir.mkdir(parents=True)
         original = destination_dir / "DJI_0001.MP4"
         original.write_bytes(b"different, unrelated content")
@@ -519,7 +531,7 @@ class TestCollisionProtection:
         input_dir.mkdir()
         (input_dir / "DJI_0001.MP4").write_bytes(b"third variant")
 
-        destination_dir = _workspace_dir(config, "Nike", "Zomer", "Drone")
+        destination_dir = _workspace_dir(config, "Nike", "Zomer", "Drone", camera_profile="DJI")
         destination_dir.mkdir(parents=True)
         (destination_dir / "DJI_0001.MP4").write_bytes(b"first variant")
         (destination_dir / "DJI_0001_001.MP4").write_bytes(b"second variant")
@@ -540,7 +552,7 @@ class TestCollisionProtection:
         input_dir.mkdir()
         (input_dir / "DJI_0001.MP4").write_bytes(b"new content")
 
-        destination_dir = _workspace_dir(config, "Nike", "Zomer", "Drone")
+        destination_dir = _workspace_dir(config, "Nike", "Zomer", "Drone", camera_profile="DJI")
         destination_dir.mkdir(parents=True)
         (destination_dir / "DJI_0001.MP4").write_bytes(b"different content")
 
@@ -745,7 +757,7 @@ class TestRuntimeEnospc:
         with pytest.raises(DestinationFullError):
             service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
 
-        workspace = _workspace_dir(config, "Nike", "Zomer", "Drone")
+        workspace = _workspace_dir(config, "Nike", "Zomer", "Drone", camera_profile="DJI")
 
         # De partial destination-file van de mislukte copy is weggehaald:
         assert not (workspace / "DJI_0002.MP4").exists()
@@ -846,7 +858,7 @@ class TestRuntimeEnospc:
         # Het bestand zelf is al compleet gekopieerd én checksum-geverifieerd
         # vóór de manifest-write faalde — dat maakt het geen "partial" bestand,
         # en het wordt dus nooit weggegooid, alleen de hele run stopt.
-        workspace = _workspace_dir(config, "Nike", "Zomer", "Drone")
+        workspace = _workspace_dir(config, "Nike", "Zomer", "Drone", camera_profile="DJI")
         assert (workspace / "DJI_0001.MP4").read_bytes() == b"good content"
 
     def test_non_enospc_manifest_write_failure_is_destination_unavailable(
@@ -927,7 +939,7 @@ class TestFase50ClassificationFoundation:
         service = _make_service(config, camera_profiles)
         report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
 
-        expected = _workspace_dir(config, "Nike", "Zomer", "Drone") / "DJI_0001.MP4"
+        expected = _workspace_dir(config, "Nike", "Zomer", "Drone", camera_profile="DJI") / "DJI_0001.MP4"
         assert report.assets[0].destination_path == expected
 
     def test_real_run_exposes_media_type_manufacturer_and_model_on_the_asset_result(
@@ -1093,7 +1105,7 @@ class TestFase51MetadataProvenance:
         service = _make_service(config, camera_profiles)
         report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
 
-        expected = _workspace_dir(config, "Nike", "Zomer", "Drone") / "DJI_0001.MP4"
+        expected = _workspace_dir(config, "Nike", "Zomer", "Drone", camera_profile="DJI") / "DJI_0001.MP4"
         assert report.assets[0].destination_path == expected
 
     def test_reporting_counts_are_unaffected_by_fase_5_1_fields(self, tmp_path, camera_profiles):
@@ -1133,6 +1145,31 @@ class _CountingChecksumStorage(LocalFilesystemStorage):
 _REAL_UMID = "060A2B340101010501010D43130000006AED1A61791206D210322CFFFE7DA477"
 
 
+def _write_umid_matched_pair(input_dir: Path, umid: str = _REAL_UMID) -> None:
+    """Shared by TestFase52SidecarAssociation and
+    TestFase53SidecarPlacementInheritance — a module-level helper (not a
+    class method) so Fase 5.3's tests can reuse the exact same proven
+    UMID-matched fixture pair without duplicating it."""
+    (input_dir / "611_4921.MXF").write_bytes(b"fake mxf bytes")
+    (input_dir / "611_4921M01.XML").write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<NonRealTimeMeta xmlns="urn:schemas-professionalDisc:nonRealTimeMeta:ver.2.20">\n'
+        f'  <TargetMaterial umidRef="{umid}"/>\n'
+        '  <Duration value="871"/>\n'
+        '  <LtcChangeTable tcFps="25" halfStep="false"></LtcChangeTable>\n'
+        "</NonRealTimeMeta>\n"
+    )
+
+
+def _fake_safe_probe_with_umid(umid: str):
+    def _fake(path: Path):
+        if path.name == "611_4921.MXF":
+            return _probe_result_with_umid(f"0x{umid}")
+        return None
+
+    return _fake
+
+
 class TestFase52SidecarAssociation:
     """Fase 5.2 — sidecar_of_asset_id/relationship_evidence. None of these
     tests touch destination paths, category, camera_profile, confidence,
@@ -1140,23 +1177,10 @@ class TestFase52SidecarAssociation:
     or collision resolution — those are covered, unchanged, elsewhere."""
 
     def _write_umid_matched_pair(self, input_dir: Path, umid: str = _REAL_UMID) -> None:
-        (input_dir / "611_4921.MXF").write_bytes(b"fake mxf bytes")
-        (input_dir / "611_4921M01.XML").write_text(
-            '<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<NonRealTimeMeta xmlns="urn:schemas-professionalDisc:nonRealTimeMeta:ver.2.20">\n'
-            f'  <TargetMaterial umidRef="{umid}"/>\n'
-            '  <Duration value="871"/>\n'
-            '  <LtcChangeTable tcFps="25" halfStep="false"></LtcChangeTable>\n'
-            "</NonRealTimeMeta>\n"
-        )
+        _write_umid_matched_pair(input_dir, umid)
 
     def _fake_safe_probe_with_umid(self, umid: str):
-        def _fake(path: Path):
-            if path.name == "611_4921.MXF":
-                return _probe_result_with_umid(f"0x{umid}")
-            return None
-
-        return _fake
+        return _fake_safe_probe_with_umid(umid)
 
     def test_umid_matched_sidecar_gets_the_main_medias_checksum(
         self, tmp_path, camera_profiles, monkeypatch
@@ -1265,21 +1289,26 @@ class TestFase52SidecarAssociation:
         assert sidecar_asset.sidecar_of_asset_id is None
         assert sidecar_asset.outcome == AssetOutcome.COPIED
 
-    def test_destination_paths_are_exactly_unchanged_by_fase_5_2(self, tmp_path, camera_profiles):
-        """Regression guard: Fase 5.2 changes nothing about where a sidecar
-        ends up on disk — that's Fase 5.3's job."""
+    def test_unlinked_sidecar_destination_is_unaffected_by_fase_5_3(self, tmp_path, camera_profiles):
+        """Fase 5.2's original regression guard, narrowed to what's still
+        true after Fase 5.3: a sidecar WITHOUT proven evidence still lands in
+        Onbekend/, exactly as before. The linked case (this same
+        611_4921.MXF/611_4921M01.XML pair, with a mocked UMID match) now
+        co-locates instead — see TestFase53SidecarPlacementInheritance."""
         input_dir = tmp_path / "input"
         input_dir.mkdir()
         self._write_umid_matched_pair(input_dir)
+        # Geen safe_probe-mock hier: zonder een echte MXF-UMID blijft de
+        # relatie NONE (zie resolve_relationship), dus dit bewijst het
+        # ongekoppelde pad, niet het gekoppelde.
 
         config = _make_config(tmp_path)
         service = _make_service(config, camera_profiles)
         report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
 
         by_name = {asset.source_path.name: asset for asset in report.assets}
+        assert by_name["611_4921M01.XML"].relationship_evidence == RelationshipEvidence.NONE
         expected_dir = _workspace_dir(config, "Nike", "Zomer", "Onbekend")
-        # De sidecar wordt vandaag nog gewoon als Onbekend geclassificeerd —
-        # de relatie staat los van category/destination in Fase 5.2.
         assert by_name["611_4921M01.XML"].destination_path == expected_dir / "611_4921M01.XML"
 
     def test_classification_is_unaffected_by_sidecar_association(self, tmp_path, camera_profiles):
@@ -1328,7 +1357,7 @@ class TestResolveSidecarRelationshipsOrderIndependence:
     sidecar and its main media in (rglob order is not something this logic
     may depend on)."""
 
-    def test_same_result_regardless_of_scan_order(self, tmp_path, monkeypatch):
+    def test_same_result_regardless_of_scan_order(self, tmp_path, camera_profiles, monkeypatch):
         source = tmp_path
         xml_path = tmp_path / "611_4921M01.XML"
         xml_path.write_text(
@@ -1348,8 +1377,494 @@ class TestResolveSidecarRelationshipsOrderIndependence:
             lambda path: _probe_result_with_umid(f"0x{_REAL_UMID}") if path == media_path else None,
         )
 
-        sidecar_first = _resolve_sidecar_relationships([xml_path, media_path], source)
-        media_first = _resolve_sidecar_relationships([media_path, xml_path], source)
+        sidecar_first, placements_sidecar_first = _resolve_sidecar_relationships(
+            [xml_path, media_path], source, camera_profiles
+        )
+        media_first, placements_media_first = _resolve_sidecar_relationships(
+            [media_path, xml_path], source, camera_profiles
+        )
 
         assert sidecar_first == media_first
         assert sidecar_first == {xml_path: (media_path, RelationshipEvidence.UMID_MATCH)}
+        # Fase 5.3 — the inherited-placement index is equally scan-order-independent.
+        assert placements_sidecar_first == placements_media_first
+        assert placements_sidecar_first[media_path].category == "Camera"
+        assert placements_sidecar_first[media_path].camera_profile == "Sony FX6"
+
+
+# -- Fase 5.3: Camera-Aware Organization -------------------------------------
+#
+# Target layout (see docs): {date}_Raw/Camera/{profile}/, {date}_Raw/Drone/{profile}/,
+# with Audio/Onbekend staying flat. A proven sidecar inherits ONLY its main
+# media's placement (category/camera_profile/recording_date), never its own
+# classification fields.
+
+
+class TestFase53CameraAwareOrganization:
+    """Fase 5.3 — per-profile destination subfolders for Camera/Drone, flat
+    for Audio/Onbekend. Classification itself (classify()) is unchanged;
+    only _build_workspace_path()'s folder layout is new."""
+
+    def test_each_proven_camera_profile_gets_its_own_subfolder(
+        self, tmp_path, camera_profiles, monkeypatch, make_probe_result
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+
+        probes = {
+            # Sony FX6 — HIGH via confirmed_filename_pattern alone, no probe needed.
+            "611_1234.MXF": None,
+            # Sony FX3 — HIGH via metadata_make_or_model (model_contains "FX3").
+            "fx3_clip.MP4": make_probe_result(
+                model="ILME-FX3", major_brand="XAVC", container_format="mp4"
+            ),
+            # Sony A7 IV — HIGH via metadata_make_or_model (model_contains "ILCE-7M4").
+            "a7iv_clip.MOV": make_probe_result(model="ILCE-7M4"),
+            # GoPro — HIGH via metadata_make_or_model (make_contains "GoPro").
+            "gopro_clip.MP4": make_probe_result(make="GoPro"),
+            # DJI — MEDIUM via the generic "^DJI_.*" filename pattern, no probe needed.
+            "DJI_0009.MP4": None,
+        }
+        for name in probes:
+            (input_dir / name).write_bytes(b"fake bytes")
+
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", lambda path: probes.get(path.name)
+        )
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        by_name = {asset.source_path.name: asset for asset in report.assets}
+
+        expectations = [
+            ("611_1234.MXF", "Camera", "Sony FX6"),
+            ("fx3_clip.MP4", "Camera", "Sony FX3"),
+            ("a7iv_clip.MOV", "Camera", "Sony A7 IV"),
+            ("gopro_clip.MP4", "Camera", "GoPro"),
+            ("DJI_0009.MP4", "Drone", "DJI"),
+        ]
+        for filename, category, profile in expectations:
+            asset = by_name[filename]
+            assert asset.category == category
+            assert asset.camera_profile == profile
+            expected_dir = _workspace_dir(config, "Nike", "Zomer", category, camera_profile=profile)
+            assert asset.destination_path == expected_dir / filename
+
+    def test_audio_stays_flat_no_profile_subfolder(self, tmp_path, camera_profiles):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "silence.wav").write_bytes(b"fake audio bytes")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        asset = report.assets[0]
+        assert asset.category == "Audio"
+        assert asset.camera_profile == "Audio"
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Audio")
+        assert asset.destination_path == expected_dir / "silence.wav"
+
+    def test_unknown_file_stays_flat_under_onbekend(self, tmp_path, camera_profiles):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "random_notes.txt").write_bytes(b"not a recognized asset at all")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        asset = report.assets[0]
+        assert asset.category == "Onbekend"
+        assert asset.camera_profile == "Onbekend"
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Onbekend")
+        assert asset.destination_path == expected_dir / "random_notes.txt"
+
+
+class TestFase53ProfileSegmentSafety:
+    """Fase 5.3 — _is_safe_profile_segment()/_build_workspace_path() defense
+    in depth: classify() can never actually produce an unsafe camera_profile
+    value (see _is_safe_profile_segment()'s docstring), so these are unit
+    tests directly against the path-building functions, not full-pipeline
+    tests — there is no way to reach this branch through classify() itself."""
+
+    @pytest.mark.parametrize("unsafe_value", ["", ".", "..", "a/b", "a\\b", "../../etc"])
+    def test_is_safe_profile_segment_rejects_unsafe_values(self, unsafe_value):
+        assert ingest_service_module._is_safe_profile_segment(unsafe_value) is False
+
+    @pytest.mark.parametrize("safe_value", ["Sony FX6", "DJI", "GoPro", "Sony A7 IV"])
+    def test_is_safe_profile_segment_accepts_real_profile_labels(self, safe_value):
+        assert ingest_service_module._is_safe_profile_segment(safe_value) is True
+
+    def test_build_workspace_path_falls_back_to_flat_when_profile_is_unsafe(self):
+        base = Path("/storage")
+        result = ingest_service_module._build_workspace_path(
+            storage_root=base,
+            client="Nike",
+            project="Zomer",
+            recording_date=dt.date(2026, 10, 13),
+            category="Camera",
+            camera_profile="../evil",
+            filename="clip.mp4",
+        )
+        assert result == (
+            base / "Klanten" / "Nike" / "Zomer" / "2026-10-13_Raw" / "Camera" / "clip.mp4"
+        )
+
+    def test_build_workspace_path_never_nests_audio_or_onbekend(self):
+        base = Path("/storage")
+        for category, profile, filename in (
+            ("Audio", "Audio", "clip.wav"),
+            ("Onbekend", "Onbekend", "clip.bin"),
+        ):
+            result = ingest_service_module._build_workspace_path(
+                storage_root=base,
+                client="Nike",
+                project="Zomer",
+                recording_date=dt.date(2026, 10, 13),
+                category=category,
+                camera_profile=profile,
+                filename=filename,
+            )
+            assert result == (
+                base / "Klanten" / "Nike" / "Zomer" / "2026-10-13_Raw" / category / filename
+            )
+
+
+class TestFase53SidecarPlacementInheritance:
+    """Fase 5.3 — a proven sidecar inherits ONLY the category/camera_profile/
+    recording_date of its main media for destination-path purposes; its own
+    classification fields (category/camera_profile/confidence/manufacturer/
+    model/classification_source) are never touched — see
+    TestFase52SidecarAssociation.test_classification_is_unaffected_by_sidecar_association,
+    which still proves exactly that, unchanged."""
+
+    def test_umid_matched_sidecar_is_co_located_with_its_main_medias_resolved_folder(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        by_name = {asset.source_path.name: asset for asset in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.UMID_MATCH
+        assert main_asset.category == "Camera"
+        assert main_asset.camera_profile == "Sony FX6"
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert main_asset.destination_path == expected_dir / "611_4921.MXF"
+        assert sidecar_asset.destination_path == expected_dir / "611_4921M01.XML"
+        # De sidecar's eigen classificatievelden blijven ongewijzigd (Onbekend) —
+        # alleen het pad erft van de hoofdmedia, zie de klassedocstring.
+        assert sidecar_asset.category == "Onbekend"
+        assert sidecar_asset.camera_profile == "Onbekend"
+
+    def test_name_and_duration_matched_sidecar_is_co_located_with_its_main_media(
+        self, tmp_path, camera_profiles, monkeypatch, make_probe_result
+    ):
+        """The UMID-less fallback path (FX3/A7IV-style MP4, no UMID exposed
+        via ffprobe) — evidence comes from a matching duration instead, and
+        placement inheritance works identically."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "C0050.MP4").write_bytes(b"fake mp4 bytes")
+        (input_dir / "C0050M01.XML").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<NonRealTimeMeta xmlns="urn:schemas-professionalDisc:nonRealTimeMeta:ver.2.20">\n'
+            "  <Duration value=\"871\"/>\n"
+            '  <LtcChangeTable tcFps="25" halfStep="false"></LtcChangeTable>\n'
+            "</NonRealTimeMeta>\n"
+        )
+
+        main_media_probe = make_probe_result(
+            model="ILME-FX3",
+            major_brand="XAVC",
+            container_format="mp4",
+            duration_seconds=871 / 25,
+        )
+        monkeypatch.setattr(
+            ingest_service_module,
+            "safe_probe",
+            lambda path: main_media_probe if path.name == "C0050.MP4" else None,
+        )
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        by_name = {asset.source_path.name: asset for asset in report.assets}
+        sidecar_asset = by_name["C0050M01.XML"]
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.NAME_AND_DURATION_MATCH
+
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX3")
+        assert by_name["C0050.MP4"].destination_path == expected_dir / "C0050.MP4"
+        assert sidecar_asset.destination_path == expected_dir / "C0050M01.XML"
+
+    def test_unlinked_sidecar_without_any_naming_candidate_stays_under_onbekend(
+        self, tmp_path, camera_profiles
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "notes.XML").write_text("<not-sony-metadata/>")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+
+        asset = report.assets[0]
+        assert asset.relationship_evidence == RelationshipEvidence.NONE
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Onbekend")
+        assert asset.destination_path == expected_dir / "notes.XML"
+
+    def test_placement_is_identical_regardless_of_scan_order(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+
+        def _run_with_order(order_dir: Path, write_sidecar_first: bool) -> Path:
+            order_dir.mkdir()
+            if write_sidecar_first:
+                _write_umid_matched_pair(order_dir)
+            else:
+                # Zelfde bestanden, maar de hoofdmedia wordt eerst op schijf
+                # gezet — scan-volgorde (rglob) hangt af van het bestandssysteem,
+                # dus dit bewijst dat de UITKOMST er niet van afhangt, niet dat
+                # scan() zelf een bepaalde volgorde garandeert.
+                (order_dir / "611_4921.MXF").write_bytes(b"fake mxf bytes")
+                (order_dir / "611_4921M01.XML").write_text(
+                    '<?xml version="1.0" encoding="UTF-8"?>\n'
+                    '<NonRealTimeMeta xmlns="urn:schemas-professionalDisc:nonRealTimeMeta:ver.2.20">\n'
+                    f'  <TargetMaterial umidRef="{_REAL_UMID}"/>\n'
+                    '  <Duration value="871"/>\n'
+                    '  <LtcChangeTable tcFps="25" halfStep="false"></LtcChangeTable>\n'
+                    "</NonRealTimeMeta>\n"
+                )
+            config = _make_config(order_dir.parent / f"{order_dir.name}_storage")
+            service = _make_service(config, camera_profiles)
+            report = service.run(order_dir, client="Nike", project="Zomer", dry_run=True)
+            by_name = {asset.source_path.name: asset for asset in report.assets}
+            return by_name["611_4921M01.XML"].destination_path.relative_to(config.storage_root)
+
+        sidecar_first_result = _run_with_order(tmp_path / "sidecar_first", True)
+        media_first_result = _run_with_order(tmp_path / "media_first", False)
+
+        assert sidecar_first_result == media_first_result
+
+    def test_sidecar_placement_is_correct_even_when_main_media_is_a_duplicate_this_run(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        # Run 1: alleen de hoofdmedia, zodat die al in het manifest staat.
+        run1_dir = tmp_path / "run1"
+        run1_dir.mkdir()
+        (run1_dir / "611_4921.MXF").write_bytes(b"fake mxf bytes")
+        service.run(run1_dir, client="Nike", project="Zomer", dry_run=False)
+
+        # Run 2: dezelfde hoofdmedia-inhoud (nu een duplicate) plus zijn sidecar (nieuw).
+        run2_dir = tmp_path / "run2"
+        run2_dir.mkdir()
+        _write_umid_matched_pair(run2_dir)
+        report = service.run(run2_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {asset.source_path.name: asset for asset in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.DUPLICATE_SKIPPED
+        assert sidecar_asset.outcome == AssetOutcome.COPIED
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.UMID_MATCH
+
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert main_asset.destination_path == expected_dir / "611_4921.MXF"
+        assert sidecar_asset.destination_path == expected_dir / "611_4921M01.XML"
+
+    def test_sidecar_placement_is_correct_even_when_main_media_fails_verification(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """A failed main media must never silently present the sidecar as
+        part of a fully-succeeded recording group — there is no such
+        aggregate status anywhere in IngestService; each asset's `outcome`
+        stays fully independent, exactly as before Fase 5.3. This only
+        proves the sidecar's own placement is still correct even though its
+        main media's copy failed."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        config = _make_config(tmp_path)
+        real_storage = LocalFilesystemStorage()
+
+        class _FailsVerificationForOneFile(Storage):
+            def list_files(self, root):
+                return real_storage.list_files(root)
+
+            def exists(self, path):
+                return real_storage.exists(path)
+
+            def copy(self, source, destination):
+                real_storage.copy(source, destination)
+
+            def checksum(self, path):
+                path = Path(path)
+                if path.name == "611_4921.MXF" and config.storage_root in path.parents:
+                    return "corrupted-destination-checksum"
+                return real_storage.checksum(path)
+
+            def free_bytes(self, path):
+                return real_storage.free_bytes(path)
+
+            def remove(self, path):
+                real_storage.remove(path)
+
+        service = _make_service(config, camera_profiles, storage=_FailsVerificationForOneFile())
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {asset.source_path.name: asset for asset in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.FAILED_VERIFICATION
+        assert sidecar_asset.outcome == AssetOutcome.COPIED
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert sidecar_asset.destination_path == expected_dir / "611_4921M01.XML"
+
+    def test_sidecar_placement_is_unaffected_by_a_name_collision_on_the_main_media(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        collision_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        collision_dir.mkdir(parents=True)
+        (collision_dir / "611_4921.MXF").write_bytes(b"different, unrelated content")
+
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {asset.source_path.name: asset for asset in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.name_conflict_resolved is True
+        assert main_asset.destination_path.name == "611_4921_001.MXF"
+        # De map blijft gelijk ondanks de naamconflict-suffix op de hoofdmedia —
+        # de sidecar belandt in diezelfde map, onder zijn eigen, ongewijzigde naam.
+        assert sidecar_asset.destination_path.parent == collision_dir
+        assert sidecar_asset.destination_path.name == "611_4921M01.XML"
+
+    def test_dry_run_and_real_ingest_compute_identical_sidecar_placement(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        preview = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+        real = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        preview_sidecar = next(
+            a for a in preview.assets if a.source_path.name == "611_4921M01.XML"
+        )
+        real_sidecar = next(a for a in real.assets if a.source_path.name == "611_4921M01.XML")
+        assert preview_sidecar.destination_path == real_sidecar.destination_path
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert real_sidecar.destination_path == expected_dir / "611_4921M01.XML"
+
+
+class TestFase53ManifestBackwardCompatibility:
+    """Fase 5.3 — the new camera-aware layout only governs where NEW assets
+    are placed; it never reads, rewrites, or migrates existing manifest
+    records. An old-shape record (as a pre-5.3 version of Many Ingest would
+    have written it, flat destination_path, missing every Fase 5.0+ field)
+    must keep deduping correctly, and a genuinely new file in the same run
+    must still get the new, nested destination."""
+
+    def test_old_manifest_record_still_dedupes_and_new_files_get_the_new_layout(
+        self, tmp_path, camera_profiles
+    ):
+        config = _make_config(tmp_path)
+        config.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        old_content = b"already ingested content"
+        old_checksum = hashlib.sha256(old_content).hexdigest()
+        old_flat_destination = (
+            config.storage_root / "Klanten" / "Nike" / "Zomer" / "2026-01-01_Raw" / "Drone"
+            / "DJI_0001.MP4"
+        )
+        config.manifest_path.write_text(
+            json.dumps(
+                {
+                    "assets": [
+                        {
+                            "asset_id": old_checksum,
+                            "client_id": "Nike",
+                            "project_id": "Zomer",
+                            "ingest_run_id": "old-run",
+                            "operator": "iemand",
+                            "source_machine": "oude-machine",
+                            "original_path": "/oud/pad/DJI_0001.MP4",
+                            "destination_path": str(old_flat_destination),
+                            "category": "Drone",
+                            "camera_profile": "DJI",
+                            "confidence": "middel",
+                            "ingested_at": "2026-01-01T00:00:00+00:00",
+                            # Bewust GEEN Fase 5.0+/5.1/5.2-velden — dit simuleert een
+                            # manifest geschreven door een versie van vóór die fases.
+                        }
+                    ]
+                }
+            )
+        )
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(old_content)
+        (input_dir / "DJI_0002.MP4").write_bytes(b"brand new content")
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {asset.source_path.name: asset for asset in report.assets}
+        assert by_name["DJI_0001.MP4"].outcome == AssetOutcome.DUPLICATE_SKIPPED
+
+        new_asset = by_name["DJI_0002.MP4"]
+        assert new_asset.outcome == AssetOutcome.COPIED
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Drone", camera_profile="DJI")
+        assert new_asset.destination_path == expected_dir / "DJI_0002.MP4"
+
+        # Het oude record is ongewijzigd gebleven — geen migratie, geen herschrijving.
+        schema = json.loads(config.manifest_path.read_text())
+        old_record = next(a for a in schema["assets"] if a["asset_id"] == old_checksum)
+        assert old_record["destination_path"] == str(old_flat_destination)

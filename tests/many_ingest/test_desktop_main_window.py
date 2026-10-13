@@ -187,7 +187,14 @@ def test_no_candidates_shows_empty_state_and_choose_button(qapp):
 
 
 def test_selecting_a_manual_folder_shows_only_name_and_media_summary(qapp, tmp_path):
-    window = MainWindow(detect_volumes=lambda: [])
+    # detect_destinations expliciet niet-leeg injecteren (zoals _window() al
+    # doet) — anders rendert _render_destination_picker() zijn eigen
+    # "linkButton" (destination-retry) vóór deze test zijn eigen "linkButton"
+    # (bronselectie), en pakt secondary_action_button() de verkeerde.
+    window = MainWindow(
+        detect_volumes=lambda: [],
+        detect_destinations=lambda source_path: [_destination("Chris", tmp_path / "Chris")],
+    )
     chosen = tmp_path / "SD_CARD_1"
     chosen.mkdir()
     (chosen / "clip.mp4").write_bytes(b"x" * 1000)
@@ -218,7 +225,12 @@ def test_retry_button_re_runs_detection(qapp, tmp_path):
 
 def test_single_candidate_is_selected_automatically(qapp, tmp_path):
     volume = _volume("SD_CARD_1", tmp_path, media_count=214, media_bytes=214_000_000_000)
-    window = MainWindow(detect_volumes=lambda: [volume])
+    # detect_destinations expliciet niet-leeg injecteren (zoals _window() al
+    # doet) — zie de uitleg bij test_selecting_a_manual_folder_shows_only_name_and_media_summary.
+    window = MainWindow(
+        detect_volumes=lambda: [volume],
+        detect_destinations=lambda source_path: [_destination("Chris", tmp_path / "Chris")],
+    )
 
     assert window.selected_source == tmp_path
     assert window.current_message() == "SD_CARD_1"
@@ -246,7 +258,12 @@ def test_choosing_a_card_selects_that_volume(qapp, tmp_path):
         _volume("SD_CARD_1", tmp_path / "a"),
         _volume("EXT_DRIVE_2", tmp_path / "b"),
     ]
-    window = MainWindow(detect_volumes=lambda: volumes)
+    # detect_destinations expliciet niet-leeg injecteren (zoals _window() al
+    # doet) — zie de uitleg bij test_selecting_a_manual_folder_shows_only_name_and_media_summary.
+    window = MainWindow(
+        detect_volumes=lambda: volumes,
+        detect_destinations=lambda source_path: [_destination("Chris", tmp_path / "Chris")],
+    )
 
     window.volume_cards()[1].click()
 

@@ -243,9 +243,17 @@ def test_name_conflict_gets_an_automatic_suffix_and_never_overwrites(tmp_path):
     # Zet handmatig een ANDER bestand klaar op precies de plek waar de engine
     # dit bestand naartoe zou kopiëren — de exacte botsing die de
     # collision-protection in IngestService (ongewijzigd, zie
-    # core/ingest_service.py) moet opvangen.
+    # core/ingest_service.py) moet opvangen. Fase 5.3: DJI (Drone-categorie)
+    # krijgt nu een eigen profielsubmap.
     destination_dir = (
-        tmp_path / "storage" / "Klanten" / "Nike" / "Zomer" / f"{_today()}_Raw" / "Drone"
+        tmp_path
+        / "storage"
+        / "Klanten"
+        / "Nike"
+        / "Zomer"
+        / f"{_today()}_Raw"
+        / "Drone"
+        / "DJI"
     )
     destination_dir.mkdir(parents=True)
     conflicting_path = destination_dir / "DJI_0001.MP4"
