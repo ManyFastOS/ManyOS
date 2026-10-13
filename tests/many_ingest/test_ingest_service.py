@@ -1868,3 +1868,574 @@ class TestFase53ManifestBackwardCompatibility:
         schema = json.loads(config.manifest_path.read_text())
         old_record = next(a for a in schema["assets"] if a["asset_id"] == old_checksum)
         assert old_record["destination_path"] == str(old_flat_destination)
+
+
+# -- Fase 5.3.1A: Sidecar Integrity Hardening (referential integrity) -------
+#
+# `relationship_evidence` (proven CONTENT relationship) and
+# `sidecar_of_asset_id` (MANIFEST relationship — only set when a record for
+# that checksum genuinely exists in the manifest right now) are two
+# deliberately different claims. See core/ingest_service.py's Fase 5.3.1A
+# comment in _process_asset() for the exact rule.
+
+
+class TestFase531AReferentialIntegrity:
+    def test_sidecar_of_asset_id_is_set_when_main_media_is_successfully_copied_and_registered(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.COPIED
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.UMID_MATCH
+        assert sidecar_asset.sidecar_of_asset_id == main_asset.checksum
+
+        # Niet alleen de in-memory AssetResult — het PERSISTEERDE record moet
+        # dezelfde, geldige FK bevatten.
+        schema = json.loads(config.manifest_path.read_text())
+        sidecar_record = next(
+            a for a in schema["assets"] if a["asset_id"] == sidecar_asset.checksum
+        )
+        assert sidecar_record["sidecar_of_asset_id"] == main_asset.checksum
+        assert sidecar_record["relationship_evidence"] == "umid_match"
+
+    def test_sidecar_of_asset_id_is_set_when_main_media_is_an_already_registered_duplicate(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        # Run 1: alleen de hoofdmedia, zodat die al een echt manifestrecord heeft.
+        run1_dir = tmp_path / "run1"
+        run1_dir.mkdir()
+        (run1_dir / "611_4921.MXF").write_bytes(b"fake mxf bytes")
+        service.run(run1_dir, client="Nike", project="Zomer", dry_run=False)
+
+        # Run 2: dezelfde hoofdmedia-inhoud (nu een bevestigde duplicate) + sidecar (nieuw).
+        run2_dir = tmp_path / "run2"
+        run2_dir.mkdir()
+        _write_umid_matched_pair(run2_dir)
+        report = service.run(run2_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.DUPLICATE_SKIPPED
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.UMID_MATCH
+        assert sidecar_asset.sidecar_of_asset_id == main_asset.checksum
+
+        # Niet alleen de in-memory AssetResult — het gepersisteerde sidecar-
+        # record moet naar een daadwerkelijk aanwezig hoofdmediarecord
+        # verwijzen (geregistreerd in run 1, niet opnieuw in run 2).
+        schema = json.loads(config.manifest_path.read_text())
+        asset_ids = {a["asset_id"] for a in schema["assets"]}
+        sidecar_record = next(
+            a for a in schema["assets"] if a["asset_id"] == sidecar_asset.checksum
+        )
+        assert sidecar_record["sidecar_of_asset_id"] == main_asset.checksum
+        assert sidecar_record["sidecar_of_asset_id"] in asset_ids
+        assert sidecar_record["relationship_evidence"] == "umid_match"
+
+    def test_sidecar_of_asset_id_is_none_when_main_media_fails_verification(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+        config = _make_config(tmp_path)
+        real_storage = LocalFilesystemStorage()
+
+        class _FailsVerificationForOneFile(Storage):
+            def list_files(self, root):
+                return real_storage.list_files(root)
+
+            def exists(self, path):
+                return real_storage.exists(path)
+
+            def copy(self, source, destination):
+                real_storage.copy(source, destination)
+
+            def checksum(self, path):
+                path = Path(path)
+                if path.name == "611_4921.MXF" and config.storage_root in path.parents:
+                    return "corrupted-destination-checksum"
+                return real_storage.checksum(path)
+
+            def free_bytes(self, path):
+                return real_storage.free_bytes(path)
+
+            def remove(self, path):
+                real_storage.remove(path)
+
+        service = _make_service(config, camera_profiles, storage=_FailsVerificationForOneFile())
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.FAILED_VERIFICATION
+        assert sidecar_asset.outcome == AssetOutcome.COPIED
+        # Bewezen bronrelatie blijft behouden...
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.UMID_MATCH
+        # ...maar geen manifest-FK naar een nooit-geregistreerd hoofdmediarecord.
+        assert sidecar_asset.sidecar_of_asset_id is None
+
+        # Het manifest bevat precies één record (de sidecar zelf) — de
+        # hoofdmedia is nooit geregistreerd, en de persisted FK is None, niet
+        # dangling.
+        schema = json.loads(config.manifest_path.read_text())
+        assert len(schema["assets"]) == 1
+        assert schema["assets"][0]["asset_id"] == sidecar_asset.checksum
+        assert schema["assets"][0]["sidecar_of_asset_id"] is None
+        assert schema["assets"][0]["relationship_evidence"] == "umid_match"
+
+    def test_sidecar_itself_failing_does_not_change_its_correctly_gated_sidecar_of_asset_id(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """The sidecar's OWN outcome stays fully independent (pre-existing
+        Fase 5.2 invariant) — this just confirms the new gating logic isn't
+        accidentally coupled to the sidecar's own copy/verification result."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+        config = _make_config(tmp_path)
+        real_storage = LocalFilesystemStorage()
+
+        class _FailsVerificationForTheSidecar(Storage):
+            def list_files(self, root):
+                return real_storage.list_files(root)
+
+            def exists(self, path):
+                return real_storage.exists(path)
+
+            def copy(self, source, destination):
+                real_storage.copy(source, destination)
+
+            def checksum(self, path):
+                path = Path(path)
+                if path.name == "611_4921M01.XML" and config.storage_root in path.parents:
+                    return "corrupted-destination-checksum"
+                return real_storage.checksum(path)
+
+            def free_bytes(self, path):
+                return real_storage.free_bytes(path)
+
+            def remove(self, path):
+                real_storage.remove(path)
+
+        service = _make_service(config, camera_profiles, storage=_FailsVerificationForTheSidecar())
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.COPIED
+        assert sidecar_asset.outcome == AssetOutcome.FAILED_VERIFICATION
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.UMID_MATCH
+        assert sidecar_asset.sidecar_of_asset_id == main_asset.checksum
+
+    def test_sidecar_of_asset_id_is_correct_even_when_the_sidecar_is_scanned_before_its_main_media(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """The exact scenario named in the Fase 5.3.1A brief: the sidecar
+        appears BEFORE its main media in the raw scan list. run()'s stable
+        sidecar-last partition must still process the main media first."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        class _ForcedOrderStorage(LocalFilesystemStorage):
+            """Deterministically puts the named file first in list_files(),
+            regardless of the real filesystem's own rglob order — so this
+            test proves the fix, not just a lucky filesystem ordering."""
+
+            def __init__(self, first_filename: str) -> None:
+                super().__init__()
+                self._first_filename = first_filename
+
+            def list_files(self, root):
+                files = list(super().list_files(root))
+                files.sort(key=lambda p: 0 if p.name == self._first_filename else 1)
+                return files
+
+        config = _make_config(tmp_path)
+        storage = _ForcedOrderStorage("611_4921M01.XML")
+        service = _make_service(config, camera_profiles, storage=storage)
+
+        # Bewijs dat de sidecar daadwerkelijk eerst in de ruwe scanlijst staat —
+        # anders test dit scenario niets.
+        scan_result = service.scan(input_dir)
+        assert scan_result.files[0].name == "611_4921M01.XML"
+
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.COPIED
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.UMID_MATCH
+        assert sidecar_asset.sidecar_of_asset_id == main_asset.checksum
+
+        # Niet alleen de in-memory AssetResult — ook het gepersisteerde
+        # sidecar-record moet naar een daadwerkelijk aanwezig hoofdmedia-
+        # record verwijzen, ondanks dat de sidecar als eerste in de ruwe
+        # scanlijst stond.
+        schema = json.loads(config.manifest_path.read_text())
+        assert len(schema["assets"]) == 2
+        asset_ids = {a["asset_id"] for a in schema["assets"]}
+        sidecar_record = next(
+            a for a in schema["assets"] if a["asset_id"] == sidecar_asset.checksum
+        )
+        assert sidecar_record["sidecar_of_asset_id"] == main_asset.checksum
+        assert sidecar_record["sidecar_of_asset_id"] in asset_ids
+        assert sidecar_record["relationship_evidence"] == "umid_match"
+
+    def test_main_media_manifest_write_failure_aborts_before_any_sidecar_is_touched(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """Hoofdvideo wordt wel gekopieerd, maar manifestregistratie mislukt
+        (ENOSPC) — de hele run breekt af (bestaand gedrag, ongewijzigd) vóórdat
+        de sidecar ooit aan de beurt komt, dankzij de sidecar-last-herordening.
+        Er kan dus geen enkel sidecar-record ontstaan, dangling of anders."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+        config = _make_config(tmp_path)
+
+        def _failing_register(self, record):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        monkeypatch.setattr(JSONManifest, "register", _failing_register)
+        service = _make_service(config, camera_profiles)
+
+        with pytest.raises(DestinationFullError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        # Niets is ooit geregistreerd — de run brak af bij de hoofdmedia, de
+        # allereerste in de herordende lijst.
+        assert not config.manifest_path.exists()
+
+    def test_cancellation_between_main_media_and_sidecar_leaves_no_dangling_relation(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """Annulering (gemodelleerd als een uitzondering uit progress_callback,
+        exact zoals ingest_worker.py's SIGTERM-afhandeling) tussen de
+        hoofdmedia en zijn sidecar: dankzij de sidecar-last-herordening is het
+        eerste verwerkte bestand altijd de hoofdmedia, nooit de sidecar — een
+        annulering na bestand 1 raakt de sidecar dus nooit."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        class _Cancelled(Exception):
+            pass
+
+        def _progress_callback(update):
+            if update.processed == 1:
+                raise _Cancelled()
+
+        with pytest.raises(_Cancelled):
+            service.run(
+                input_dir,
+                client="Nike",
+                project="Zomer",
+                dry_run=False,
+                progress_callback=_progress_callback,
+            )
+
+        # De hoofdmedia is wél volledig verwerkt en geregistreerd vóór de
+        # annulering...
+        schema = json.loads(config.manifest_path.read_text())
+        assert len(schema["assets"]) == 1
+        assert schema["assets"][0]["original_path"] == str(input_dir / "611_4921.MXF")
+        # ...de sidecar is nooit bereikt — geen enkel record voor hem, dangling
+        # of anders.
+        assert all(
+            Path(a["original_path"]).name != "611_4921M01.XML" for a in schema["assets"]
+        )
+
+    def test_old_manifest_record_shape_still_correctly_backs_a_sidecar_relation(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """Oude manifests blijven leesbaar: een pre-Fase-5.0-record (zonder elk
+        van de latere additieve velden) volstaat volledig als grondwaarheid
+        voor de nieuwe is_duplicate()-gate — er wordt niets gemigreerd of
+        herschreven."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        config.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        main_content = b"fake mxf bytes"
+        main_checksum = hashlib.sha256(main_content).hexdigest()
+        config.manifest_path.write_text(
+            json.dumps(
+                {
+                    "assets": [
+                        {
+                            "asset_id": main_checksum,
+                            "client_id": "Nike",
+                            "project_id": "Zomer",
+                            "ingest_run_id": "old-run",
+                            "operator": "iemand",
+                            "source_machine": "oude-machine",
+                            "original_path": "/oud/pad/611_4921.MXF",
+                            "destination_path": str(
+                                config.storage_root
+                                / "Klanten"
+                                / "Nike"
+                                / "Zomer"
+                                / "2026-01-01_Raw"
+                                / "Camera"
+                                / "611_4921.MXF"
+                            ),
+                            "category": "Camera",
+                            "camera_profile": "Sony FX6",
+                            "confidence": "hoog",
+                            "ingested_at": "2026-01-01T00:00:00+00:00",
+                            # Bewust geen Fase 5.0+/5.1/5.2-velden.
+                        }
+                    ]
+                }
+            )
+        )
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        # _write_umid_matched_pair schrijft precies dezelfde inhoud (b"fake
+        # mxf bytes") als main_content hierboven, plus de bijpassende sidecar.
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.DUPLICATE_SKIPPED
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.UMID_MATCH
+        assert sidecar_asset.sidecar_of_asset_id == main_checksum
+
+        # Niet alleen de in-memory AssetResult — het gepersisteerde sidecar-
+        # record moet verwijzen naar het asset_id van het OUDE, al bestaande
+        # record (nooit gemigreerd of herschreven, zie de testdocstring).
+        schema = json.loads(config.manifest_path.read_text())
+        assert len(schema["assets"]) == 2  # het oude record + de nieuwe sidecar
+        asset_ids = {a["asset_id"] for a in schema["assets"]}
+        assert main_checksum in asset_ids  # het oude record is ongewijzigd aanwezig
+        sidecar_record = next(
+            a for a in schema["assets"] if a["asset_id"] == sidecar_asset.checksum
+        )
+        assert sidecar_record["sidecar_of_asset_id"] == main_checksum
+        assert sidecar_record["sidecar_of_asset_id"] in asset_ids
+        assert sidecar_record["relationship_evidence"] == "umid_match"
+
+    def test_dry_run_never_suggests_a_manifest_relation_for_a_not_yet_copied_main_media(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """Expliciete dry-run-semantiek: een preview registreert niets, dus
+        sidecar_of_asset_id mag nooit een manifestrelatie suggereren die
+        alleen zou ontstaan ALS de hoofdvideo daadwerkelijk gekopieerd werd.
+        relationship_evidence (de bewezen bronrelatie) blijft wel gewoon
+        zichtbaar — dat is altijd al waar, los van wat een run doet."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.PREVIEW
+        assert main_asset.is_duplicate is False
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.UMID_MATCH
+        assert sidecar_asset.sidecar_of_asset_id is None
+        assert not config.manifest_path.exists()  # een dry-run registreert nooit iets
+
+    def test_dry_run_still_truthfully_reports_a_genuinely_pre_existing_manifest_relation(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """Het spiegelbeeld van de vorige test: als de hoofdvideo al ECHT (uit
+        een eerdere, niet-dry-run) in het manifest staat, mag een preview die
+        waarheid gewoon laten zien — dat is geen fictieve suggestie, want de
+        relatie bestaat al."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        run1_dir = tmp_path / "run1"
+        run1_dir.mkdir()
+        (run1_dir / "611_4921.MXF").write_bytes(b"fake mxf bytes")
+        service.run(run1_dir, client="Nike", project="Zomer", dry_run=False)
+
+        run2_dir = tmp_path / "run2"
+        run2_dir.mkdir()
+        _write_umid_matched_pair(run2_dir)
+        report = service.run(run2_dir, client="Nike", project="Zomer", dry_run=True)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.PREVIEW
+        assert main_asset.is_duplicate is True
+        assert sidecar_asset.relationship_evidence == RelationshipEvidence.UMID_MATCH
+        assert sidecar_asset.sidecar_of_asset_id == main_asset.checksum
+        # Nog steeds niets nieuws geschreven door de preview zelf.
+        schema = json.loads(config.manifest_path.read_text())
+        assert len(schema["assets"]) == 1  # alleen run1's registratie
+
+    def test_dry_run_and_real_ingest_use_the_same_gating_rule(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """Dry-run en real ingest delen exact hetzelfde codepad voor de
+        is_duplicate()-gate (beide zijn read-only aanroepen) — het enige
+        verschil is WAT er al écht in het manifest staat op het moment van
+        aanroepen, niet een apart dry_run-specifiek vertakking in de
+        gating-logica zelf."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        run1_dir = tmp_path / "run1"
+        run1_dir.mkdir()
+        (run1_dir / "611_4921.MXF").write_bytes(b"fake mxf bytes")
+        service.run(run1_dir, client="Nike", project="Zomer", dry_run=False)
+
+        preview_dir = tmp_path / "preview"
+        preview_dir.mkdir()
+        _write_umid_matched_pair(preview_dir)
+        preview_report = service.run(preview_dir, client="Nike", project="Zomer", dry_run=True)
+
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        _write_umid_matched_pair(real_dir)
+        real_report = service.run(real_dir, client="Nike", project="Zomer", dry_run=False)
+
+        preview_sidecar = next(
+            a for a in preview_report.assets if a.source_path.name == "611_4921M01.XML"
+        )
+        real_sidecar = next(
+            a for a in real_report.assets if a.source_path.name == "611_4921M01.XML"
+        )
+        assert preview_sidecar.sidecar_of_asset_id == real_sidecar.sidecar_of_asset_id
+
+    def test_mixed_scan_processes_main_media_before_sidecars_with_correct_progress_and_byte_totals(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """End-to-end regression over a realistic mixed scan: at least two
+        ordinary media files plus one proven sidecar pair. Confirms the
+        stable sidecar-last partition (run()) doesn't regress progress
+        reporting, byte totals, or processing counts — not just the
+        isolated two-file sidecar scenarios covered elsewhere in this
+        class."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "clip_a.mp4").write_bytes(b"1" * 100)
+        _write_umid_matched_pair(input_dir)  # 611_4921.MXF + 611_4921M01.XML
+        (input_dir / "clip_z.mp4").write_bytes(b"2" * 25)
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        # Bewijs dat de sidecar niet toevallig al als laatste in de ruwe
+        # scanlijst staat — anders zou deze test de herordening niet
+        # daadwerkelijk uitoefenen.
+        scan_result = service.scan(input_dir)
+        sidecar_index = next(
+            i for i, p in enumerate(scan_result.files) if p.name == "611_4921M01.XML"
+        )
+        assert sidecar_index < len(scan_result.files) - 1
+
+        updates: list[ProgressUpdate] = []
+        processed_names: list[str] = []
+        report = service.run(
+            input_dir,
+            client="Nike",
+            project="Zomer",
+            dry_run=False,
+            progress_callback=updates.append,
+            asset_callback=lambda asset: processed_names.append(asset.source_path.name),
+        )
+
+        # Hoofdmedia (en elk ander gewoon bestand) wordt vóór de sidecar verwerkt.
+        assert processed_names[-1] == "611_4921M01.XML"
+        assert set(processed_names[:-1]) == {"clip_a.mp4", "611_4921.MXF", "clip_z.mp4"}
+
+        # Geen bestand wordt dubbel verwerkt.
+        assert len(processed_names) == len(set(processed_names)) == 4
+
+        # Progress-callbacks rapporteren exact 1 t/m N; total blijft constant.
+        assert [u.processed for u in updates] == [1, 2, 3, 4]
+        assert all(u.total == 4 for u in updates)
+
+        # bytes_processed cumulatief correct, en het eindrapport komt overeen —
+        # los van de verwerkingsvolgorde (optelling is orde-onafhankelijk).
+        expected_total_bytes = sum(p.stat().st_size for p in input_dir.iterdir())
+        assert updates[-1].bytes_processed == expected_total_bytes
+        assert report.total_bytes == expected_total_bytes
+        assert len(report.assets) == 4
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+        assert main_asset.outcome == AssetOutcome.COPIED
+        assert sidecar_asset.outcome == AssetOutcome.COPIED
+        assert sidecar_asset.sidecar_of_asset_id == main_asset.checksum
+
+        # Ook het gepersisteerde manifest bevat precies vier records, één per
+        # bestand — geen dubbele registratie.
+        schema = json.loads(config.manifest_path.read_text())
+        assert len(schema["assets"]) == 4
+        sidecar_record = next(
+            a for a in schema["assets"] if a["asset_id"] == sidecar_asset.checksum
+        )
+        assert sidecar_record["sidecar_of_asset_id"] == main_asset.checksum

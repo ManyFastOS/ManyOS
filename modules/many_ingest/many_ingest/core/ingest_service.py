@@ -308,17 +308,32 @@ class IngestService:
         resolved_sidecars, sidecar_placements = _resolve_sidecar_relationships(
             scan_result.files, scan_result.source, self._camera_profiles
         )
+        # Fase 5.3.1A — stable partition: every non-sidecar file (including
+        # every proven sidecar's own main media) is processed before ANY
+        # proven sidecar, with the original relative scan order preserved
+        # within each group. This guarantees that by the time a sidecar's
+        # own turn comes up, its main media's outcome for THIS run (if that
+        # main media is part of this same scan) is already final — so the
+        # referential-integrity check in _process_asset() below
+        # (`self._manifest.is_duplicate(main_media_checksum)`) can never see
+        # a false negative caused purely by scan order ("XML before its
+        # video"). This never changes classification, checksums, dedupe, or
+        # camera-aware placement — purely an iteration-order change over the
+        # exact same file list.
+        ordered_files = [p for p in scan_result.files if p not in resolved_sidecars] + [
+            p for p in scan_result.files if p in resolved_sidecars
+        ]
         # Run-scoped only: guarantees a main-media file referenced by a
         # sidecar is never checksummed twice (once for its own asset, once
         # for the sidecar's sidecar_of_asset_id) regardless of which one
         # this loop reaches first — see _cached_checksum().
         checksum_cache: dict[Path, str] = {}
 
-        total = len(scan_result.files)
+        total = len(ordered_files)
         assets: list[AssetResult] = []
         bytes_processed = 0
 
-        for index, path in enumerate(scan_result.files, start=1):
+        for index, path in enumerate(ordered_files, start=1):
             asset = self._process_asset(
                 path,
                 scan_result.source,
@@ -406,14 +421,40 @@ class IngestService:
 
         # Fase 5.2 — populated only when resolve_relationship() already
         # found evidence for this exact file (see run()); nothing here
-        # changes checksum/dedupe semantics — sidecar_of_asset_id is just
-        # the main media's own, already-computed asset_id.
+        # changes checksum/dedupe semantics.
+        #
+        # Fase 5.3.1A — `relationship_evidence` and `sidecar_of_asset_id` are
+        # two deliberately DIFFERENT claims, never conflated:
+        #   - `relationship_evidence` is the proven CONTENT relationship
+        #     between the two source files (UMID/duration match) — always
+        #     set when resolve_relationship() found evidence, regardless of
+        #     anything that happens to either file afterwards.
+        #   - `sidecar_of_asset_id` is a MANIFEST relationship: it is only
+        #     ever set to the main media's checksum when a record for that
+        #     checksum actually exists in the manifest at this exact moment
+        #     (checked via the existing `Manifest.is_duplicate()` — the same
+        #     primitive `is_duplicate` above already uses, never a new
+        #     manifest method). `run()`'s stable sidecar-last partitioning
+        #     guarantees that if the main media is part of this same scan,
+        #     its outcome (COPIED and registered, confirmed DUPLICATE_SKIPPED
+        #     against a pre-existing record, or FAILED_VERIFICATION/never
+        #     reached) is already final by the time we get here — so this
+        #     check can never give a false negative purely due to scan
+        #     order. It also naturally keeps dry-run honest: a dry-run never
+        #     calls `register()`, so this only reports a manifest relation
+        #     that genuinely, already exists on disk — never one that would
+        #     only become true if the main media were actually copied.
+        #     A missing/failed main media leaves `sidecar_of_asset_id=None`
+        #     while `relationship_evidence` stays exactly as proven — never
+        #     a dangling reference, never a lost/altered content relation.
         sidecar_of_asset_id: str | None = None
         relationship_evidence = RelationshipEvidence.NONE
         resolved = resolved_sidecars.get(path)
         if resolved is not None:
             main_media_path, relationship_evidence = resolved
-            sidecar_of_asset_id = _cached_checksum(self._storage, checksum_cache, main_media_path)
+            main_media_checksum = _cached_checksum(self._storage, checksum_cache, main_media_path)
+            if self._manifest.is_duplicate(main_media_checksum):
+                sidecar_of_asset_id = main_media_checksum
 
         # Fase 5.3 — a proven sidecar inherits ONLY its main media's placement
         # (category/camera_profile/recording_date) for destination-path
