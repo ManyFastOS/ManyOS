@@ -69,6 +69,7 @@ from many_ingest.classification.file_types import (
     detect_media_type,
 )
 from many_ingest.config import CameraProfile, IngestConfig
+from many_ingest.device_identity import same_physical_device
 from many_ingest.logger import ActionLogger
 from many_ingest.metadata_extractor import (
     FFPROBE_INSTALL_MESSAGE,
@@ -328,6 +329,16 @@ class IngestService:
         # for the sidecar's sidecar_of_asset_id) regardless of which one
         # this loop reaches first — see _cached_checksum().
         checksum_cache: dict[Path, str] = {}
+        # Fase 5.3.1B — run-scoped only, same reasoning as checksum_cache:
+        # memoizes the verified-existing-destination decision per main-media
+        # checksum (not per raw candidate path), so N sidecars proven against
+        # the same main media verify (and, critically, re-hash the
+        # destination file) at most once per run — see
+        # _verified_existing_destination(). Never shared across separate
+        # run() calls (a fresh dict every time), so a destination file
+        # modified/removed between two runs is always re-verified, never
+        # trusted from a stale cache.
+        destination_verification_cache: dict[str, Path | None] = {}
 
         total = len(ordered_files)
         assets: list[AssetResult] = []
@@ -345,6 +356,7 @@ class IngestService:
                 resolved_sidecars,
                 sidecar_placements,
                 checksum_cache,
+                destination_verification_cache,
             )
             assets.append(asset)
 
@@ -408,6 +420,7 @@ class IngestService:
         resolved_sidecars: dict[Path, tuple[Path, RelationshipEvidence]],
         sidecar_placements: dict[Path, _InheritedPlacement],
         checksum_cache: dict[Path, str],
+        destination_verification_cache: dict[str, Path | None],
     ) -> AssetResult:
         probe_result = safe_probe(path)
         file_type = detect_file_type(path, probe_result)
@@ -456,6 +469,35 @@ class IngestService:
             if self._manifest.is_duplicate(main_media_checksum):
                 sidecar_of_asset_id = main_media_checksum
 
+        # Fase 5.3.1B — when sidecar_of_asset_id is set (a CONFIRMED manifest
+        # relationship, per Fase 5.3.1A directly above), try to physically
+        # co-locate this sidecar with its main media's ACTUAL, already-
+        # registered destination — covers a duplicate sitting in either a
+        # current camera-aware folder or an old, flat pre-Fase-5.3 folder,
+        # as long as it's inside THIS run's own Project Workspace
+        # (Klanten/{client}/{project}/, via the existing
+        # _project_workspace_path() helper — never the whole storage_root:
+        # a main media registered for a different client/project must never
+        # decide where this run's sidecar physically lands, however
+        # identical its checksum happens to be). Deliberately gated on
+        # `sidecar_of_asset_id`, never attempted when it's `None`
+        # (FAILED_VERIFICATION / never-reached main media this run) — this
+        # reuses the 5.3.1A guarantee as its own precondition rather than
+        # re-deriving it, so 5.3.1B can never weaken it. A verification
+        # failure here (missing file, changed content, unsafe path, wrong
+        # project) is never fatal — `_verified_existing_destination()` only
+        # ever returns `None` on failure, falling through to the unchanged
+        # Fase 5.3 camera-aware computation below.
+        verified_existing_destination: Path | None = None
+        if sidecar_of_asset_id is not None:
+            verified_existing_destination = _verified_existing_destination(
+                self._storage,
+                self._manifest,
+                _project_workspace_path(self._config.storage_root, client, project),
+                sidecar_of_asset_id,
+                destination_verification_cache,
+            )
+
         # Fase 5.3 — a proven sidecar inherits ONLY its main media's placement
         # (category/camera_profile/recording_date) for destination-path
         # purposes, never its own classification: `classification` above
@@ -478,15 +520,22 @@ class IngestService:
         destination_recording_date = (
             placement.recording_date if placement is not None else recording_date
         )
-        naive_destination = _build_workspace_path(
-            storage_root=self._config.storage_root,
-            client=client,
-            project=project,
-            recording_date=destination_recording_date,
-            category=destination_category,
-            camera_profile=destination_camera_profile,
-            filename=path.name,
-        )
+        # Fase 5.3.1B — a verified existing destination (see above) wins
+        # over the freshly computed camera-aware path: `_resolve_destination`
+        # below still handles the final filename and any collision suffix
+        # exactly as before, this only changes WHICH FOLDER that happens in.
+        if verified_existing_destination is not None:
+            naive_destination = verified_existing_destination.parent / path.name
+        else:
+            naive_destination = _build_workspace_path(
+                storage_root=self._config.storage_root,
+                client=client,
+                project=project,
+                recording_date=destination_recording_date,
+                category=destination_category,
+                camera_profile=destination_camera_profile,
+                filename=path.name,
+            )
 
         destination = naive_destination
         name_conflict_resolved = False
@@ -793,6 +842,136 @@ def _cached_checksum(storage: Storage, cache: dict[Path, str], path: Path) -> st
     checksum = storage.checksum(path)
     cache[path] = checksum
     return checksum
+
+
+def _verified_existing_destination(
+    storage: Storage,
+    manifest: Manifest,
+    allowed_root: Path,
+    checksum: str,
+    cache: dict[str, Path | None],
+) -> Path | None:
+    """Fase 5.3.1B — the ONLY place that ever decides a manifest-recorded
+    destination_path is safe to physically co-locate a sidecar next to.
+    Returns the main media's real destination file path (never its parent —
+    the caller takes `.parent` itself), or `None` if no candidate from
+    `manifest.find_destinations(checksum)` passes every check below.
+
+    `allowed_root` MUST be the CURRENT run's own Project Workspace
+    (`_project_workspace_path(storage_root, client, project)` —
+    `Klanten/{client}/{project}/`), never the bare `storage_root`. A main
+    media file registered for a DIFFERENT client/project can have the exact
+    same checksum (e.g. identical footage re-delivered, or simply identical
+    bytes) without that ever being a reason to let it decide where this
+    run's sidecar physically lands — that would leak a file across client/
+    project boundaries. Restricting to the current Project Workspace still
+    allows co-locating with an older, flat pre-Fase-5.3 folder for the SAME
+    client/project (the actual Fase 5.3.1B goal), since that folder is a
+    descendant of the same Project Workspace regardless of its internal
+    date/category/camera-profile subfolder shape.
+
+    Never raises: every fallible call below (path resolution, the manifest
+    lookup itself, the destination checksum) is caught and treated as "this
+    candidate doesn't verify" / "no candidates available", never as a
+    reason to abort the run over what is strictly an optional placement
+    optimization. This is a DELIBERATELY different failure policy than
+    `Manifest.is_duplicate()` elsewhere in `_process_asset()`: a corrupted/
+    unreadable manifest file still makes `is_duplicate()` raise and abort
+    the whole run unchanged — deduplication is not optional, so that
+    existing fail-loud behaviour is correct and is NOT touched here. This
+    function only ever softens failures for its OWN, optional lookup.
+
+    Run-scoped cache, keyed by checksum (not by individual candidate path):
+    memoizes the FINAL decision for a given main-media checksum, so N
+    sidecars proven against the same main media (Fase 5.3.1A) verify, and
+    critically re-hash the destination file, at most once per run,
+    regardless of how many raw candidates `find_destinations()` returned.
+    `cache` is always a fresh dict created per `run()` call (see run()) —
+    never shared across separate runs, so a destination file that changes
+    or disappears between two runs is always re-verified from scratch, never
+    trusted from a stale decision. `allowed_root` is constant for the whole
+    lifetime of one `run()` call (client/project never change mid-run), so
+    keying the cache by checksum alone — without also keying by
+    `allowed_root` — stays correct.
+
+    Verification order, each a precondition for the next:
+    1. `candidate.resolve()` — follows symlinks to the real, final path;
+       a candidate that can't be resolved at all (including a circular-
+       symlink `RuntimeError`, not just `OSError`/`ValueError`) is skipped,
+       not fatal.
+    2. The resolved path must be inside `allowed_root` (also resolved) —
+       blocks path traversal, a symlink that textually looks like it's
+       under `allowed_root` but actually escapes it, AND a different
+       client/project's registered destination.
+    3. `same_physical_device()` (device_identity.py, `st_dev` — never a
+       path-string/volume-name comparison) — blocks a swapped volume that
+       happens to be mounted at a path matching an old record.
+    4. `resolved.is_file()` — must be an existing, regular file (not a
+       directory, not a dangling special file).
+    5. `storage.checksum(resolved) == checksum` — the content must still be
+       exactly what the manifest recorded; a changed or corrupted file never
+       counts as a match, however close its path looks.
+
+    Multiple candidates (e.g. a hand-edited/merged manifest with more than
+    one record for the same checksum — `find_destinations()` never hides
+    this) are tried in the order returned; the first one that passes every
+    check wins. If none do, this returns `None` and the caller falls back to
+    the ordinary, freshly computed Fase 5.3 camera-aware destination."""
+    if checksum in cache:
+        return cache[checksum]
+
+    try:
+        allowed_root_resolved = allowed_root.resolve()
+    except (OSError, ValueError, RuntimeError):
+        # Can't even resolve the allowed root itself (e.g. the destination
+        # disk vanished mid-run, or a symlink loop in its own ancestry) — no
+        # candidate could ever be proven safe against it; fall back, never
+        # abort a run over this optional lookup.
+        cache[checksum] = None
+        return None
+
+    try:
+        candidates = manifest.find_destinations(checksum)
+    except (OSError, ValueError, AttributeError, TypeError):
+        # E.g. a corrupted/unreadable manifest JSON file raises
+        # json.JSONDecodeError (a ValueError subclass) here. A manifest with
+        # syntactically valid JSON but the wrong SHAPE (e.g. "assets" is a
+        # string, null, or a list containing non-dict entries) raises
+        # AttributeError/TypeError instead, from inside find_destinations()'s
+        # own `.get()` calls — just as uncaught, so caught here too.
+        # Deliberately NOT the same policy as `Manifest.is_duplicate()` —
+        # see this function's docstring above.
+        candidates = []
+
+    verified: Path | None = None
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if not _is_within(resolved, allowed_root_resolved):
+            continue
+        if not same_physical_device(resolved, allowed_root_resolved):
+            continue
+        try:
+            if not resolved.is_file():
+                continue
+            if storage.checksum(resolved) != checksum:
+                continue
+        except OSError:
+            continue
+        verified = resolved
+        break
+
+    cache[checksum] = verified
+    return verified
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    """Fase 5.3.1B — both arguments are expected already-resolved (symlinks
+    followed) by the caller; this is a pure, no-I/O ancestor check, never a
+    second resolution pass."""
+    return path.is_relative_to(root)
 
 
 @dataclasses.dataclass(frozen=True)

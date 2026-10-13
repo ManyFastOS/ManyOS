@@ -373,3 +373,134 @@ def test_an_old_shaped_manifest_without_fase_5_2_keys_still_supports_dedupe(tmp_
     )
     assert manifest.is_duplicate("new-sidecar-checksum") is True
     assert manifest.is_duplicate("pre-fase-5-2-checksum") is True
+
+
+# -- Fase 5.3.1B: find_destinations() ----------------------------------------
+
+
+def test_find_destinations_returns_empty_list_for_an_unknown_checksum(tmp_path):
+    manifest = JSONManifest(tmp_path / "asset_schema.json")
+    assert manifest.find_destinations("unknown") == []
+
+
+def test_find_destinations_returns_the_one_registered_destination(tmp_path):
+    manifest_path = tmp_path / "asset_schema.json"
+    manifest = JSONManifest(manifest_path)
+    manifest.register(_record("abc123"))
+
+    assert manifest.find_destinations("abc123") == [Path("/out/clip.mp4")]
+    assert manifest.find_destinations("something-else") == []
+
+
+def test_find_destinations_returns_every_match_never_picks_one_itself(tmp_path):
+    """A hand-edited/merged manifest can in principle contain more than one
+    record for the same asset_id — find_destinations() must surface ALL of
+    them, in file order, never silently resolve to a single "winning" one.
+    That decision belongs to the caller (IngestService), which verifies
+    before trusting any of them."""
+    manifest_path = tmp_path / "asset_schema.json"
+    old_shaped = {
+        "assets": [
+            {
+                "asset_id": "duplicated-checksum",
+                "client_id": "Nike",
+                "project_id": "Zomer",
+                "ingest_run_id": "run-0",
+                "operator": "tester",
+                "source_machine": "test-machine",
+                "original_path": "/in/clip.mxf",
+                "destination_path": "/out/old/clip.mxf",
+                "category": "Camera",
+                "camera_profile": "Sony FX6",
+                "confidence": "hoog",
+                "ingested_at": "2026-08-03T00:00:00+00:00",
+            },
+            {
+                "asset_id": "duplicated-checksum",
+                "client_id": "Nike",
+                "project_id": "Zomer",
+                "ingest_run_id": "run-1",
+                "operator": "tester",
+                "source_machine": "test-machine",
+                "original_path": "/in/clip.mxf",
+                "destination_path": "/out/new/clip.mxf",
+                "category": "Camera",
+                "camera_profile": "Sony FX6",
+                "confidence": "hoog",
+                "ingested_at": "2026-08-04T00:00:00+00:00",
+            },
+        ]
+    }
+    manifest_path.write_text(json.dumps(old_shaped))
+
+    manifest = JSONManifest(manifest_path)
+    assert manifest.find_destinations("duplicated-checksum") == [
+        Path("/out/old/clip.mxf"),
+        Path("/out/new/clip.mxf"),
+    ]
+
+
+def test_find_destinations_skips_records_with_a_missing_or_invalid_destination_path(tmp_path):
+    """Must never raise over data it doesn't itself trust — a malformed
+    record is simply skipped, not a reason to fail the whole lookup. The
+    caller's own verification would reject these anyway, but the lookup
+    itself must stay crash-free regardless."""
+    manifest_path = tmp_path / "asset_schema.json"
+    old_shaped = {
+        "assets": [
+            {
+                "asset_id": "missing-destination",
+                # geen destination_path key
+            },
+            {
+                "asset_id": "null-destination",
+                "destination_path": None,
+            },
+            {
+                "asset_id": "empty-destination",
+                "destination_path": "",
+            },
+            {
+                "asset_id": "valid-destination",
+                "destination_path": "/out/clip.mp4",
+            },
+        ]
+    }
+    manifest_path.write_text(json.dumps(old_shaped))
+
+    manifest = JSONManifest(manifest_path)
+    assert manifest.find_destinations("missing-destination") == []
+    assert manifest.find_destinations("null-destination") == []
+    assert manifest.find_destinations("empty-destination") == []
+    assert manifest.find_destinations("valid-destination") == [Path("/out/clip.mp4")]
+
+
+def test_an_old_shaped_manifest_without_fase_5_3_1b_usage_still_supports_find_destinations(
+    tmp_path,
+):
+    """find_destinations() reads the exact same two keys (asset_id,
+    destination_path) every record has had since Fase 0 — no migration,
+    works against any existing manifest unchanged."""
+    manifest_path = tmp_path / "asset_schema.json"
+    old_shaped = {
+        "assets": [
+            {
+                "asset_id": "pre-fase-5-3-1b-checksum",
+                "client_id": "Nike",
+                "project_id": "Zomer",
+                "ingest_run_id": "run-0",
+                "operator": "tester",
+                "source_machine": "test-machine",
+                "original_path": "/in/clip.mp4",
+                "destination_path": "/out/clip.mp4",
+                "category": "Drone",
+                "camera_profile": "DJI",
+                "confidence": "hoog",
+                "ingested_at": "2026-08-03T00:00:00+00:00",
+            }
+        ]
+    }
+    manifest_path.write_text(json.dumps(old_shaped))
+
+    manifest = JSONManifest(manifest_path)
+    assert manifest.find_destinations("pre-fase-5-3-1b-checksum") == [Path("/out/clip.mp4")]

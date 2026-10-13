@@ -61,3 +61,20 @@ class JSONManifest(Manifest):
 
     def _load_asset_ids(self) -> set[str]:
         return {asset["asset_id"] for asset in self._load().get("assets", []) if "asset_id" in asset}
+
+    def find_destinations(self, checksum: str) -> list[Path]:
+        """Fase 5.3.1B — mechanical lookup only, see Manifest.find_destinations()'s
+        docstring for why this never picks a "winning" record itself. A
+        record with a missing/empty/non-string `destination_path` is simply
+        skipped — this method must never raise over data it doesn't itself
+        verify; the caller (IngestService) is the one that decides whether a
+        returned path is actually safe to trust."""
+        destinations: list[Path] = []
+        for asset in self._load().get("assets", []):
+            if asset.get("asset_id") != checksum:
+                continue
+            raw_destination_path = asset.get("destination_path")
+            if not raw_destination_path or not isinstance(raw_destination_path, str):
+                continue
+            destinations.append(Path(raw_destination_path))
+        return destinations

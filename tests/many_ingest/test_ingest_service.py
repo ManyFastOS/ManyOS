@@ -35,6 +35,7 @@ from many_ingest.core.ingest_service import (
 from many_ingest.core.report import summarize
 from many_ingest.logger import ActionLogger
 from many_ingest.metadata_extractor import FfprobeNotFoundError
+from many_ingest.ports.manifest import Manifest
 from many_ingest.ports.storage import Storage
 from many_ingest.sidecar_relationship import RelationshipEvidence
 
@@ -2439,3 +2440,893 @@ class TestFase531AReferentialIntegrity:
             a for a in schema["assets"] if a["asset_id"] == sidecar_asset.checksum
         )
         assert sidecar_record["sidecar_of_asset_id"] == main_asset.checksum
+
+
+# -- Fase 5.3.1B: Verified Sidecar Co-location -------------------------------
+#
+# A proven sidecar's manifest-confirmed main media (Fase 5.3.1A's
+# sidecar_of_asset_id) is used to physically co-locate the sidecar NEXT TO
+# the main media's real, verified destination — including an old, flat
+# pre-Fase-5.3 folder — but only when that candidate passes every safety
+# check in _verified_existing_destination(). Any failure falls back to the
+# unchanged Fase 5.3 camera-aware computation.
+
+
+def _seed_old_flat_record_and_file(
+    config: IngestConfig, checksum: str, content: bytes, filename: str = "611_4921.MXF"
+) -> Path:
+    """Simulates a pre-Fase-5.3 ingest: a manifest record with a flat
+    (no camera_profile subfolder) destination_path, AND the matching
+    physical file actually present there — both the bookkeeping and the
+    ground truth a verified lookup needs to find and trust."""
+    old_dir = config.storage_root / "Klanten" / "Nike" / "Zomer" / "2026-01-01_Raw" / "Camera"
+    old_dir.mkdir(parents=True, exist_ok=True)
+    old_path = old_dir / filename
+    old_path.write_bytes(content)
+
+    config.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    config.manifest_path.write_text(
+        json.dumps(
+            {
+                "assets": [
+                    {
+                        "asset_id": checksum,
+                        "client_id": "Nike",
+                        "project_id": "Zomer",
+                        "ingest_run_id": "old-run",
+                        "operator": "iemand",
+                        "source_machine": "oude-machine",
+                        "original_path": f"/oud/pad/{filename}",
+                        "destination_path": str(old_path),
+                        "category": "Camera",
+                        "camera_profile": "Sony FX6",
+                        "confidence": "hoog",
+                        "ingested_at": "2026-01-01T00:00:00+00:00",
+                    }
+                ]
+            }
+        )
+    )
+    return old_path
+
+
+class TestFase531BVerifiedSidecarColocation:
+    def test_new_main_media_and_sidecar_in_the_same_run_use_the_verified_lookup(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """Even the "nothing special" case now goes through
+        find_destinations()/_verified_existing_destination() — proven here
+        with a spy, not just by checking the (unchanged) end result."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+        config = _make_config(tmp_path)
+
+        looked_up_checksums: list[str] = []
+        original_find_destinations = JSONManifest.find_destinations
+
+        def _spy_find_destinations(self, checksum):
+            looked_up_checksums.append(checksum)
+            return original_find_destinations(self, checksum)
+
+        monkeypatch.setattr(JSONManifest, "find_destinations", _spy_find_destinations)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.COPIED
+        assert sidecar_asset.sidecar_of_asset_id == main_asset.checksum
+        assert looked_up_checksums == [main_asset.checksum]
+        assert sidecar_asset.destination_path.parent == main_asset.destination_path.parent
+        assert sidecar_asset.destination_path.exists()
+        assert main_asset.destination_path.exists()
+
+    def test_duplicate_in_a_new_camera_aware_folder_is_unaffected(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        run1_dir = tmp_path / "run1"
+        run1_dir.mkdir()
+        (run1_dir / "611_4921.MXF").write_bytes(b"fake mxf bytes")
+        service.run(run1_dir, client="Nike", project="Zomer", dry_run=False)
+
+        run2_dir = tmp_path / "run2"
+        run2_dir.mkdir()
+        _write_umid_matched_pair(run2_dir)
+        report = service.run(run2_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.DUPLICATE_SKIPPED
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert main_asset.destination_path == expected_dir / "611_4921.MXF"
+        assert sidecar_asset.destination_path == expected_dir / "611_4921M01.XML"
+        assert sidecar_asset.destination_path.exists()
+
+    def test_duplicate_in_an_old_flat_folder_is_co_located_there(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """The headline fix: a sidecar for a main media already sitting in a
+        pre-Fase-5.3 flat folder now lands next to it, not in a freshly
+        computed, empty camera-aware folder."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        checksum = hashlib.sha256(b"fake mxf bytes").hexdigest()
+        old_path = _seed_old_flat_record_and_file(config, checksum, b"fake mxf bytes")
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.DUPLICATE_SKIPPED
+        assert sidecar_asset.outcome == AssetOutcome.COPIED
+        # Fysiek naast elkaar, in de OUDE, platte map — niet in Camera/Sony FX6/.
+        assert sidecar_asset.destination_path.parent == old_path.parent
+        assert sidecar_asset.destination_path == old_path.parent / "611_4921M01.XML"
+        assert old_path.exists()
+        assert sidecar_asset.destination_path.exists()
+
+        schema = json.loads(config.manifest_path.read_text())
+        sidecar_record = next(
+            a for a in schema["assets"] if a["asset_id"] == sidecar_asset.checksum
+        )
+        assert sidecar_record["destination_path"] == str(old_path.parent / "611_4921M01.XML")
+        assert sidecar_record["sidecar_of_asset_id"] == checksum
+
+    def test_missing_destination_file_falls_back_to_camera_aware_placement(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        checksum = hashlib.sha256(b"fake mxf bytes").hexdigest()
+        # Record aanmaken ZONDER het bestand fysiek te plaatsen.
+        old_dir = config.storage_root / "Klanten" / "Nike" / "Zomer" / "2026-01-01_Raw" / "Camera"
+        old_path = old_dir / "611_4921.MXF"
+        config.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        config.manifest_path.write_text(
+            json.dumps(
+                {
+                    "assets": [
+                        {
+                            "asset_id": checksum,
+                            "client_id": "Nike",
+                            "project_id": "Zomer",
+                            "ingest_run_id": "old-run",
+                            "operator": "iemand",
+                            "source_machine": "oude-machine",
+                            "original_path": "/oud/pad/611_4921.MXF",
+                            "destination_path": str(old_path),
+                            "category": "Camera",
+                            "camera_profile": "Sony FX6",
+                            "confidence": "hoog",
+                            "ingested_at": "2026-01-01T00:00:00+00:00",
+                        }
+                    ]
+                }
+            )
+        )
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert sidecar_asset.destination_path == expected_dir / "611_4921M01.XML"
+        assert not old_path.exists()  # nooit aangemaakt — puur een terugval
+
+    def test_changed_content_at_the_recorded_destination_falls_back(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        original_content = b"fake mxf bytes"
+        checksum = hashlib.sha256(original_content).hexdigest()
+        # Record claimt `checksum`, maar het bestand op dat pad is sindsdien
+        # gewijzigd (andere inhoud dan verwacht).
+        old_path = _seed_old_flat_record_and_file(config, checksum, original_content)
+        old_path.write_bytes(b"gewijzigde inhoud, niet meer wat het manifest claimt")
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert sidecar_asset.destination_path == expected_dir / "611_4921M01.XML"
+
+    def test_failed_verification_of_main_media_never_triggers_the_lookup(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """sidecar_of_asset_id is already None per Fase 5.3.1A when the main
+        media fails verification — the Fase 5.3.1B lookup must never even be
+        attempted (not just "attempted but failing")."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+        config = _make_config(tmp_path)
+        real_storage = LocalFilesystemStorage()
+
+        class _FailsVerificationForOneFile(Storage):
+            def list_files(self, root):
+                return real_storage.list_files(root)
+
+            def exists(self, path):
+                return real_storage.exists(path)
+
+            def copy(self, source, destination):
+                real_storage.copy(source, destination)
+
+            def checksum(self, path):
+                path = Path(path)
+                if path.name == "611_4921.MXF" and config.storage_root in path.parents:
+                    return "corrupted-destination-checksum"
+                return real_storage.checksum(path)
+
+            def free_bytes(self, path):
+                return real_storage.free_bytes(path)
+
+            def remove(self, path):
+                real_storage.remove(path)
+
+        looked_up_checksums: list[str] = []
+        original_find_destinations = JSONManifest.find_destinations
+
+        def _spy_find_destinations(self, checksum):
+            looked_up_checksums.append(checksum)
+            return original_find_destinations(self, checksum)
+
+        monkeypatch.setattr(JSONManifest, "find_destinations", _spy_find_destinations)
+
+        service = _make_service(config, camera_profiles, storage=_FailsVerificationForOneFile())
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.FAILED_VERIFICATION
+        assert sidecar_asset.sidecar_of_asset_id is None
+        assert looked_up_checksums == []  # nooit aangeroepen
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert sidecar_asset.destination_path == expected_dir / "611_4921M01.XML"
+
+    def test_sidecar_itself_already_a_duplicate_is_skipped_without_crashing(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+        service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        # Zelfde bestanden, zelfde inhoud, opnieuw: zowel hoofdmedia als
+        # sidecar zijn nu allebei al geregistreerde duplicates.
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert main_asset.outcome == AssetOutcome.DUPLICATE_SKIPPED
+        assert sidecar_asset.outcome == AssetOutcome.DUPLICATE_SKIPPED
+        assert sidecar_asset.sidecar_of_asset_id == main_asset.checksum
+
+    def test_name_collision_in_the_old_flat_folder_still_gets_a_suffix(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        checksum = hashlib.sha256(b"fake mxf bytes").hexdigest()
+        old_path = _seed_old_flat_record_and_file(config, checksum, b"fake mxf bytes")
+        # Een andere, onverwante XML met exact dezelfde naam staat al in de
+        # oude map.
+        (old_path.parent / "611_4921M01.XML").write_bytes(b"onverwante, bestaande XML-inhoud")
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert sidecar_asset.name_conflict_resolved is True
+        assert sidecar_asset.destination_path.parent == old_path.parent
+        assert sidecar_asset.destination_path.name == "611_4921M01_001.XML"
+        assert sidecar_asset.outcome == AssetOutcome.COPIED
+
+    def test_dry_run_and_real_ingest_compute_the_same_old_folder_placement(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        checksum = hashlib.sha256(b"fake mxf bytes").hexdigest()
+        old_path = _seed_old_flat_record_and_file(config, checksum, b"fake mxf bytes")
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        preview = service.run(input_dir, client="Nike", project="Zomer", dry_run=True)
+        real = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        preview_sidecar = next(
+            a for a in preview.assets if a.source_path.name == "611_4921M01.XML"
+        )
+        real_sidecar = next(a for a in real.assets if a.source_path.name == "611_4921M01.XML")
+        assert preview_sidecar.destination_path == real_sidecar.destination_path
+        assert real_sidecar.destination_path == old_path.parent / "611_4921M01.XML"
+
+    def test_path_traversal_outside_storage_root_is_rejected(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        content = b"fake mxf bytes"
+        checksum = hashlib.sha256(content).hexdigest()
+
+        # Een record dat NAAR BUITEN de destination-root wijst — fysiek
+        # aanwezig en met de juiste checksum, om specifiek te bewijzen dat
+        # ALLEEN de containment-check dit blokkeert, niet exists()/checksum().
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        outside_path = outside_dir / "611_4921.MXF"
+        outside_path.write_bytes(content)
+
+        config.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        config.manifest_path.write_text(
+            json.dumps(
+                {
+                    "assets": [
+                        {
+                            "asset_id": checksum,
+                            "client_id": "Nike",
+                            "project_id": "Zomer",
+                            "ingest_run_id": "old-run",
+                            "operator": "iemand",
+                            "source_machine": "oude-machine",
+                            "original_path": "/oud/pad/611_4921.MXF",
+                            "destination_path": str(outside_path),
+                            "category": "Camera",
+                            "camera_profile": "Sony FX6",
+                            "confidence": "hoog",
+                            "ingested_at": "2026-01-01T00:00:00+00:00",
+                        }
+                    ]
+                }
+            )
+        )
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert sidecar_asset.destination_path == expected_dir / "611_4921M01.XML"
+        assert sidecar_asset.destination_path.parent != outside_path.parent
+
+    def test_symlink_escaping_storage_root_is_rejected(self, tmp_path, camera_profiles, monkeypatch):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        content = b"fake mxf bytes"
+        checksum = hashlib.sha256(content).hexdigest()
+
+        # Het echte bestand staat BUITEN storage_root...
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        real_file = outside_dir / "611_4921.MXF"
+        real_file.write_bytes(content)
+
+        # ...maar het geregistreerde pad is een symlink die TEKSTUEEL binnen
+        # storage_root staat en er dus "geldig" uitziet vóór resolutie.
+        inside_dir = config.storage_root / "Klanten" / "Nike" / "Zomer" / "2026-01-01_Raw" / "Camera"
+        inside_dir.mkdir(parents=True, exist_ok=True)
+        symlink_path = inside_dir / "611_4921.MXF"
+        symlink_path.symlink_to(real_file)
+
+        config.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        config.manifest_path.write_text(
+            json.dumps(
+                {
+                    "assets": [
+                        {
+                            "asset_id": checksum,
+                            "client_id": "Nike",
+                            "project_id": "Zomer",
+                            "ingest_run_id": "old-run",
+                            "operator": "iemand",
+                            "source_machine": "oude-machine",
+                            "original_path": "/oud/pad/611_4921.MXF",
+                            "destination_path": str(symlink_path),
+                            "category": "Camera",
+                            "camera_profile": "Sony FX6",
+                            "confidence": "hoog",
+                            "ingested_at": "2026-01-01T00:00:00+00:00",
+                        }
+                    ]
+                }
+            )
+        )
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert sidecar_asset.destination_path == expected_dir / "611_4921M01.XML"
+
+    def test_swapped_physical_volume_is_rejected_even_with_a_matching_path_and_checksum(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """same_physical_device() returning False must independently block
+        trust, even when the path textually resolves inside storage_root
+        and the checksum matches — proves the device check isn't redundant
+        with the containment check."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        monkeypatch.setattr(ingest_service_module, "same_physical_device", lambda a, b: False)
+
+        config = _make_config(tmp_path)
+        checksum = hashlib.sha256(b"fake mxf bytes").hexdigest()
+        old_path = _seed_old_flat_record_and_file(config, checksum, b"fake mxf bytes")
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert sidecar_asset.destination_path == expected_dir / "611_4921M01.XML"
+        assert sidecar_asset.destination_path.parent != old_path.parent
+
+    def test_multiple_manifest_records_tries_each_until_one_verifies(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        content = b"fake mxf bytes"
+        checksum = hashlib.sha256(content).hexdigest()
+
+        valid_old_path = _seed_old_flat_record_and_file(config, checksum, content)
+
+        # Een tweede record voor DEZELFDE checksum, wijzend naar een pad dat
+        # nooit fysiek is aangemaakt (ongeldig) — vóór het geldige record in
+        # het manifest gezet, om te bewijzen dat de eerste match niet
+        # klakkeloos gebruikt wordt.
+        schema = json.loads(config.manifest_path.read_text())
+        invalid_record = dict(schema["assets"][0])
+        invalid_record["destination_path"] = str(
+            config.storage_root / "Klanten" / "Nike" / "Zomer" / "nergens" / "611_4921.MXF"
+        )
+        schema["assets"].insert(0, invalid_record)
+        config.manifest_path.write_text(json.dumps(schema))
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert sidecar_asset.destination_path.parent == valid_old_path.parent
+
+    def test_missing_or_invalid_manifest_destination_path_never_crashes_the_run(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        checksum = hashlib.sha256(b"fake mxf bytes").hexdigest()
+        config.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        config.manifest_path.write_text(
+            json.dumps(
+                {
+                    "assets": [
+                        {"asset_id": checksum},  # geen destination_path key
+                        {"asset_id": checksum, "destination_path": None},
+                        {"asset_id": checksum, "destination_path": ""},
+                    ]
+                }
+            )
+        )
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        main_asset = by_name["611_4921.MXF"]
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        # is_duplicate() is nog steeds True (asset_id staat er), maar geen
+        # enkele bruikbare bestemming — terugval, geen crash.
+        assert main_asset.outcome == AssetOutcome.DUPLICATE_SKIPPED
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert sidecar_asset.destination_path == expected_dir / "611_4921M01.XML"
+
+    def test_multiple_sidecars_sharing_the_same_verified_main_media_hash_the_destination_once(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """Two content-identical main media files (same checksum) in
+        different subfolders, each with its own proven sidecar — both
+        sidecars resolve to the SAME verified main-media checksum, so the
+        run-scoped cache must prevent re-hashing that destination file for
+        the second sidecar."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "clipA").mkdir()
+        _write_umid_matched_pair(input_dir / "clipA")
+        (input_dir / "clipB").mkdir()
+        _write_umid_matched_pair(input_dir / "clipB")
+
+        counting_storage = _CountingChecksumStorage()
+        service = _make_service(config, camera_profiles, storage=counting_storage)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_path = {a.source_path: a for a in report.assets}
+        main_a = by_path[input_dir / "clipA" / "611_4921.MXF"]
+        main_b = by_path[input_dir / "clipB" / "611_4921.MXF"]
+        sidecar_a = by_path[input_dir / "clipA" / "611_4921M01.XML"]
+        sidecar_b = by_path[input_dir / "clipB" / "611_4921M01.XML"]
+
+        # Eén van de twee is de "eerste" (COPIED), de ander een duplicate
+        # van exact dezelfde inhoud.
+        outcomes = {main_a.outcome, main_b.outcome}
+        assert outcomes == {AssetOutcome.COPIED, AssetOutcome.DUPLICATE_SKIPPED}
+        assert sidecar_a.sidecar_of_asset_id == main_a.checksum
+        assert sidecar_b.sidecar_of_asset_id == main_b.checksum
+        assert main_a.checksum == main_b.checksum  # zelfde inhoud, dus zelfde checksum
+
+        copied_main = main_a if main_a.outcome == AssetOutcome.COPIED else main_b
+        # De bestemmingsdatei van de daadwerkelijk gekopieerde hoofdmedia
+        # wordt precies TWEE keer gehasht, niet drie: één keer door de
+        # hoofdmedia's eigen post-copy checksumverificatie, en één keer door
+        # de EERSTE sidecar's lookup-verificatie (_verified_existing_destination).
+        # De TWEEDE sidecar's lookup voor dezelfde checksum komt uit de
+        # run-scoped cache en voegt géén extra hash toe — zonder die cache
+        # zou dit drie zijn (1 + 1 per sidecar).
+        assert counting_storage.checksum_calls.get(copied_main.destination_path, 0) == 2
+        assert sidecar_a.destination_path.parent == copied_main.destination_path.parent
+        assert sidecar_b.destination_path.parent == copied_main.destination_path.parent
+
+    def test_cross_project_main_media_never_determines_the_sidecar_placement(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """The headline fix from the final safety review: a main media
+        already registered for a DIFFERENT client/project, with an
+        identical checksum, must never decide where this run's sidecar
+        physically lands. The sidecar must stay inside its OWN project's
+        camera-aware placement."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        # Project A: hoofdvideo wordt hier normaal geregistreerd.
+        project_a_dir = tmp_path / "source_a"
+        project_a_dir.mkdir()
+        (project_a_dir / "611_4921.MXF").write_bytes(b"fake mxf bytes")
+        report_a = service.run(project_a_dir, client="Nike", project="ProjectA", dry_run=False)
+        main_a = report_a.assets[0]
+
+        # Project B: totaal andere client/project, maar exact dezelfde
+        # hoofdmedia-inhoud (dus dezelfde checksum) + een sidecar.
+        project_b_dir = tmp_path / "source_b"
+        project_b_dir.mkdir()
+        _write_umid_matched_pair(project_b_dir)
+        report_b = service.run(
+            project_b_dir, client="Sharpwaves", project="ProjectB", dry_run=False
+        )
+
+        by_name = {a.source_path.name: a for a in report_b.assets}
+        main_b = by_name["611_4921.MXF"]
+        sidecar_b = by_name["611_4921M01.XML"]
+
+        assert main_a.checksum == main_b.checksum  # zelfde inhoud, dus zelfde checksum
+        assert main_b.outcome == AssetOutcome.DUPLICATE_SKIPPED
+        assert sidecar_b.outcome == AssetOutcome.COPIED
+        assert sidecar_b.sidecar_of_asset_id == main_a.checksum
+
+        # De sidecar blijft binnen ZIJN EIGEN Project Workspace, nooit in
+        # project A's map.
+        expected_dir_b = _workspace_dir(
+            config, "Sharpwaves", "ProjectB", "Camera", camera_profile="Sony FX6"
+        )
+        assert sidecar_b.destination_path == expected_dir_b / "611_4921M01.XML"
+        assert "ProjectA" not in str(sidecar_b.destination_path)
+        assert sidecar_b.destination_path.exists()
+
+        # Ook het gepersisteerde record bevestigt dit.
+        schema = json.loads(config.manifest_path.read_text())
+        sidecar_record = next(a for a in schema["assets"] if a["asset_id"] == sidecar_b.checksum)
+        assert sidecar_record["destination_path"] == str(expected_dir_b / "611_4921M01.XML")
+        assert "ProjectA" not in sidecar_record["destination_path"]
+
+    def test_same_client_and_project_but_older_recording_folder_still_co_locates(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """The legitimate case the feature exists for, explicitly
+        distinguished from the cross-project case above: SAME client/
+        project, but an older, flat recording/camera folder — the sidecar
+        must still land next to the real, existing main media."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        checksum = hashlib.sha256(b"fake mxf bytes").hexdigest()
+        old_path = _seed_old_flat_record_and_file(config, checksum, b"fake mxf bytes")
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        sidecar_asset = by_name["611_4921M01.XML"]
+
+        assert sidecar_asset.destination_path == old_path.parent / "611_4921M01.XML"
+        assert sidecar_asset.destination_path.exists()
+
+        schema = json.loads(config.manifest_path.read_text())
+        sidecar_record = next(
+            a for a in schema["assets"] if a["asset_id"] == sidecar_asset.checksum
+        )
+        assert sidecar_record["destination_path"] == str(old_path.parent / "611_4921M01.XML")
+
+    def test_registered_path_with_a_circular_symlink_falls_back_safely(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        checksum = hashlib.sha256(b"fake mxf bytes").hexdigest()
+
+        old_dir = config.storage_root / "Klanten" / "Nike" / "Zomer" / "2026-01-01_Raw" / "Camera"
+        old_dir.mkdir(parents=True, exist_ok=True)
+        looping_path = old_dir / "611_4921.MXF"
+        looping_path.symlink_to(looping_path)  # wijst naar zichzelf: circulaire symlink
+
+        config.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        config.manifest_path.write_text(
+            json.dumps(
+                {
+                    "assets": [
+                        {
+                            "asset_id": checksum,
+                            "client_id": "Nike",
+                            "project_id": "Zomer",
+                            "ingest_run_id": "old-run",
+                            "operator": "iemand",
+                            "source_machine": "oude-machine",
+                            "original_path": "/oud/pad/611_4921.MXF",
+                            "destination_path": str(looping_path),
+                            "category": "Camera",
+                            "camera_profile": "Sony FX6",
+                            "confidence": "hoog",
+                            "ingested_at": "2026-01-01T00:00:00+00:00",
+                        }
+                    ]
+                }
+            )
+        )
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        # Mag niet crashen ondanks de circulaire symlink op het geregistreerde pad.
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        sidecar_asset = by_name["611_4921M01.XML"]
+        expected_dir = _workspace_dir(config, "Nike", "Zomer", "Camera", camera_profile="Sony FX6")
+        assert sidecar_asset.destination_path == expected_dir / "611_4921M01.XML"
+        assert sidecar_asset.outcome == AssetOutcome.COPIED
+
+    def test_circular_symlink_in_the_allowed_project_root_never_raises(self, tmp_path):
+        """Helper-level: a symlink loop in `allowed_root` ITSELF (not just a
+        candidate) must not raise — tested directly against
+        _verified_existing_destination(), since forcing the SAME loop
+        through a full IngestService.run() would also break that run's own
+        (unrelated) fresh camera-aware placement, confounding the test."""
+        looping_root = tmp_path / "loop"
+        looping_root.symlink_to(looping_root)
+
+        cache: dict[str, Path | None] = {}
+        result = ingest_service_module._verified_existing_destination(
+            LocalFilesystemStorage(),
+            JSONManifest(tmp_path / "asset_schema.json"),
+            looping_root,
+            "any-checksum",
+            cache,
+        )
+
+        assert result is None
+        assert cache["any-checksum"] is None
+
+    def test_manifest_lookup_errors_fall_back_at_helper_level_without_raising(self, tmp_path):
+        """Helper-level: whatever `Manifest.find_destinations()` raises
+        (a corrupted-JSON-style ValueError, a filesystem OSError, or a
+        generic ValueError), _verified_existing_destination() itself must
+        swallow it and return None — this is the function's own, optional
+        lookup, never allowed to abort the run over it."""
+
+        class _RaisingManifest(Manifest):
+            def __init__(self, exc: Exception) -> None:
+                self._exc = exc
+
+            def is_duplicate(self, checksum: str) -> bool:
+                return False
+
+            def register(self, record) -> None:
+                raise AssertionError("register() should never be called by this helper")
+
+            def find_destinations(self, checksum: str) -> list[Path]:
+                raise self._exc
+
+        for exc in (
+            json.JSONDecodeError("boom", "{}", 0),
+            OSError("boom"),
+            ValueError("boom"),
+        ):
+            cache: dict[str, Path | None] = {}
+            result = ingest_service_module._verified_existing_destination(
+                LocalFilesystemStorage(),
+                _RaisingManifest(exc),
+                tmp_path,
+                "any-checksum",
+                cache,
+            )
+            assert result is None
+
+    def test_structurally_malformed_but_valid_json_manifest_falls_back_at_helper_level(
+        self, tmp_path
+    ):
+        """Final safety review finding: syntactically valid JSON with the
+        wrong SHAPE for "assets" (a string, a list of non-dict entries, or
+        null) makes the real JSONManifest.find_destinations() raise
+        AttributeError/TypeError from inside its own `.get()` calls — a
+        different exception class than the JSONDecodeError case already
+        covered above, and one the original except clause didn't catch.
+        _verified_existing_destination() must swallow this too and return
+        None, never propagate, using the REAL adapter (not a fake), so this
+        exercises the actual fix end-to-end."""
+        for payload in (
+            {"assets": "geen lijst"},
+            {"assets": [123]},
+            {"assets": None},
+        ):
+            manifest_path = tmp_path / f"manifest_{id(payload)}.json"
+            manifest_path.write_text(json.dumps(payload))
+            manifest = JSONManifest(manifest_path)
+            cache: dict[str, Path | None] = {}
+
+            result = ingest_service_module._verified_existing_destination(
+                LocalFilesystemStorage(),
+                manifest,
+                tmp_path,
+                "any-checksum",
+                cache,
+            )
+
+            assert result is None
+            assert cache["any-checksum"] is None
+
+    def test_corrupted_manifest_still_aborts_the_whole_run_via_existing_is_duplicate(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """Explicit boundary: the new, OPTIONAL Fase 5.3.1B lookup fails safe
+        on a corrupted manifest (see the helper-level test above), but the
+        existing, MANDATORY `Manifest.is_duplicate()` check — deduplication
+        is not optional — is completely unchanged and still raises, aborting
+        the whole run, well before the 5.3.1B lookup would ever be reached.
+        This is a deliberate, documented difference in failure policy, not
+        an oversight: this test exists to make that boundary explicit and
+        guarded."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        config.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        config.manifest_path.write_text("{ dit is geen geldige JSON !!!")
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "611_4921.MXF").write_bytes(b"fake mxf bytes")
+
+        service = _make_service(config, camera_profiles)
+        with pytest.raises(json.JSONDecodeError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=False)

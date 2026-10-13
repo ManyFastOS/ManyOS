@@ -70,3 +70,19 @@ class Manifest(abc.ABC):
     @abc.abstractmethod
     def register(self, record: AssetRecord) -> None:
         """Persist a newly copied asset's record."""
+
+    @abc.abstractmethod
+    def find_destinations(self, checksum: str) -> list[Path]:
+        """Fase 5.3.1B — every recorded `destination_path` for this asset_id,
+        in whatever order the underlying store happens to hold them (empty
+        list if none). A pure, mechanical lookup — never a decision about
+        WHICH one is correct/safe to use: a manifest can in principle hold
+        more than one record for the same checksum (e.g. a hand-edited or
+        merged manifest), and this method deliberately surfaces all of them
+        rather than silently picking one. The caller (IngestService) is the
+        only place that verifies a candidate (exists, checksum, device,
+        containment) before ever trusting it — see that module's Fase 5.3.1B
+        comment. Never raises for a missing/invalid record; a malformed
+        `destination_path` is simply skipped, not a reason to fail the whole
+        lookup (the caller's verification would reject it anyway, but a
+        lookup must not crash the run over data it doesn't itself trust)."""
