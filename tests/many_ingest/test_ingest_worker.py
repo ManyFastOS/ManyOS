@@ -739,3 +739,61 @@ def test_dry_run_never_writes_a_report_file(tmp_path):
 
     assert not report_path.exists()
     assert not (tmp_path / "storage").exists()
+
+
+def test_worker_translates_unsafe_client_name_to_ingest_failed(tmp_path):
+    """Fase 5.3.2: InvalidWorkspaceNameError (IngestService.run()'s own
+    name validation) must become a normal ingest_failed event with
+    EXIT_FAILED — never an uncaught traceback on stdout/stderr — same
+    pattern as the same-physical-device/destination-unavailable cases
+    above."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+    config_path = _write_config(tmp_path)
+
+    result, lines = _run_worker(
+        tmp_path,
+        input_dir,
+        client="../../../../tmp/pwn",
+        config_path=config_path,
+        dry_run=True,
+    )
+
+    assert result.returncode == 1
+    failed = next(line for line in lines if line["event"] == "ingest_failed")
+    assert "Klantnaam" in failed["message"]
+    assert "Traceback" not in result.stderr
+    assert not (tmp_path / "storage").exists()
+
+
+def test_worker_translates_destination_escaping_symlink_to_ingest_failed(tmp_path):
+    """Fase 5.3.2: a pre-existing symlink under storage_root that would
+    redirect the Project Workspace outside it (DestinationEscapesWorkspaceError)
+    must also become a plain, friendly ingest_failed event — never a
+    stack trace, and nothing written outside the workspace."""
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+    config_path = _write_config(tmp_path)
+
+    outside = tmp_path / "outside_escape"
+    outside.mkdir()
+    storage_root = tmp_path / "storage"
+    (storage_root / "Klanten").mkdir(parents=True)
+    (storage_root / "Klanten" / "Nike").symlink_to(outside, target_is_directory=True)
+
+    result, lines = _run_worker(
+        tmp_path,
+        input_dir,
+        client="Nike",
+        project="Zomer",
+        config_path=config_path,
+        dry_run=True,
+    )
+
+    assert result.returncode == 1
+    failed = next(line for line in lines if line["event"] == "ingest_failed")
+    assert "symlink" in failed["message"].lower()
+    assert "Traceback" not in result.stderr
+    assert list(outside.iterdir()) == []

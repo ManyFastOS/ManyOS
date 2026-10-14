@@ -25,12 +25,16 @@ from many_ingest.config import IngestConfig
 from many_ingest.core import ingest_service as ingest_service_module
 from many_ingest.core.ingest_service import (
     AssetOutcome,
+    DestinationEscapesWorkspaceError,
     DestinationFullError,
     DestinationUnavailableError,
     IngestService,
+    InvalidWorkspaceNameError,
     ProgressUpdate,
     _normalize_frame_rate,
     _resolve_sidecar_relationships,
+    is_valid_workspace_name,
+    validate_workspace_name,
 )
 from many_ingest.core.report import summarize
 from many_ingest.logger import ActionLogger
@@ -912,8 +916,20 @@ class TestFase50ClassificationFoundation:
         input_dir.mkdir()
         (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
 
+        # Scoped to exactly the call _resolve_source_relative_path() makes
+        # (path.relative_to(source), i.e. other == input_dir) — NOT a
+        # blanket break of Path.relative_to for every caller. Fase 5.3.2's
+        # containment checks (_is_within()) call Path.is_relative_to(),
+        # which CPython's pathlib implements internally via relative_to()
+        # catching ValueError — a blanket patch here would make every
+        # containment check in the same run() call spuriously report "not
+        # within" too, which is not what this test is about.
+        original_relative_to = Path.relative_to
+
         def _broken_relative_to(self, *args, **kwargs):
-            raise ValueError("gesimuleerd: pad valt niet onder de bronroot")
+            if args and args[0] == input_dir:
+                raise ValueError("gesimuleerd: pad valt niet onder de bronroot")
+            return original_relative_to(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "relative_to", _broken_relative_to)
 
@@ -3330,3 +3346,574 @@ class TestFase531BVerifiedSidecarColocation:
         service = _make_service(config, camera_profiles)
         with pytest.raises(json.JSONDecodeError):
             service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+
+# -- Fase 5.3.2: Workspace Path Safety ---------------------------------------
+#
+# client/project are free text from the CLI (--client/--project, no
+# validation there) and the desktop GUI (a QLineEdit, only .strip() to gate
+# the button) that flow unvalidated into _project_workspace_path()/
+# _build_workspace_path(), which join them onto storage_root with plain
+# Path.__truediv__. Two independent defenses, tested separately below:
+#   1. validate_workspace_name() — rejects unsafe STRINGS (absolute paths,
+#      "..", path separators, empty/whitespace, control characters) before
+#      any filesystem access, identically for a dry-run and a real run.
+#   2. The containment check in run()/_process_asset() — defense-in-depth
+#      against a pre-existing SYMLINK somewhere under storage_root that
+#      could redirect an otherwise perfectly safe name outside the
+#      workspace, something no string check alone can catch.
+
+_UNSAFE_WORKSPACE_NAMES = [
+    "/etc/cron.d",  # absoluut pad
+    "/Users/someone/Desktop",  # absoluut pad
+    "../../../../tmp/pwn",  # traversal
+    "..",
+    ".",
+    "",  # leeg
+    "   ",  # alleen whitespace
+    " ZF Aftermarket",  # leidende spatie
+    "ZF Aftermarket ",  # volgspatie
+    "foo/bar",  # padscheidingsteken
+    "foo\\bar",  # padscheidingsteken (Windows-stijl)
+    "foo\x00bar",  # NUL-teken
+]
+
+_VALID_WORKSPACE_NAMES = [
+    "ZF Aftermarket",
+    "3B Exclusief",
+    "Van der Panne Makelaardij",
+    "Project 2026 - Düsseldorf",
+    "Commercial & Social",
+    "Sony FX6",
+]
+
+
+class TestValidateWorkspaceName:
+    """Direct, fast unit coverage of the validation function itself —
+    separate from the slower integration tests below that exercise it via
+    IngestService.run()."""
+
+    @pytest.mark.parametrize("name", _UNSAFE_WORKSPACE_NAMES)
+    def test_rejects_unsafe_names(self, name):
+        with pytest.raises(InvalidWorkspaceNameError):
+            validate_workspace_name(name, "Klantnaam")
+
+    @pytest.mark.parametrize("name", _VALID_WORKSPACE_NAMES)
+    def test_accepts_valid_names(self, name):
+        validate_workspace_name(name, "Klantnaam")  # mag niet raisen
+
+    @pytest.mark.parametrize("name", _VALID_WORKSPACE_NAMES)
+    def test_is_valid_workspace_name_true_for_valid_names(self, name):
+        assert is_valid_workspace_name(name) is True
+
+    @pytest.mark.parametrize("name", _UNSAFE_WORKSPACE_NAMES)
+    def test_is_valid_workspace_name_false_for_unsafe_names(self, name):
+        assert is_valid_workspace_name(name) is False
+
+
+class TestWorkspaceNameValidationInRun:
+    """Scenarios A/B/C/E/H from the Fase 5.3.2 regression-test list: unsafe
+    client/project strings, in either field, for both dry_run=True and
+    dry_run=False, must be rejected before any filesystem access — not just
+    before a write, before ANY read of storage_root/manifest_path/log_dir
+    too (see run()'s own early validation, before even the ffprobe check)."""
+
+    @pytest.mark.parametrize("field", ["client", "project"])
+    @pytest.mark.parametrize("dry_run", [True, False])
+    @pytest.mark.parametrize("unsafe_name", _UNSAFE_WORKSPACE_NAMES)
+    def test_unsafe_name_is_rejected_before_any_filesystem_access(
+        self, tmp_path, camera_profiles, unsafe_name, dry_run, field
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+
+        kwargs = {"client": "Nike", "project": "Zomer"}
+        kwargs[field] = unsafe_name
+
+        with pytest.raises(InvalidWorkspaceNameError):
+            service.run(input_dir, dry_run=dry_run, **kwargs)
+
+        # H: geen enkele read/write buiten (of binnen) de workspace — de
+        # validatie gebeurt vóór scan/ffprobe/manifest/log, voor beide modi.
+        assert not config.storage_root.exists()
+        assert not config.manifest_path.exists()
+        assert not config.log_dir.exists()
+
+    @pytest.mark.parametrize("valid_name", _VALID_WORKSPACE_NAMES)
+    def test_valid_name_with_spaces_accents_and_punctuation_is_accepted(
+        self, tmp_path, camera_profiles, valid_name
+    ):
+        """D: namen met spaties, accenten en leestekens blijven werken — de
+        validatie weigert alleen padscheidingstekens/'.'/'..'/absolute
+        paden/lege/whitespace-only/control characters, niets anders."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client=valid_name, project=valid_name, dry_run=False)
+
+        asset = report.assets[0]
+        assert asset.outcome == AssetOutcome.COPIED
+        expected_dir = _workspace_dir(config, valid_name, valid_name, "Drone", camera_profile="DJI")
+        assert asset.destination_path == expected_dir / "DJI_0001.MP4"
+        assert asset.destination_path.exists()
+
+        schema = json.loads(config.manifest_path.read_text())
+        assert schema["assets"][0]["client_id"] == valid_name
+        assert schema["assets"][0]["project_id"] == valid_name
+
+
+class TestDestinationEscapesWorkspaceContainment:
+    """Scenarios F/G from the Fase 5.3.2 regression-test list: a safe
+    client/project STRING is not enough on its own if something already on
+    disk under storage_root is a symlink pointing outside the workspace.
+    Both the coarse, run()-level check (the bare Project Workspace root
+    against storage_root) and the finer, per-asset check in
+    _process_asset() (a specific destination against the Project Workspace
+    root) are exercised separately below."""
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    @pytest.mark.parametrize("escape_depth", ["client", "project"])
+    def test_existing_symlink_in_client_or_project_directory_is_rejected(
+        self, tmp_path, camera_profiles, dry_run, escape_depth
+    ):
+        """F: a pre-existing symlink AT the client or the project directory
+        itself, pointing outside storage_root."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        outside = tmp_path / "outside_escape"
+        outside.mkdir()
+
+        klanten_dir = config.storage_root / "Klanten"
+        klanten_dir.mkdir(parents=True)
+        if escape_depth == "client":
+            (klanten_dir / "Nike").symlink_to(outside, target_is_directory=True)
+        else:
+            client_dir = klanten_dir / "Nike"
+            client_dir.mkdir()
+            (client_dir / "Zomer").symlink_to(outside, target_is_directory=True)
+
+        service = _make_service(config, camera_profiles)
+        with pytest.raises(DestinationEscapesWorkspaceError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=dry_run)
+
+        assert list(outside.iterdir()) == []  # niets geschreven buiten de workspace
+        assert not config.manifest_path.exists()
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    def test_existing_symlink_at_klanten_parent_directory_is_rejected(
+        self, tmp_path, camera_profiles, dry_run
+    ):
+        """G: a pre-existing symlink at a PARENT directory (Klanten itself),
+        above any client/project — must be caught just as reliably as a
+        symlink at the client/project level above."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        config.storage_root.mkdir(parents=True)
+        outside = tmp_path / "outside_escape"
+        outside.mkdir()
+        (config.storage_root / "Klanten").symlink_to(outside, target_is_directory=True)
+
+        service = _make_service(config, camera_profiles)
+        with pytest.raises(DestinationEscapesWorkspaceError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=dry_run)
+
+        assert list(outside.iterdir()) == []
+        assert not config.manifest_path.exists()
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    def test_symlink_planted_deeper_inside_an_otherwise_safe_workspace_is_rejected(
+        self, tmp_path, camera_profiles, dry_run
+    ):
+        """Defense-in-depth, second layer: the Project Workspace root itself
+        (Klanten/Nike/Zomer) is a completely ordinary, real directory — the
+        run()-level check passes — but the date-folder underneath it is a
+        symlink pointing outside storage_root. Only the per-asset check
+        inside _process_asset() can catch this; proves that check actually
+        runs, not just the coarser one in run()."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        outside = tmp_path / "outside_escape"
+        outside.mkdir()
+
+        project_dir = config.storage_root / "Klanten" / "Nike" / "Zomer"
+        project_dir.mkdir(parents=True)
+        today = dt.date.today().isoformat()
+        (project_dir / f"{today}_Raw").symlink_to(outside, target_is_directory=True)
+
+        service = _make_service(config, camera_profiles)
+        with pytest.raises(DestinationEscapesWorkspaceError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=dry_run)
+
+        assert list(outside.iterdir()) == []
+
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    def test_collision_candidate_symlink_is_rejected_before_being_read(
+        self, tmp_path, camera_profiles, monkeypatch, dry_run
+    ):
+        """Follow-up review, point 2: the containment check must cover
+        EVERY candidate _resolve_destination()'s collision loop considers,
+        not just the bare, un-suffixed naive_destination checked once
+        before that loop runs. Here naive_destination itself is a real,
+        legitimately colliding file (different content, so the loop
+        actually advances past it) and "_001" — the next candidate the
+        loop would try — is a symlink pointing completely outside the
+        workspace. Before this check existed inside the loop itself,
+        Storage.checksum() would have read straight through that symlink
+        (an unauthorized read of arbitrary file content, even during a
+        read-only dry-run); now it must never even be called with that
+        path, checked here with a spy rather than just by asserting the
+        end result."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"new content")
+
+        config = _make_config(tmp_path)
+        workspace_dir = _workspace_dir(config, "Nike", "Zomer", "Drone", camera_profile="DJI")
+        workspace_dir.mkdir(parents=True)
+        (workspace_dir / "DJI_0001.MP4").write_bytes(b"different, pre-existing content")
+
+        outside = tmp_path / "outside_escape"
+        outside.mkdir()
+        secret = outside / "secret.txt"
+        secret.write_bytes(b"geheime inhoud buiten de workspace")
+        (workspace_dir / "DJI_0001_001.MP4").symlink_to(secret)
+
+        checksummed_paths: list[Path] = []
+        original_checksum = LocalFilesystemStorage.checksum
+
+        def _spy_checksum(self, path):
+            checksummed_paths.append(Path(path))
+            return original_checksum(self, path)
+
+        monkeypatch.setattr(LocalFilesystemStorage, "checksum", _spy_checksum)
+
+        service = _make_service(config, camera_profiles)
+        with pytest.raises(DestinationEscapesWorkspaceError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=dry_run)
+
+        assert secret.resolve() not in {p.resolve() for p in checksummed_paths}
+
+
+    def test_symlink_swapped_in_mid_run_is_caught_on_the_next_file_not_silently_trusted(
+        self, tmp_path, camera_profiles
+    ):
+        """Follow-up review, point 3: a prior version of the per-asset check
+        resolved _project_workspace_path(storage_root, client, project) and
+        verified naive_destination against THAT resolved value, without ever
+        re-checking that the resolved value itself was still inside
+        storage_root — so once the FIRST file's check in a run passed, a
+        symlink swapped into Klanten/Nike/Zomer afterwards would silently
+        become the new "trusted" workspace root for every later file: a
+        candidate and an already-compromised boundary resolved through the
+        exact same swapped symlink still look mutually consistent to a
+        check that only compares the two against each other.
+        _verified_project_workspace_root() closes this by re-deriving and
+        re-verifying the full storage_root -> workspace-root chain on every
+        single call, not just once. Proven here end-to-end: file 1 copies
+        normally (creating the real Klanten/Nike/Zomer tree), then the
+        progress_callback — firing right after file 1 completes, before
+        file 2 is processed — replaces that real directory with a symlink
+        pointing entirely outside storage_root. File 2 must be rejected."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"first file bytes")
+        (input_dir / "DJI_0002.MP4").write_bytes(b"second file bytes")
+
+        config = _make_config(tmp_path)
+        outside = tmp_path / "outside_escape"
+        outside.mkdir()
+        project_dir = config.storage_root / "Klanten" / "Nike" / "Zomer"
+
+        def _swap_project_dir_for_a_symlink_after_first_file(update):
+            if update.processed == 1 and project_dir.exists() and not project_dir.is_symlink():
+                shutil.rmtree(project_dir)
+                project_dir.symlink_to(outside, target_is_directory=True)
+
+        service = _make_service(config, camera_profiles)
+        with pytest.raises(DestinationEscapesWorkspaceError):
+            service.run(
+                input_dir,
+                client="Nike",
+                project="Zomer",
+                dry_run=False,
+                progress_callback=_swap_project_dir_for_a_symlink_after_first_file,
+            )
+
+        # Niets van buiten de workspace is binnengehaald/geschreven na de swap.
+        assert list(outside.iterdir()) == []
+
+
+class TestSidecarColocationRespectsWorkspaceContainment:
+    """Follow-up review, point 4: confirms Fase 5.3.1B's sidecar co-location
+    lookup (_verified_existing_destination()) cannot be used to bypass the
+    Fase 5.3.2 containment checks, and that ordinary 5.3.1B behaviour is
+    unaffected (already re-confirmed by the full, unmodified
+    TestFase531BVerifiedSidecarColocation suite passing unchanged)."""
+
+    def test_sidecar_colocation_cannot_be_used_to_escape_the_workspace_via_mid_run_symlink_swap(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """A manifest record for the main media's checksum points at a file
+        physically placed OUTSIDE storage_root. Klanten/Nike/Zomer starts as
+        an ordinary, real directory (so run()'s own one-time check passes),
+        but is swapped to a symlink pointing at that same outside location
+        right after the main media finishes processing — i.e. right before
+        the sidecar (processed last, per the stable sidecar-last partition)
+        would otherwise call _verified_existing_destination() with a
+        compromised allowed_root. A prior version passed the raw, unresolved
+        _project_workspace_path() straight into that function; this ordering
+        would have let the sidecar's manifest lookup "verify" and co-locate
+        against a file outside the workspace, since the candidate and the
+        compromised allowed_root both resolve through the identical swapped
+        symlink. The fix computes and re-verifies the root BEFORE calling
+        _verified_existing_destination(), so this must now be rejected
+        before that lookup is ever reached — proven here with a checksum
+        spy, not just by asserting the end result."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        config = _make_config(tmp_path)
+        outside = tmp_path / "outside_escape"
+        outside.mkdir()
+        checksum = hashlib.sha256(b"fake mxf bytes").hexdigest()
+        evil_destination = outside / "611_4921.MXF"
+        evil_destination.write_bytes(b"fake mxf bytes")  # checksum klopt, buiten de workspace
+
+        config.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        config.manifest_path.write_text(
+            json.dumps(
+                {
+                    "assets": [
+                        {
+                            "asset_id": checksum,
+                            "client_id": "Nike",
+                            "project_id": "Zomer",
+                            "ingest_run_id": "old-run",
+                            "operator": "iemand",
+                            "source_machine": "oude-machine",
+                            "original_path": "/oud/pad/611_4921.MXF",
+                            "destination_path": str(evil_destination),
+                            "category": "Camera",
+                            "camera_profile": "Sony FX6",
+                            "confidence": "hoog",
+                            "ingested_at": "2026-01-01T00:00:00+00:00",
+                        }
+                    ]
+                }
+            )
+        )
+
+        project_dir = config.storage_root / "Klanten" / "Nike" / "Zomer"
+        project_dir.mkdir(parents=True)
+
+        def _swap_after_main_media(update):
+            if update.processed == 1 and project_dir.exists() and not project_dir.is_symlink():
+                shutil.rmtree(project_dir)
+                project_dir.symlink_to(outside, target_is_directory=True)
+
+        checksummed_paths: list[Path] = []
+        original_checksum = LocalFilesystemStorage.checksum
+
+        def _spy_checksum(self, path):
+            checksummed_paths.append(Path(path))
+            return original_checksum(self, path)
+
+        monkeypatch.setattr(LocalFilesystemStorage, "checksum", _spy_checksum)
+
+        service = _make_service(config, camera_profiles)
+        with pytest.raises(DestinationEscapesWorkspaceError):
+            service.run(
+                input_dir,
+                client="Nike",
+                project="Zomer",
+                dry_run=False,
+                progress_callback=_swap_after_main_media,
+            )
+
+        # De kwaadaardige bestemming buiten de workspace is nooit gelezen —
+        # de sidecar-lookup (_verified_existing_destination) is nooit bereikt.
+        assert evil_destination.resolve() not in {p.resolve() for p in checksummed_paths}
+
+
+class TestCrossClientProjectSymlinkEscape:
+    """Fase 5.3.2 follow-up review, finding 1 (critical): a prior version's
+    containment check only verified "stays somewhere inside storage_root" —
+    never that the resolved Project Workspace (or a deeper destination
+    subfolder) is EXACTLY the one requested. A symlink from
+    Klanten/Nike/Zomer to Klanten/Adidas/Winter — both genuinely inside the
+    same storage_root — passed that check without complaint, and a real
+    ingest for client="Nike", project="Zomer" physically wrote footage into
+    Adidas's folder (empirically confirmed during the follow-up review
+    before this fix). Every test here proves the fix closes exactly that
+    gap, for both dry-run and a real ingest, with no read/write/manifest
+    registration ever touching the redirected location."""
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    def test_symlink_to_another_clients_project_within_same_storage_root_is_rejected(
+        self, tmp_path, camera_profiles, monkeypatch, dry_run
+    ):
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"NIKE ZOMER CAMPAGNE FOOTAGE")
+
+        config = _make_config(tmp_path)
+        adidas_winter = config.storage_root / "Klanten" / "Adidas" / "Winter"
+        adidas_winter.mkdir(parents=True)
+        (adidas_winter / "pre_existing_adidas_asset.mov").write_bytes(b"ADIDAS CONFIDENTIAL")
+
+        nike_dir = config.storage_root / "Klanten" / "Nike"
+        nike_dir.mkdir(parents=True)
+        (nike_dir / "Zomer").symlink_to(adidas_winter, target_is_directory=True)
+
+        checksummed_paths: list[Path] = []
+        original_checksum = LocalFilesystemStorage.checksum
+
+        def _spy_checksum(self, path):
+            checksummed_paths.append(Path(path))
+            return original_checksum(self, path)
+
+        monkeypatch.setattr(LocalFilesystemStorage, "checksum", _spy_checksum)
+
+        service = _make_service(config, camera_profiles)
+        with pytest.raises(DestinationEscapesWorkspaceError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=dry_run)
+
+        # Niets van/naar Adidas's echte map gelezen of geschreven.
+        assert sorted(p.name for p in adidas_winter.iterdir()) == ["pre_existing_adidas_asset.mov"]
+        assert adidas_winter.resolve() / "pre_existing_adidas_asset.mov" not in {
+            p.resolve() for p in checksummed_paths
+        }
+        # Geen manifestregistratie — noch voor Nike/Zomer, noch anderszins.
+        assert not config.manifest_path.exists()
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    def test_client_level_symlink_to_another_client_is_rejected(
+        self, tmp_path, camera_profiles, dry_run
+    ):
+        """A symlink at the CLIENT level itself (Klanten/Nike -> Klanten/
+        Adidas), rather than at the project level — must be caught just as
+        reliably, regardless of which project name is requested under it."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        adidas_dir = config.storage_root / "Klanten" / "Adidas"
+        adidas_dir.mkdir(parents=True)
+
+        klanten_dir = config.storage_root / "Klanten"
+        (klanten_dir / "Nike").symlink_to(adidas_dir, target_is_directory=True)
+
+        service = _make_service(config, camera_profiles)
+        with pytest.raises(DestinationEscapesWorkspaceError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=dry_run)
+
+        assert list(adidas_dir.rglob("*")) == []
+        assert not config.manifest_path.exists()
+
+    @pytest.mark.parametrize("dry_run", [True, False])
+    @pytest.mark.parametrize("symlinked_level", ["date", "category", "camera_profile"])
+    def test_symlink_in_a_deeper_destination_subfolder_to_another_subfolder_is_rejected(
+        self, tmp_path, camera_profiles, monkeypatch, dry_run, symlinked_level
+    ):
+        """A symlink planted inside an otherwise correctly-fenced,
+        legitimate Project Workspace (Klanten/Nike/Zomer is a real
+        directory, not itself symlinked) — at the date-folder, category-
+        folder, or camera-profile-folder level — redirecting to a
+        DIFFERENT, equally legitimate subfolder within the very same
+        project. Must be rejected: redirecting a 2026 shoot's footage into
+        a 2099 shoot's folder (or Camera into Drone, or one camera profile
+        into another) is exactly the kind of misfiling Fase 5.3's
+        camera-aware structure exists to prevent, symlink or not."""
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+
+        config = _make_config(tmp_path)
+        project_dir = config.storage_root / "Klanten" / "Nike" / "Zomer"
+        today = dt.date.today().isoformat()
+
+        decoy_dir = config.storage_root / "Klanten" / "Nike" / "Zomer" / "_decoy"
+        decoy_dir.mkdir(parents=True)
+        (decoy_dir / "pre_existing_decoy_asset.mp4").write_bytes(b"VERKEERDE MAP")
+
+        if symlinked_level == "date":
+            (project_dir / f"{today}_Raw").symlink_to(decoy_dir, target_is_directory=True)
+        elif symlinked_level == "category":
+            date_dir = project_dir / f"{today}_Raw"
+            date_dir.mkdir(parents=True)
+            (date_dir / "Drone").symlink_to(decoy_dir, target_is_directory=True)
+        else:  # camera_profile
+            category_dir = project_dir / f"{today}_Raw" / "Drone"
+            category_dir.mkdir(parents=True)
+            (category_dir / "DJI").symlink_to(decoy_dir, target_is_directory=True)
+
+        checksummed_paths: list[Path] = []
+        original_checksum = LocalFilesystemStorage.checksum
+
+        def _spy_checksum(self, path):
+            checksummed_paths.append(Path(path))
+            return original_checksum(self, path)
+
+        monkeypatch.setattr(LocalFilesystemStorage, "checksum", _spy_checksum)
+
+        service = _make_service(config, camera_profiles)
+        with pytest.raises(DestinationEscapesWorkspaceError):
+            service.run(input_dir, client="Nike", project="Zomer", dry_run=dry_run)
+
+        assert sorted(p.name for p in decoy_dir.iterdir()) == ["pre_existing_decoy_asset.mp4"]
+        assert decoy_dir.resolve() / "pre_existing_decoy_asset.mp4" not in {
+            p.resolve() for p in checksummed_paths
+        }
+        assert not config.manifest_path.exists()
+
+    def test_existing_fase_531b_sidecar_colocation_into_a_legacy_flat_folder_still_works(
+        self, tmp_path, camera_profiles, monkeypatch
+    ):
+        """Explicit cross-confirmation (alongside the full, unmodified
+        TestFase531BVerifiedSidecarColocation suite passing unchanged) that
+        the stricter, exact-relative-structure containment check applied to
+        the ORDINARY placement path is never applied to legacy sidecar
+        co-location — an old, flat, pre-Fase-5.3 folder legitimately has a
+        different structure than the current camera-aware layout, and must
+        never be forced to "migrate" or rejected for that reason."""
+        monkeypatch.setattr(
+            ingest_service_module, "safe_probe", _fake_safe_probe_with_umid(_REAL_UMID)
+        )
+        config = _make_config(tmp_path)
+        checksum = hashlib.sha256(b"fake mxf bytes").hexdigest()
+        old_path = _seed_old_flat_record_and_file(config, checksum, b"fake mxf bytes")
+
+        input_dir = tmp_path / "input"
+        input_dir.mkdir()
+        _write_umid_matched_pair(input_dir)
+
+        service = _make_service(config, camera_profiles)
+        report = service.run(input_dir, client="Nike", project="Zomer", dry_run=False)
+
+        by_name = {a.source_path.name: a for a in report.assets}
+        sidecar_asset = by_name["611_4921M01.XML"]
+        assert sidecar_asset.outcome == AssetOutcome.COPIED
+        assert sidecar_asset.destination_path.parent == old_path.parent
+        assert sidecar_asset.destination_path.exists()

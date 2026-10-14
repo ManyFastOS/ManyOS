@@ -105,28 +105,21 @@ from pathlib import Path
 
 from many_ingest.core.ingest_service import (
     AssetResult,
+    DestinationEscapesWorkspaceError,
     DestinationFullError,
     DestinationUnavailableError,
     IngestReport,
+    InvalidWorkspaceNameError,
     ProgressUpdate,
 )
 from many_ingest.core.report import render_report, summarize
-from many_ingest.device_identity import same_physical_device
+from many_ingest.device_identity import ALLOW_SAME_DEVICE_ENV_VAR, same_physical_device
 from many_ingest.metadata_extractor import FfprobeNotFoundError
 from many_ingest.service_factory import build_ingest_service
 
 EXIT_SUCCESS = 0
 EXIT_FAILED = 1
 EXIT_CANCELLED = 2
-
-# Test-only escape hatch for the same-physical-device safety rule below —
-# same convention as this test suite's existing QT_QPA_PLATFORM=offscreen
-# toggle. A real machine always has source and destination on genuinely
-# different disks; automated tests run everything under one pytest tmp_path,
-# which is necessarily one physical device with no portable way to fake a
-# second one without real external hardware. Never set this outside tests —
-# nothing in desktop/, cli.py, or app.py ever sets it.
-_ALLOW_SAME_DEVICE_ENV_VAR = "MANY_INGEST_ALLOW_SAME_DEVICE_FOR_TESTS"
 
 _FFPROBE_MISSING_MESSAGE = (
     "Deze Mac mist een onderdeel dat nodig is om bestanden te analyseren. "
@@ -147,6 +140,13 @@ _DESTINATION_UNAVAILABLE_MESSAGE = (
 _SAME_DEVICE_MESSAGE = (
     "De bron en de gekozen bestemmingsschijf zijn dezelfde fysieke schijf. "
     "Kies een andere bestemmingsschijf."
+)
+_DESTINATION_ESCAPES_WORKSPACE_MESSAGE = (
+    "De bestemmingsmap voor deze klant/project wijst (mogelijk via een "
+    "symlink) niet naar de verwachte opslaglocatie. De ingest is om "
+    "veiligheidsredenen gestopt — bestanden die eerder in deze run al "
+    "succesvol zijn gekopieerd, blijven behouden. Neem contact op met de "
+    "beheerder."
 )
 _UNEXPECTED_ERROR_MESSAGE_PREVIEW = "Er ging iets mis tijdens het analyseren. Probeer het opnieuw."
 _UNEXPECTED_ERROR_MESSAGE_COPY = "Er ging iets mis tijdens het kopiëren. Probeer het opnieuw."
@@ -300,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
     # (die geen kiezer-UI heeft) en voor elke andere aanroeper. Geldt voor
     # preview én een echte run — een preview tegen een bestemming die feitelijk
     # de bron zelf is, levert sowieso een zinloze/misleidende preview op.
-    if os.environ.get(_ALLOW_SAME_DEVICE_ENV_VAR) != "1" and same_physical_device(
+    if os.environ.get(ALLOW_SAME_DEVICE_ENV_VAR) != "1" and same_physical_device(
         args.source, args.destination_root
     ):
         _emit("ingest_failed", message=_SAME_DEVICE_MESSAGE)
@@ -308,8 +308,20 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         service = build_ingest_service(
-            args.config_path, args.camera_profiles_path, args.destination_root
+            args.config_path, args.camera_profiles_path, args.destination_root, args.source
         )
+    except DestinationUnavailableError:
+        # Fase 5.3.2 follow-up review, point 3: build_ingest_service() does
+        # its OWN, deeper same-physical-device check against the fully
+        # resolved storage_root (not just the raw destination_root checked
+        # above) — catches a symlink inside footage_subpath that redirects
+        # storage_root back onto the source disk even though
+        # destination_root itself is genuinely a different device. Must be
+        # caught here specifically, before the broad `except Exception`
+        # below, or this would be misreported as a generic/unexpected
+        # error instead of the clear, dedicated message this already has.
+        _emit("ingest_failed", message=_DESTINATION_UNAVAILABLE_MESSAGE)
+        return EXIT_FAILED
     except (OSError, ValueError):
         _emit("ingest_failed", message=_CONFIG_INVALID_MESSAGE)
         return EXIT_FAILED
@@ -329,6 +341,22 @@ def main(argv: list[str] | None = None) -> int:
     except _IngestCancelled:
         _emit("ingest_cancelled")
         return EXIT_CANCELLED
+    except InvalidWorkspaceNameError as exc:
+        # str(exc) is already the complete, friendly, Dutch message (built
+        # in core/ingest_service.py's validate_workspace_name()) — same
+        # reasoning as DestinationFullError just below, never mapped to a
+        # static canned string, since the exact reason (empty name, leading
+        # whitespace, a path separator, ...) is only known there.
+        _emit("ingest_failed", message=str(exc))
+        return EXIT_FAILED
+    except DestinationEscapesWorkspaceError:
+        # Unlike InvalidWorkspaceNameError, this one IS mapped to a static
+        # message: its own str(exc) names real, absolute disk paths (see
+        # DestinationEscapesWorkspaceError's docstring) which the desktop
+        # app's "never a technical detail" design rule (Design Language
+        # hoofdstuk 15) says never belongs in a user-facing message.
+        _emit("ingest_failed", message=_DESTINATION_ESCAPES_WORKSPACE_MESSAGE)
+        return EXIT_FAILED
     except DestinationFullError as exc:
         # str(exc) is already the complete, friendly, Dutch message (built in
         # core/ingest_service.py, where the actual required/available sizes

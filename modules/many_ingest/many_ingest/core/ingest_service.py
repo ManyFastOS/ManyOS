@@ -99,6 +99,74 @@ _MAX_COLLISION_ATTEMPTS = 999
 # builds on disk.
 CLIENT_FOLDER_NAME = "Klanten"
 
+_CLIENT_FIELD_LABEL = "Klantnaam"
+_PROJECT_FIELD_LABEL = "Projectnaam"
+
+
+class InvalidWorkspaceNameError(Exception):
+    """Raised by `validate_workspace_name()` when `client` or `project`
+    cannot safely form a Project Workspace path segment
+    (`Klanten/{client}/{project}`, see `_project_workspace_path()`). Checked
+    as the very first thing `run()` does — before ffprobe, scanning, or any
+    manifest/destination access — identically for a dry-run and a real run
+    (Fase 5.3.2: a read-only preview still turns `client`/`project` into
+    path segments it reads from, so it needs the exact same guarantee a
+    real run does)."""
+
+
+def validate_workspace_name(value: str, field_label: str) -> None:
+    """The one validation `client`/`project` names go through — called by
+    `IngestService.run()` (the real safety boundary, mandatory regardless of
+    caller) and reused as-is by the desktop GUI for Preview-button gating
+    (`main_window.py`, via `is_valid_workspace_name()` below) — no second
+    implementation (Fase 5.3.2).
+
+    Deliberately conservative: rejects anything that could change which
+    directory `_project_workspace_path()`/`_build_workspace_path()` resolve
+    to (a path separator, `.`, `..`, an absolute path) or that cannot safely
+    round-trip through a filesystem path / JSON manifest / log line (`\\0`
+    and other control characters), plus leading/trailing whitespace —
+    silently stripping that would itself be the kind of silent, surprising
+    normalization this function must never do (the caller always learns
+    exactly why a name was rejected, never ends up with a different name
+    than what they typed). Ordinary punctuation, accented characters,
+    digits, and spaces *between* words are all unaffected — see
+    `tests/many_ingest/test_ingest_service.py` for the concrete names this
+    must keep accepting (e.g. "Van der Panne Makelaardij", "Project 2026 -
+    Düsseldorf", "Commercial & Social")."""
+    if not value or not value.strip():
+        raise InvalidWorkspaceNameError(f"{field_label} mag niet leeg zijn.")
+    if value != value.strip():
+        raise InvalidWorkspaceNameError(
+            f"{field_label} mag geen spaties aan het begin of einde bevatten."
+        )
+    if value in (".", ".."):
+        raise InvalidWorkspaceNameError(f"{field_label} mag niet '.' of '..' zijn.")
+    if "/" in value or "\\" in value:
+        raise InvalidWorkspaceNameError(
+            f"{field_label} mag geen '/' of '\\' bevatten (geen padscheidingstekens)."
+        )
+    if Path(value).is_absolute():
+        raise InvalidWorkspaceNameError(f"{field_label} mag geen absoluut pad zijn.")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise InvalidWorkspaceNameError(
+            f"{field_label} bevat een onzichtbaar of ongeldig teken en kan niet worden gebruikt."
+        )
+
+
+def is_valid_workspace_name(value: str) -> bool:
+    """Bool convenience wrapper around `validate_workspace_name()` — for UI
+    gating only (main_window.py's Preview-button enablement). Never a
+    substitute for the real check: `IngestService.run()` always calls
+    `validate_workspace_name()` itself and never trusts that a caller's UI
+    already validated anything (the same defense-in-depth split
+    `eject.py`'s `can_eject()`/`validate_eject()` already uses)."""
+    try:
+        validate_workspace_name(value, "")
+    except InvalidWorkspaceNameError:
+        return False
+    return True
+
 
 class DestinationUnavailableError(Exception):
     """Raised at the start of a REAL run when the destination (resolved from
@@ -115,6 +183,35 @@ class DestinationUnavailableError(Exception):
     writes tied to the whole run's integrity, not a single asset's, so a
     genuine write failure there aborts the run rather than being silently
     treated as "this one file is bad" (see `_log_or_raise`/`_process_asset`)."""
+
+
+class DestinationEscapesWorkspaceError(Exception):
+    """Raised when a computed destination path — the Project Workspace root
+    itself (checked once in `run()`), or a specific asset's full destination
+    within it (checked in `_process_asset()`) — does not stay inside its
+    expected boundary once symlinks are resolved (Fase 5.3.2 — defense in
+    depth, see `_verify_within_boundary()`). A safe `client`/`project`
+    *string* (see `validate_workspace_name()`) is not enough on its own: a
+    pre-existing symlink already sitting on disk under `storage_root`
+    (`Klanten`, a client folder, a project folder, or anything deeper)
+    could still redirect a perfectly ordinary name outside the workspace.
+
+    Same severity class as `DestinationUnavailableError`/
+    `DestinationFullError` — aborts the whole run, never downgraded to a
+    single asset's `FAILED_VERIFICATION` — because the cause is an
+    infrastructure-level safety violation (something is wrong with the
+    destination disk's own layout), not a problem with one file.
+
+    TOCTOU: proving containment and the filesystem call it guards (mkdir,
+    copy, or the `exists`/`checksum` calls `_resolve_destination` makes for
+    a collision check) are two separate steps, not one atomic operation — a
+    symlink swapped into place in the brief window between them would not
+    be caught. v0.1's threat model is a single operator running one ingest
+    at a time against a destination disk only that operator controls; this
+    gap is accepted and documented here rather than silently assumed closed.
+    Closing it fully would need atomic, symlink-aware filesystem primitives
+    (e.g. `O_NOFOLLOW`/`openat`-relative opens) that Python's `pathlib`/
+    `shutil` do not portably expose — out of scope for this phase."""
 
 
 class DestinationFullError(Exception):
@@ -264,10 +361,35 @@ class IngestService:
         progress_callback: ProgressCallback | None = None,
         asset_callback: AssetCallback | None = None,
     ) -> IngestReport:
+        # Fase 5.3.2 — the very first thing run() does, before ffprobe,
+        # scanning, or any destination access, identical for dry_run=True
+        # and dry_run=False (see validate_workspace_name()'s docstring):
+        # client/project become path segments in _project_workspace_path()
+        # below, so an unsafe name must never reach any filesystem call, not
+        # even a read-only one.
+        validate_workspace_name(client, _CLIENT_FIELD_LABEL)
+        validate_workspace_name(project, _PROJECT_FIELD_LABEL)
+
         if not is_ffprobe_available():
             # Never proceed without metadata capability — a run without ffprobe would
             # silently degrade every asset to "Onbekend" instead of failing loudly.
             raise FfprobeNotFoundError(FFPROBE_INSTALL_MESSAGE)
+
+        # Fase 5.3.2 — defense-in-depth, independent of the name validation
+        # above: even a perfectly safe client/project STRING can resolve
+        # outside storage_root if something already on disk (Klanten/, or
+        # the client/project directory itself) is already a symlink
+        # pointing elsewhere — planted by an earlier run, another process,
+        # or deliberately. Checked here for both modes (same reasoning as
+        # the name validation above), so every subsequent read/write below
+        # — including the read-only collision checks a dry-run performs —
+        # is proven safe before it happens, not caught after the fact.
+        # _process_asset() independently re-does this exact same check for
+        # every asset (never trusting that this one, up-front call is still
+        # valid later in a long run) — see _verified_project_workspace_root()'s
+        # docstring for why re-verifying on every use, not just once here,
+        # matters.
+        _verified_project_workspace_root(self._config.storage_root, client, project)
 
         if not dry_run:
             _ensure_destination_is_writable(self._config.storage_root)
@@ -469,18 +591,41 @@ class IngestService:
             if self._manifest.is_duplicate(main_media_checksum):
                 sidecar_of_asset_id = main_media_checksum
 
+        # Fase 5.3.2 — computed here, ONCE per asset, before the Fase 5.3.1B
+        # sidecar co-location lookup immediately below: re-derives AND
+        # re-verifies the full chain (storage_root -> Project Workspace
+        # root, via _verified_project_workspace_root() — never just reuses
+        # a value computed earlier in run(), see that function's docstring
+        # for why re-verifying on every use, not just once per run,
+        # matters). Deliberately computed BEFORE _verified_existing_destination()
+        # is called, not after: that function does its OWN internal
+        # `allowed_root.resolve()` + containment check against whatever
+        # `allowed_root` it is given, but never itself re-verifies that
+        # `allowed_root` is still inside storage_root — only the CALLER can
+        # prove that. Passing an already fully-verified, resolved root in
+        # here (rather than the raw, unresolved `_project_workspace_path()`
+        # a prior version passed) closes that gap without touching
+        # `_verified_existing_destination()`'s own logic at all: a 5.3.1B
+        # candidate is now checked against a boundary already proven safe,
+        # never against one a mid-run symlink swap could have compromised
+        # in between (see
+        # test_symlink_swapped_in_mid_run_is_caught_on_the_next_file_not_silently_trusted).
+        project_workspace_root_resolved = _verified_project_workspace_root(
+            self._config.storage_root, client, project
+        )
+
         # Fase 5.3.1B — when sidecar_of_asset_id is set (a CONFIRMED manifest
         # relationship, per Fase 5.3.1A directly above), try to physically
         # co-locate this sidecar with its main media's ACTUAL, already-
         # registered destination — covers a duplicate sitting in either a
         # current camera-aware folder or an old, flat pre-Fase-5.3 folder,
         # as long as it's inside THIS run's own Project Workspace
-        # (Klanten/{client}/{project}/, via the existing
-        # _project_workspace_path() helper — never the whole storage_root:
-        # a main media registered for a different client/project must never
-        # decide where this run's sidecar physically lands, however
-        # identical its checksum happens to be). Deliberately gated on
-        # `sidecar_of_asset_id`, never attempted when it's `None`
+        # (Klanten/{client}/{project}/, via the already-verified
+        # project_workspace_root_resolved above — never the whole
+        # storage_root: a main media registered for a different client/
+        # project must never decide where this run's sidecar physically
+        # lands, however identical its checksum happens to be). Deliberately
+        # gated on `sidecar_of_asset_id`, never attempted when it's `None`
         # (FAILED_VERIFICATION / never-reached main media this run) — this
         # reuses the 5.3.1A guarantee as its own precondition rather than
         # re-deriving it, so 5.3.1B can never weaken it. A verification
@@ -493,7 +638,7 @@ class IngestService:
             verified_existing_destination = _verified_existing_destination(
                 self._storage,
                 self._manifest,
-                _project_workspace_path(self._config.storage_root, client, project),
+                project_workspace_root_resolved,
                 sidecar_of_asset_id,
                 destination_verification_cache,
             )
@@ -537,6 +682,61 @@ class IngestService:
                 filename=path.name,
             )
 
+        # Fase 5.3.2 follow-up review, finding 1 — two different cases,
+        # deliberately handled differently (see
+        # DestinationEscapesWorkspaceError's docstring):
+        #
+        # - ORDINARY placement (verified_existing_destination is None):
+        #   naive_destination was just built from a FIXED FORMULA
+        #   (_build_workspace_path(): date/category/[camera_profile/]
+        #   filename, under the Project Workspace root) — so it is
+        #   possible, and required, to verify that RESOLVING it preserves
+        #   that EXACT relative structure, not merely that it lands
+        #   "somewhere" inside storage_root. A symlink redirecting to a
+        #   different, otherwise entirely legitimate client's/project's/
+        #   date's/category's/camera-profile's folder — still fully
+        #   "inside storage_root" — is caught here; a prior version's bare
+        #   containment check missed exactly this (see
+        #   _verify_within_boundary()'s docstring). Deliberately
+        #   RE-VERIFIED here (not the project_workspace_root_resolved
+        #   computed earlier, above the sidecar lookup) to keep the TOCTOU
+        #   window right before the collision-check/copy operations that
+        #   follow as small as possible.
+        # - SIDECAR co-location (verified_existing_destination is not
+        #   None): it is a RESOLVED, already fully-verified path returned
+        #   by _verified_existing_destination() (Fase 5.3.1B, unchanged) —
+        #   which may legitimately be an old, flat, pre-Fase-5.3 folder
+        #   with no fixed structure at all. There is no "expected relative
+        #   formula" to compare against here, and there must never be
+        #   one: forcing a legacy folder to match the current camera-aware
+        #   shape would be exactly the unwanted migration this phase must
+        #   not introduce. Its directory is already proven safe by
+        #   5.3.1B's own check (_is_within(), against the same, now
+        #   correctly-fenced project_workspace_root_resolved computed
+        #   above) — reused as-is, no further check needed.
+        #
+        # Either way, the result is `destination_dir_resolved`: the
+        # already-verified, resolved DIRECTORY `_resolve_destination()`
+        # below checks every collision candidate's leaf against (Fase
+        # 5.3.2 follow-up review, finding about collision resolution).
+        if verified_existing_destination is not None:
+            destination_dir_resolved = verified_existing_destination.parent
+        else:
+            project_workspace_root = _project_workspace_path(
+                self._config.storage_root, client, project
+            )
+            project_workspace_root_resolved = _verified_project_workspace_root(
+                self._config.storage_root, client, project
+            )
+            resolved_naive_destination = _verify_within_boundary(
+                naive_destination,
+                project_workspace_root,
+                project_workspace_root_resolved,
+                candidate_label="Het doelpad",
+                boundary_label="de Project Workspace-map",
+            )
+            destination_dir_resolved = resolved_naive_destination.parent
+
         destination = naive_destination
         name_conflict_resolved = False
         error: str | None = None
@@ -547,7 +747,9 @@ class IngestService:
             # what's already there) so the preview reflects reality — only the
             # actual copy/register below is gated behind dry_run.
             try:
-                destination, is_duplicate = self._resolve_destination(checksum, naive_destination)
+                destination, is_duplicate = self._resolve_destination(
+                    checksum, naive_destination, destination_dir_resolved
+                )
                 name_conflict_resolved = (not is_duplicate) and (destination != naive_destination)
             except OSError as exc:
                 error = f"Kon doelmap niet controleren op naamconflicten: {exc}"
@@ -700,7 +902,9 @@ class IngestService:
             relationship_evidence=relationship_evidence,
         )
 
-    def _resolve_destination(self, source_checksum: str, destination: Path) -> tuple[Path, bool]:
+    def _resolve_destination(
+        self, source_checksum: str, destination: Path, destination_dir_resolved: Path
+    ) -> tuple[Path, bool]:
         """Never overwrites an existing file.
 
         Returns (final_destination, is_duplicate). If `destination` is already
@@ -708,10 +912,44 @@ class IngestService:
         path is needed. If it's occupied by different content, an automatic
         `_001`, `_002`, ... suffix is appended until a free (or checksum-matching)
         name is found.
+
+        Fase 5.3.2 — every candidate this loop considers (the bare
+        `destination`, then each `_001`, `_002`, ... suffix) has its LEAF
+        verified *before* the `exists()`/`checksum()` calls that follow for
+        it: resolving the candidate (following a symlink the leaf itself
+        might be) must land it inside `destination_dir_resolved` — the
+        already-verified, resolved DIRECTORY the caller computed once,
+        before this loop starts (see `_process_asset()`'s Fase 5.3.2
+        block). Every candidate here shares that exact same directory by
+        construction (`_with_suffix()` only ever changes the filename's
+        stem, never the parent) — so this is deliberately a simpler,
+        cheaper check than the caller's own
+        (`_verify_within_boundary()`'s exact-relative-structure
+        comparison against a distant ancestor): it only needs to confirm
+        the leaf's resolution didn't silently move it to a *different*
+        directory, never re-derive or re-compare an expected relative path
+        from scratch. A suffix candidate is a genuinely different path
+        object; it could already exist on disk as a symlink planted
+        outside the workspace even when the un-suffixed `destination` is
+        perfectly ordinary — checking only once, up front, would leave
+        `self._storage.checksum(candidate)` free to read an arbitrary file
+        outside the workspace for every later candidate. Raises
+        `DestinationEscapesWorkspaceError` (not caught here, not an
+        `OSError`, so it is never mistaken by the caller for an ordinary
+        collision-check I/O failure) the moment any candidate fails this.
         """
         candidate = destination
         index = 0
-        while self._storage.exists(candidate):
+        while True:
+            resolved_candidate = _resolve_boundary(candidate, "Het doelpad")
+            if resolved_candidate.parent != destination_dir_resolved:
+                raise DestinationEscapesWorkspaceError(
+                    f"Het doelpad ({resolved_candidate}) ligt niet in de verwachte "
+                    f"map ({destination_dir_resolved}) — mogelijk een symlink die "
+                    f"naar een andere locatie leidt. {_SAFE_STOP_MESSAGE}"
+                )
+            if not self._storage.exists(candidate):
+                return candidate, False
             if self._storage.checksum(candidate) == source_checksum:
                 return candidate, True
             index += 1
@@ -720,7 +958,6 @@ class IngestService:
                     f"Te veel naamconflicten voor {destination} (>{_MAX_COLLISION_ATTEMPTS})."
                 )
             candidate = _with_suffix(destination, index)
-        return candidate, False
 
 
 def _ensure_destination_is_writable(storage_root: Path) -> None:
@@ -974,6 +1211,103 @@ def _is_within(path: Path, root: Path) -> bool:
     return path.is_relative_to(root)
 
 
+# Fase 5.3.2 follow-up review, finding 2 — a safety-check failure part-way
+# through a run never implies that NOTHING happened: files already copied
+# and checksum-verified earlier in the same run stay exactly where they
+# are (the same "never roll back a verified file" stance
+# DestinationFullError/DestinationUnavailableError already take). Every
+# DestinationEscapesWorkspaceError message below ends with this, instead
+# of a prior version's unconditional (and, after the first file, simply
+# false) "er is niets geschreven" claim.
+_SAFE_STOP_MESSAGE = (
+    "De ingest is om veiligheidsredenen gestopt. Bestanden die eerder in "
+    "deze run succesvol zijn gekopieerd en geverifieerd, blijven behouden. "
+    "Controleer het rapport of actielogboek voor de status."
+)
+
+
+def _resolve_boundary(path: Path, label: str) -> Path:
+    """Fase 5.3.2 — resolves `path` (symlinks followed for every existing
+    ancestor; `strict=False` so a not-yet-created tail, e.g. a brand-new
+    client/project folder on its very first ingest, is appended literally
+    instead of raising) for use as a containment check's boundary or
+    candidate (see `_verify_within_boundary()`). A resolve failure (a
+    permission error walking an ancestor, a broken/circular symlink) means
+    safety can never be proven here — raises
+    `DestinationEscapesWorkspaceError` rather than silently falling back to
+    the unresolved path, which would defeat the entire point of this
+    check."""
+    try:
+        return path.resolve(strict=False)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise DestinationEscapesWorkspaceError(
+            f"Kon {label} niet veilig herleiden (mogelijk een kapotte of "
+            f"circulaire symlink): {exc}. {_SAFE_STOP_MESSAGE}"
+        ) from exc
+
+
+def _verify_within_boundary(
+    candidate: Path,
+    candidate_root: Path,
+    boundary_resolved: Path,
+    *,
+    candidate_label: str,
+    boundary_label: str,
+) -> Path:
+    """Fase 5.3.2's containment check, used by both `run()`/
+    `_verified_project_workspace_root()` (the bare Project Workspace root
+    against `storage_root`) and `_process_asset()`'s ordinary,
+    formula-based placement (a specific destination against the Project
+    Workspace root) — never duplicated as a second implementation.
+
+    Fase 5.3.2 follow-up review, finding 1 — deliberately STRONGER than "is
+    `candidate`, once resolved, merely a descendant of `boundary_resolved`"
+    (which a prior version checked via `_is_within()` alone): `candidate`
+    is always expected to already be a literal child of `candidate_root`
+    (e.g. `storage_root/Klanten/{client}/{project}`, or
+    `project_workspace_root/{date}_Raw/{category}/.../{filename}`) — this
+    requires that RESOLVING `candidate` (following any symlink anywhere in
+    its ancestry) leaves it at the EXACT SAME relative position under
+    `boundary_resolved` that it held, unresolved, under `candidate_root`.
+    A symlink that redirects to a DIFFERENT, otherwise entirely legitimate
+    location still fully inside `boundary_resolved` — another client's or
+    project's folder, or another date/category/camera-profile folder
+    within the very same project — changes that relative position and is
+    therefore still rejected. A bare "is it inside storage_root" check
+    missed exactly this (empirically confirmed: a symlink from
+    `Klanten/Nike/Zomer` to `Klanten/Adidas/Winter`, both genuinely inside
+    the same `storage_root`, passed the old check without complaint and
+    caused a real ingest to physically write Nike/Zomer footage into
+    Adidas's folder).
+
+    Legitimate case this still allows: `storage_root`/`destination_root`
+    itself reachable via a symlink (an operator-configured setup, see
+    `DestinationEscapesWorkspaceError`'s docstring) — since `candidate_root`
+    and `boundary_resolved` are resolved through the exact same external
+    symlink chain, the portion of the relative path INSIDE the Project
+    Workspace (`Klanten/{client}/{project}/...`) is unaffected; only a
+    symlink INSIDE that internal structure can ever produce a mismatch.
+
+    Never substitutes a different path on failure: a candidate that fails
+    this always raises `DestinationEscapesWorkspaceError` and aborts the
+    run, never silently falls back to another folder or disk."""
+    resolved_candidate = _resolve_boundary(candidate, candidate_label)
+    expected_relative = candidate.relative_to(candidate_root)
+    try:
+        actual_relative = resolved_candidate.relative_to(boundary_resolved)
+    except ValueError:
+        actual_relative = None
+    if actual_relative != expected_relative:
+        raise DestinationEscapesWorkspaceError(
+            f"{candidate_label} ({resolved_candidate}) komt niet overeen met "
+            f"de verwachte locatie ({boundary_resolved / expected_relative}) "
+            f"binnen {boundary_label} — mogelijk een symlink die naar een "
+            "andere locatie leidt, ook als die zelf nog binnen de "
+            f"bestemmingsroot ligt. {_SAFE_STOP_MESSAGE}"
+        )
+    return resolved_candidate
+
+
 @dataclasses.dataclass(frozen=True)
 class _InheritedPlacement:
     """Fase 5.3 — the subset of a main-media file's own placement a proven
@@ -1123,6 +1457,47 @@ def _resolve_recording_date(path: Path, probe_result: ProbeResult | None) -> dt.
 
 def _project_workspace_path(storage_root: Path, client: str, project: str) -> Path:
     return storage_root / CLIENT_FOLDER_NAME / client / project
+
+
+def _verified_project_workspace_root(storage_root: Path, client: str, project: str) -> Path:
+    """Fase 5.3.2 — the ONLY place that produces a *resolved, trusted*
+    Project Workspace boundary. Always re-verifies `Klanten/{client}/
+    {project}` against `storage_root` from scratch, every single time it is
+    called (both from `run()`, once, and from `_process_asset()`, once per
+    asset) — never assumes a prior call earlier in the same `run()` already
+    proved this, because the filesystem can change between calls (e.g. a
+    symlink swapped into `Klanten`/the client folder/the project folder
+    between two files of the same run — see DestinationEscapesWorkspaceError's
+    TOCTOU note).
+
+    This matters specifically because resolving `project_workspace_root`
+    alone and then treating it as trustworthy for the rest of the run —
+    without re-anchoring it against `storage_root_resolved` on every use —
+    would let such a mid-run symlink swap silently become the new "trusted"
+    workspace root for every check performed afterwards: a destination
+    candidate and an already-compromised boundary that are BOTH resolved
+    through the very same swapped symlink still look mutually consistent to
+    a check that only compares the two against each other. Re-deriving and
+    re-verifying the full chain (storage_root -> project_workspace_root) on
+    every call closes that gap — a compromised `project_workspace_root` is
+    caught here immediately, not just once at the very start of `run()`.
+
+    Raises `DestinationEscapesWorkspaceError` if the chain does not hold —
+    including, since the Fase 5.3.2 follow-up review's finding 1, when
+    `Klanten/{client}/{project}` resolves to a DIFFERENT, otherwise
+    legitimate location still inside `storage_root` (e.g. another client's
+    or project's folder) — `_verify_within_boundary()`'s exact-relative-
+    structure comparison, not a bare "is it inside storage_root" check,
+    is what actually proves that. Never returns an unverified path."""
+    project_workspace_root = _project_workspace_path(storage_root, client, project)
+    storage_root_resolved = _resolve_boundary(storage_root, "de bestemmingsroot")
+    return _verify_within_boundary(
+        project_workspace_root,
+        storage_root,
+        storage_root_resolved,
+        candidate_label="De Project Workspace-map",
+        boundary_label="de bestemmingsroot",
+    )
 
 
 # Fase 5.3 — only these two categories get a camera_profile subfolder (see

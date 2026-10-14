@@ -15,6 +15,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+# Test-only escape hatch for the same-physical-device safety rule, shared by
+# every caller that needs it (ingest_worker.py, service_factory.py) — one
+# name, not a separately-defined string literal per module. A real machine
+# always has source and destination on genuinely different disks;
+# automated tests run everything under one pytest tmp_path, which is
+# necessarily one physical device with no portable way to fake a second one
+# without real external hardware. Never set this outside tests.
+ALLOW_SAME_DEVICE_ENV_VAR = "MANY_INGEST_ALLOW_SAME_DEVICE_FOR_TESTS"
+
 
 def device_id(path: Path) -> int | None:
     """The filesystem device id of the nearest existing ancestor of `path`.

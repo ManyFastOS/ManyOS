@@ -8,9 +8,11 @@ import click
 
 from many_ingest.core.ingest_service import (
     AssetOutcome,
+    DestinationEscapesWorkspaceError,
     DestinationFullError,
     DestinationUnavailableError,
     IngestReport,
+    InvalidWorkspaceNameError,
     ProgressUpdate,
 )
 from many_ingest.core.report import render_report, summarize
@@ -82,9 +84,15 @@ def run(
         )
         raise SystemExit(1)
 
-    service = build_ingest_service(config_path, camera_profiles_path, destination_root)
-
     try:
+        # Fase 5.3.2 follow-up review, point 3: build_ingest_service() now
+        # independently re-checks the same-physical-device rule against the
+        # fully resolved storage_root (catches a symlink inside
+        # footage_subpath redirecting it back onto the source disk) — moved
+        # inside this try block, not called separately beforehand, so a
+        # DestinationUnavailableError from either call gets the exact same
+        # handling below, never a second, separate error path.
+        service = build_ingest_service(config_path, camera_profiles_path, destination_root, source)
         report = service.run(
             source=source,
             client=client,
@@ -93,6 +101,12 @@ def run(
             progress_callback=_print_progress,
         )
     except FfprobeNotFoundError as exc:
+        click.echo(f"\n{exc}", err=True)
+        raise SystemExit(1) from exc
+    except InvalidWorkspaceNameError as exc:
+        click.echo(f"\n{exc}", err=True)
+        raise SystemExit(1) from exc
+    except DestinationEscapesWorkspaceError as exc:
         click.echo(f"\n{exc}", err=True)
         raise SystemExit(1) from exc
     except DestinationFullError as exc:

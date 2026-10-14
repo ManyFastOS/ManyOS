@@ -52,7 +52,7 @@ from PySide6.QtWidgets import (
 )
 
 from many_ingest.config import load_storage_layout
-from many_ingest.core.ingest_service import CLIENT_FOLDER_NAME, ProgressUpdate
+from many_ingest.core.ingest_service import CLIENT_FOLDER_NAME, ProgressUpdate, is_valid_workspace_name
 from many_ingest.core.report import IngestSummary
 from many_ingest.desktop import eject, ingest_process
 from many_ingest.desktop.volumes import (
@@ -875,16 +875,33 @@ class MainWindow(QWidget):
         preview_button.setEnabled(False)
 
         def _update_enabled() -> None:
+            # Fase 5.3.2 — reuses the exact same validation IngestService.run()
+            # enforces (core/ingest_service.py's is_valid_workspace_name()),
+            # never a separate/looser UI-only rule. This only gates the
+            # button for a better experience (an obviously-unsafe name never
+            # even reaches "Bekijk inhoud") — it is never a substitute for
+            # the service's own, mandatory check: a worker process invoked
+            # any other way still validates independently.
+            #
+            # Deliberately NOT .strip()'d here: validate_workspace_name()
+            # rejects leading/trailing whitespace on purpose (silently
+            # stripping it would itself be exactly the kind of silent
+            # normalization that function's docstring promises never
+            # happens). Gating on the raw text — and passing that exact same
+            # raw text to _start_preview() below — keeps the GUI and the CLI
+            # (which also never strips) accepting and rejecting the identical
+            # set of names; a prior version stripped here, which silently
+            # accepted a whitespace-padded name the CLI would have rejected.
             preview_button.setEnabled(
-                bool(client_input.text().strip())
-                and bool(project_input.text().strip())
+                is_valid_workspace_name(client_input.text())
+                and is_valid_workspace_name(project_input.text())
                 and self._selected_destination is not None
             )
 
         client_input.textChanged.connect(_update_enabled)
         project_input.textChanged.connect(_update_enabled)
         preview_button.clicked.connect(
-            lambda: self._start_preview(client_input.text().strip(), project_input.text().strip())
+            lambda: self._start_preview(client_input.text(), project_input.text())
         )
 
         self._render_destination_picker(layout, on_change=_update_enabled)

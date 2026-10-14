@@ -321,6 +321,49 @@ def test_preview_button_disabled_until_client_project_and_destination_are_filled
     assert window.choose_button().isEnabled() is False
 
 
+def test_preview_button_disabled_for_leading_or_trailing_whitespace_in_name(qapp, tmp_path):
+    """Fase 5.3.2 regression: is_valid_workspace_name() (and the service's
+    own validate_workspace_name() it wraps) deliberately rejects
+    leading/trailing whitespace rather than silently stripping it (silently
+    normalizing would be exactly the kind of surprise that function's
+    docstring promises never happens). The GUI must gate on that same rule,
+    not on a pre-stripped value — a prior version called
+    `.strip()` before checking, which silently accepted a name the CLI/
+    service would have rejected."""
+    window = _window(tmp_path)
+    window.project_input().setText("Zomer Campagne")
+    window.destination_cards()[0].click()
+
+    window.client_input().setText(" Nike")  # leidende spatie
+    assert window.choose_button().isEnabled() is False
+
+    window.client_input().setText("Nike ")  # volgspatie
+    assert window.choose_button().isEnabled() is False
+
+    window.client_input().setText("Nike")  # geen whitespace: wél geldig
+    assert window.choose_button().isEnabled() is True
+
+
+def test_start_preview_receives_the_exact_raw_text_never_a_silently_stripped_copy(qapp, tmp_path):
+    """Fase 5.3.2 regression: whatever is in the QLineEdit at click time must
+    reach _start_preview() byte-for-byte — the GUI and IngestService.run()'s
+    own validate_workspace_name() must agree on exactly the same set of
+    accepted/rejected names, which only holds if neither side silently
+    rewrites the value first."""
+    starter = _CapturingStartPreview()
+    window = _window(tmp_path, start_preview=starter)
+    window.client_input().setText("Van der Panne Makelaardij")
+    window.project_input().setText("Project 2026 - Düsseldorf")
+    window.destination_cards()[0].click()
+
+    window.choose_button().click()
+
+    assert len(starter.calls) == 1
+    call = starter.calls[0]
+    assert call["client"] == "Van der Panne Makelaardij"
+    assert call["project"] == "Project 2026 - Düsseldorf"
+
+
 def test_clicking_a_destination_card_shows_the_chosen_destination(qapp, tmp_path):
     window = _window(
         tmp_path, destinations=[_destination("Chris", tmp_path / "Chris", free_bytes=1_500_000_000_000)]

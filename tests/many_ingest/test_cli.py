@@ -31,8 +31,19 @@ def _bypass_same_device_check(monkeypatch) -> None:
     `tmp_path` for both, which is necessarily one physical device on any
     single-disk test machine (see device_identity.py's module docstring).
     Tests that aren't about that rule specifically bypass it here; the rule
-    itself is tested directly below, in isolation, using the real check."""
+    itself is tested directly below, in isolation, using the real check.
+
+    Two separate checks, both bypassed here: cli.py's own, shallow check
+    against the raw `destination_root` (monkeypatched directly, since it's
+    called before `build_ingest_service()` even runs), and
+    `service_factory.build_ingest_service()`'s own, deeper check against the
+    fully resolved `storage_root` (Fase 5.3.2 follow-up review, point 3) —
+    bypassed via the same test-only env var `ingest_worker.py`'s tests
+    already use (device_identity.py's `ALLOW_SAME_DEVICE_ENV_VAR`), since
+    that check lives in a different module's own `same_physical_device`
+    reference, not reachable via the monkeypatch above."""
     monkeypatch.setattr("many_ingest.cli.same_physical_device", lambda a, b: False)
+    monkeypatch.setenv("MANY_INGEST_ALLOW_SAME_DEVICE_FOR_TESTS", "1")
 
 
 def test_dry_run_then_real_run_then_duplicate_skip(tmp_path, monkeypatch):
@@ -178,4 +189,68 @@ def test_run_rejects_source_and_destination_on_the_same_physical_device(tmp_path
 
     assert result.exit_code != 0
     assert "dezelfde fysieke schijf" in result.output
+    assert not (tmp_path / "storage").exists()
+
+
+def test_run_rejects_unsafe_client_name_with_clear_message_and_nonzero_exit(tmp_path, monkeypatch):
+    """Fase 5.3.2: InvalidWorkspaceNameError (raised by
+    IngestService.run()'s own name validation) must be translated to a
+    clear, non-traceback message and a non-zero exit code — same pattern
+    cli.py already uses for FfprobeNotFoundError/DestinationFullError/
+    DestinationUnavailableError. Checked for a dry-run, which already
+    reaches this validation before anything else."""
+    _bypass_same_device_check(monkeypatch)
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+    config_path = _write_config(tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "run",
+            "--source", str(input_dir),
+            "--destination", str(tmp_path),
+            "--client", "../../../../tmp/pwn",
+            "--project", "Zomer",
+            "--dry-run",
+            "--config", str(config_path),
+            "--camera-profiles", str(CAMERA_PROFILES_PATH),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Klantnaam" in result.output
+    assert "Traceback" not in result.output
+    assert not (tmp_path / "storage").exists()
+
+
+def test_run_requires_non_empty_client_and_project(tmp_path, monkeypatch):
+    """Click's required=True only proves the flag was passed, not that its
+    value is non-empty — --client "" must still be rejected by the service's
+    own validation, with a clear message, not silently accepted."""
+    _bypass_same_device_check(monkeypatch)
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    (input_dir / "DJI_0001.MP4").write_bytes(b"fake video bytes")
+    config_path = _write_config(tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "run",
+            "--source", str(input_dir),
+            "--destination", str(tmp_path),
+            "--client", "",
+            "--project", "Zomer",
+            "--dry-run",
+            "--config", str(config_path),
+            "--camera-profiles", str(CAMERA_PROFILES_PATH),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Klantnaam" in result.output
     assert not (tmp_path / "storage").exists()
